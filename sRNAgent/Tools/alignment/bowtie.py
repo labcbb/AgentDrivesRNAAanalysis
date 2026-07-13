@@ -94,7 +94,7 @@ def bowtie_build(
     if offrate is not None:
         cmd.extend(["-o", str(offrate)])
     if threads > 1:
-        cmd.extend(["-p", str(threads)])
+        cmd.extend(["--threads", str(threads)])
     if verbose:
         cmd.append("--verbose")
     if extra_args:

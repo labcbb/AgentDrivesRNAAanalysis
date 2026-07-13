@@ -41,24 +41,19 @@ Aligned SAM file → downstream analysis (miRNA quantification, etc.)
 
 ### 1. 下载并构建参考基因组索引
 
-以人类参考基因组 GRCh38 (GENCODE release 50) 为例。首先下载 FASTA 文件，然后用 `bowtie_build` 构建索引。
-
-```bash
-# 下载 GRCh38 参考基因组 FASTA (约 1.2 GB)
-wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/GRCh38.primary_assembly.genome.fa.gz
-
-# 解压
-gunzip GRCh38.primary_assembly.genome.fa.gz
-```
-
-构建索引：
+以人类参考基因组 GRCh38 (GENCODE release 50) 为例。用 `download_genome` 自动下载、解压、清理 header，然后用 `bowtie_build` 构建索引。
 
 ```python
 import sRNAgent as sa
 
+# 下载基因组（自动解压 + 清理 header + 生成 .dict）
+result = sa.reference.download_genome("homo_sapiens", output_dir="ref", jobs=8)
+# result["fasta"] 指向解压后的 .fa 文件，header 已清理（取第一个空格前的内容）
+
+# 构建 Bowtie 索引
 sa.alignment.bowtie_build(
-    "GRCh38.primary_assembly.genome.fa",
-    "grch38",
+    result["fasta"],
+    "ref/grch38",
     threads=8,
 )
 ```

@@ -10,7 +10,9 @@ Supports multi-threaded resumable download via ``_utils.py``.
 
 from __future__ import annotations
 
+import gzip
 import re
+import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
@@ -188,18 +190,42 @@ def _find_ensembl_ncrna_file(species: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Internal: sequence dictionary generation
+# Internal: sequence dictionary generation + FASTA cleanup
 # ---------------------------------------------------------------------------
 
 
-def _generate_dict(fasta_gz: str | Path) -> str:
-    """Generate a ``.dict`` file from a gzipped FASTA using ``samtools dict``."""
-    fasta_path = Path(fasta_gz)
+def _clean_fasta_headers(input_fa: Path, output_fa: Path) -> Path:
+    """Read a FASTA file, truncate each header at the first space, write result.
+
+    Ensembl/GENCODE headers like::
+
+        >chr1 AC:1234 ... Homo sapiens GRCh38 ...
+
+    become::
+
+        >chr1
+
+    This avoids errors in tools that cannot handle whitespace in identifiers
+    (e.g. miRDeep2, bowtie-build).
+    """
+    with open(input_fa, "r") as f_in, open(output_fa, "w") as f_out:
+        for line in f_in:
+            if line.startswith(">"):
+                ident = line[1:].split(None, 1)[0]
+                f_out.write(f">{ident}\n")
+            else:
+                f_out.write(line)
+    return output_fa
+
+
+def _generate_dict(fasta_path: str | Path) -> str:
+    """Generate a ``.dict`` file from a FASTA using ``samtools dict``."""
+    fasta_path = Path(fasta_path)
     if not fasta_path.exists():
         raise FileNotFoundError(f"FASTA not found: {fasta_path}")
 
     stem = str(fasta_path.name)
-    for sfx in (".fa.gz", ".fna.gz", ".fasta.gz", ".fa", ".fna", ".fasta"):
+    for sfx in (".fa", ".fna", ".fasta"):
         stem = stem.replace(sfx, "")
     dict_path = fasta_path.parent / f"{stem}.dict"
 
@@ -257,7 +283,9 @@ def list_species() -> List[str]:
         "from **GENCODE** "
         "(e.g. ``GRCh38.primary_assembly.genome.fa.gz``).\n"
         "For all other species, downloads from **Ensembl**.\n"
-        "Automatically generates a ``.dict`` sequence dictionary file."
+        "Automatically decompresses the FASTA, cleans sequence headers "
+        "(removes everything after the first space in each ``>`` line), "
+        "and generates a ``.dict`` sequence dictionary file."
     ),
     examples=[
         'sa.reference.download_genome("homo_sapiens", output_dir="ref", jobs=8)',
@@ -279,6 +307,10 @@ def download_genome(
 ) -> Dict[str, str]:
     """Download a reference genome FASTA (primary assembly).
 
+    Downloads the gzipped FASTA, decompresses it, cleans sequence headers
+    (truncates each ``>`` line at the first space), and optionally generates
+    a ``.dict`` sequence dictionary.
+
     Parameters
     ----------
     species
@@ -297,7 +329,8 @@ def download_genome(
     Returns
     -------
     dict
-        ``{"fasta": "<path>", "dict": "<path>"}``
+        ``{"fasta": "<path>", "dict": "<path>"}`` where *fasta* points to the
+        decompressed and header-cleaned FASTA file.
     """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -310,12 +343,28 @@ def download_genome(
         filename = _find_ensembl_dna_file(species, assembly)
         url = f"{FASTA_BASE}/{_species_dirname(species)}/dna/{filename}"
 
-    output_path = out_dir / filename
-    fasta_path = resumable_download(url, output_path, jobs=jobs, force=force)
+    # Download gzipped FASTA
+    gz_path = out_dir / filename
+    gz_path = Path(resumable_download(url, gz_path, jobs=jobs, force=force))
 
-    result: Dict[str, str] = {"fasta": fasta_path}
+    # Determine cleaned FASTA path (strip .gz)
+    fa_path = gz_path.parent / gz_path.name.replace(".gz", "")
+
+    # Decompress if needed
+    if force or not fa_path.exists():
+        print(f"[genome] Decompressing {gz_path.name} -> {fa_path.name}", flush=True)
+        with gzip.open(gz_path, "rb") as f_in, open(fa_path, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+    # Clean headers: truncate at first space in each > line
+    tmp_fa = fa_path.with_suffix(".tmp.fa")
+    _clean_fasta_headers(fa_path, tmp_fa)
+    shutil.move(str(tmp_fa), str(fa_path))
+    print(f"[genome] Cleaned headers: {fa_path.name}", flush=True)
+
+    result: Dict[str, str] = {"fasta": str(fa_path)}
     if generate_dict:
-        dict_path = _generate_dict(fasta_path)
+        dict_path = _generate_dict(fa_path)
         result["dict"] = dict_path
 
     return result

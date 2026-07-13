@@ -99,35 +99,23 @@ result = sa.reference.download_genome(
 )
 ```
 
-**CORRECT — 下载后构建 Bowtie 索引（用于 read 比对和 miRDeep2）：**
+**CORRECT — 下载后直接构建 Bowtie 索引（`download_genome` 已自动解压并清理序列名）：**
 
 ```python
 import sRNAgent as sa
 
-# 先下载基因组 FASTA
+# 下载基因组（自动解压 + 清理 header + 生成 .dict）
 result = sa.reference.download_genome("homo_sapiens", output_dir="ref", jobs=8)
 
-# 再构建 Bowtie 索引（需要基因组 FASTA 的解压版本）
-import gzip
-from pathlib import Path
-
-fa_gz = Path(result["fasta"])
-fa_unzipped = fa_gz.with_name(fa_gz.name.replace(".gz", ""))
-if not fa_unzipped.exists():
-    print("Decompressing genome FASTA for bowtie-build...")
-    with gzip.open(fa_gz, "rb") as f_in, open(fa_unzipped, "wb") as f_out:
-        import shutil
-        shutil.copyfileobj(f_in, f_out)
-
+# 直接使用返回的 FASTA 路径（已解压，可读）
 sa.alignment.bowtie_build(
-    str(fa_unzipped),
+    result["fasta"],  # 已解压，header 已清理
     "ref/grch38",
     threads=8,
 )
 ```
 
-> Bowtie 索引所需的参考序列现在来自 **GENCODE**（`GRCh38.primary_assembly.genome.fa.gz`），不再是 Ensembl 命名格式。
-> Bowtie 索引是 **`sa.alignment.bowtie`** 比对和 **miRDeep2 mapper.pl** 的必需输入。`bowtie_build` 需要未压缩的 FASTA 文件。具体用法见 `alignment-srna` skill。
+> Bowtie 索引所需的参考序列来自 **GENCODE**（`GRCh38.primary_assembly.genome.fa.gz`），`download_genome` 已自动解压并清理 header（取第一个空格前的内容），返回的 `result["fasta"]` 可直接用于 `bowtie_build`。
 
 **WRONG — 物种名拼写错误:**
 

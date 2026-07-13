@@ -26,20 +26,10 @@ print(f"DICT:  {result['dict']}")
 
 ```python
 import sRNAgent as sa
-import gzip
-from pathlib import Path
 
+# download_genome 自动解压 + 清理 header，直接返回 .fa 路径
 result = sa.reference.download_genome("homo_sapiens", output_dir="ref", jobs=8)
-
-# Decompress if needed
-fa_gz = Path(result["fasta"])
-fa = fa_gz.with_name(fa_gz.name.replace(".gz", ""))
-if not fa.exists():
-    with gzip.open(fa_gz, "rb") as f_in, open(fa, "wb") as f_out:
-        import shutil
-        shutil.copyfileobj(f_in, f_out)
-
-sa.alignment.bowtie_build(str(fa), "ref/grch38", threads=8)
+sa.alignment.bowtie_build(result["fasta"], "ref/grch38", threads=8)
 ```
 
 ## Download human GTF annotation

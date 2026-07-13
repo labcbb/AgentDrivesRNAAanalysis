@@ -5,21 +5,14 @@
 bowtie --version
 bowtie-build --version
 
-# Download GRCh38 human reference genome (one time only)
-wget https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_50/GRCh38.primary_assembly.genome.fa.gz
-gunzip GRCh38.primary_assembly.genome.fa.gz
-```
-
-## Build Bowtie index (one time per genome)
+## Download genome + Build Bowtie index (one time per genome)
 
 ```python
 import sRNAgent as sa
 
-sa.alignment.bowtie_build(
-    "GRCh38.primary_assembly.genome.fa",
-    "grch38",
-    threads=8,
-)
+# download_genome 自动解压 + 清理 header，直接返回 .fa 路径
+result = sa.reference.download_genome("homo_sapiens", output_dir="ref", jobs=8)
+sa.alignment.bowtie_build(result["fasta"], "grch38", threads=8)
 ```
 
 ## Stringent sRNA-seq alignment (0 mismatch, unique only)
