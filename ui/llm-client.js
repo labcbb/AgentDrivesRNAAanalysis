@@ -318,9 +318,55 @@
     });
   }
 
+  /** 旁观端实时同步：加入已有 Agent 运行的事件广播（断开不会 cancel 任务） */
+  async function agentLiveEventStream({ chatId, afterSeq = 0, signal, onEvent }) {
+    if (!chatId) throw new Error("chatId 不能为空");
+    if (window.location.protocol === "file:") {
+      throw new Error("file:// 无法订阅实时事件，请通过 serve.py 打开页面");
+    }
+    const qs = `?chatId=${encodeURIComponent(chatId)}&afterSeq=${encodeURIComponent(String(afterSeq || 0))}`;
+    let response;
+    try {
+      response = await fetch(`${PROXY_BASE}/api/agent/events/stream${qs}`, {
+        method: "GET",
+        headers: { Accept: "text/event-stream" },
+        signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw error;
+      }
+      throw new Error(
+        `无法连接实时同步通道 ${PROXY_BASE}。（${error instanceof Error ? error.message : String(error)}）`,
+      );
+    }
+    if (!response.ok || !response.body) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || data.message || `实时同步失败 (HTTP ${response.status})`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parsed = parseSseChunk(buffer);
+      buffer = parsed.rest;
+      for (const event of parsed.events) {
+        onEvent?.(event);
+        if (event.type === "stream_end" || event.type === "done" || event.type === "cancelled" || event.type === "error") {
+          return;
+        }
+      }
+    }
+  }
+
   window.llmChatCompletion = chatCompletion;
   window.agentChatCompletion = agentChatCompletion;
   window.agentChatStream = agentChatStream;
+  window.agentLiveEventStream = agentLiveEventStream;
   window.cancelAgentRun = cancelAgentRun;
   window.approveAgentCode = approveAgentCode;
   window.fetchAgentRunStatus = fetchAgentRunStatus;

@@ -39,6 +39,14 @@ from session_errors import (
     update_run_context,
 )
 from session_plan import clear_plan, load_plan, plan_progress_summary, save_plan  # noqa: E402
+from session_live import (  # noqa: E402
+    close_live_bus,
+    get_live_run_id,
+    has_live_bus,
+    iter_live_events,
+    publish_live_event,
+    start_live_bus,
+)
 from work_space import get_work_space, list_work_space_files  # noqa: E402
 
 _runs_lock = threading.Lock()
@@ -130,14 +138,15 @@ def kernel_environment(chat_id: str) -> Dict[str, Any]:
         }
     executor = execution.notebook_executor
 
-    if _chat_has_active_run(chat_id) or getattr(executor, "is_busy", lambda: False)():
+    # 仅在内核真正 busy 时回退缓存；Agent run 进行中但两次 execute_code 之间内核空闲时，仍应能扫到最新变量
+    if getattr(executor, "is_busy", lambda: False)():
         cached_vars = _cached_kernel_variables(chat_id)
         return {
             "ok": True,
             "ready": bool(cached_vars),
             "busy": True,
             "variables": cached_vars,
-            "message": "Agent 正在运行，显示缓存的环境快照",
+            "message": "内核正在执行代码，显示缓存的环境快照",
         }
 
     if not executor.use_notebook_ready():
@@ -375,6 +384,12 @@ def cancel_run(
     for active_run_id in runs_to_cleanup:
         cleanup_run(active_run_id)
 
+    if resolved_chat_id:
+        try:
+            close_live_bus(resolved_chat_id)
+        except Exception:
+            pass
+
     if resolved_chat_id and run_id and (cancelled or interrupted):
         if force_interrupt:
             record_user_cancellation(
@@ -498,6 +513,7 @@ def agent_run_status(chat_id: str) -> Dict[str, Any]:
 
     has_active_run = _chat_has_active_run(chat_id)
     busy = kernel_is_busy(SRNAGENT_PROJECT, chat_id)
+    live_run_id = get_live_run_id(chat_id)
     plan = load_plan(chat_id)
     plan_summary = plan_progress_summary(plan) if plan else ""
     running_step = None
@@ -525,6 +541,8 @@ def agent_run_status(chat_id: str) -> Dict[str, Any]:
         "staleCodePanel": stale_code_panel,
         "taskActive": task_active,
         "backgroundActive": busy and not has_active_run,
+        "liveAvailable": has_live_bus(chat_id),
+        "runId": live_run_id,
         "plan": plan,
         "planSummary": plan_summary,
         "runningStepTitle": str((running_step or {}).get("title") or "").strip(),
@@ -607,6 +625,15 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     auto_approve_code = bool(body.get("autoApproveCode"))
     cancel_event = register_run(run_id, chat_id)
     event_queue: queue.Queue = queue.Queue()
+    start_live_bus(chat_id, run_id)
+
+    def _publish(event: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(event or {})
+        try:
+            publish_live_event(chat_id, payload)
+        except Exception:
+            pass
+        return payload
 
     def on_progress(event: Dict[str, Any]) -> None:
         event_queue.put(event)
@@ -616,6 +643,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             record_stream_event_error(chat_id, event)
         except Exception:
             pass
+        _publish(event)
 
     def request_code_approval(request_id: str, code: str, description: str) -> bool:
         if auto_approve_code:
@@ -676,7 +704,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                     cancel_event=cancel_event,
                     code_approval_callback=request_code_approval,
                 )
-            event_queue.put(
+            on_progress(
                 {
                     "type": "done",
                     "text": text,
@@ -688,7 +716,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                 }
             )
         except AgentCancelledError:
-            event_queue.put({"type": "cancelled", "message": "已停止生成"})
+            on_progress({"type": "cancelled", "message": "已停止生成"})
         except Exception as exc:  # noqa: BLE001
             record_session_error(
                 chat_id,
@@ -698,7 +726,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                 run_id=run_id,
                 source="agent_worker",
             )
-            event_queue.put({"type": "error", "message": str(exc)})
+            on_progress({"type": "error", "message": str(exc)})
         finally:
             event_queue.put(_STREAM_SENTINEL)
             cleanup_run(run_id)
@@ -706,7 +734,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
-    yield {"type": "run_start", "runId": run_id}
+    yield _publish({"type": "run_start", "runId": run_id, "chatId": chat_id})
     try:
         update_run_context(chat_id, {"type": "run_start", "runId": run_id})
     except Exception:
@@ -715,26 +743,38 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     worker_finished = False
     drain_started_at: Optional[float] = None
 
-    while True:
-        try:
-            item = event_queue.get(timeout=_SSE_HEARTBEAT_SEC)
-        except queue.Empty:
-            if cancel_event.is_set():
-                break
-            if worker_finished:
+    try:
+        while True:
+            try:
+                item = event_queue.get(timeout=_SSE_HEARTBEAT_SEC)
+            except queue.Empty:
+                if cancel_event.is_set():
+                    break
+                if worker_finished:
+                    if not kernel_is_busy(SRNAGENT_PROJECT, chat_id):
+                        break
+                    if drain_started_at is not None and time.time() - drain_started_at > _KERNEL_DRAIN_MAX_SEC:
+                        break
+                if worker_finished or _chat_has_active_run(chat_id) or kernel_is_busy(SRNAGENT_PROJECT, chat_id):
+                    yield _publish(_heartbeat_event(chat_id))
+                continue
+
+            if item is _STREAM_SENTINEL:
+                worker_finished = True
+                drain_started_at = time.time()
                 if not kernel_is_busy(SRNAGENT_PROJECT, chat_id):
                     break
-                if drain_started_at is not None and time.time() - drain_started_at > _KERNEL_DRAIN_MAX_SEC:
-                    break
-            if worker_finished or _chat_has_active_run(chat_id) or kernel_is_busy(SRNAGENT_PROJECT, chat_id):
-                yield _heartbeat_event(chat_id)
-            continue
+                yield _publish(_heartbeat_event(chat_id))
+                continue
+            # 多数事件在 on_progress 时已 publish；队列取出的终态事件也已 publish
+            yield item
+    finally:
+        try:
+            close_live_bus(chat_id, run_id=run_id)
+        except Exception:
+            pass
 
-        if item is _STREAM_SENTINEL:
-            worker_finished = True
-            drain_started_at = time.time()
-            if not kernel_is_busy(SRNAGENT_PROJECT, chat_id):
-                break
-            yield _heartbeat_event(chat_id)
-            continue
-        yield item
+
+def run_agent_live_stream(chat_id: str, after_seq: int = 0) -> Iterator[Dict[str, Any]]:
+    """Secondary-client live subscription (does not own / cancel the agent run)."""
+    yield from iter_live_events(chat_id, after_seq=after_seq)

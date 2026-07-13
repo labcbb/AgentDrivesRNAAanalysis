@@ -46,17 +46,27 @@ const chatStreams = new Map();
 let nextStreamGeneration = 0;
 const STREAM_IDLE_MS = 3600000;
 const STREAM_STATUS_POLL_MS = 4000;
+/** @type {Map<string, { abortController: AbortController, runId: string, codeExecutionId: string|null, lastSeq: number }>} */
+const liveFollows = new Map();
 const BACKGROUND_WATCH_POLL_MS = 3000;
 const BACKGROUND_EXECUTION_ID = "background-kernel-run";
 /** @type {Map<string, { timer: number, startedAt: number, pending: Element|null, assistantEntry: any|null }>} */
 const backgroundWatches = new Map();
 
 function isChatStreaming(chatId) {
-  return Boolean(chatId && chatStreams.has(chatId));
+  if (!chatId) return false;
+  const stream = chatStreams.get(chatId);
+  if (!stream) return false;
+  // 旁观伪 stream 不算「本机主发送流」
+  return !stream.isFollower;
+}
+
+function isLiveFollowing(chatId = activeChatId) {
+  return Boolean(chatId && liveFollows.has(chatId));
 }
 
 function isActiveChatSending() {
-  return isChatStreaming(activeChatId);
+  return isChatStreaming(activeChatId) || isLiveFollowing(activeChatId);
 }
 
 function getChatStream(chatId) {
@@ -580,8 +590,15 @@ function reconcileStaleTaskUi(chatId, status, options = {}) {
 }
 
 function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
+  // 已有真实 execute_code 进度卡片时，不要再叠一张「Agent 运行中」导致 CODE 区混乱
+  if (activeCodeExecutionId) return null;
   const codeInner = getCodePanelInner();
   if (!codeInner) return null;
+
+  const runningRealCard = codeInner.querySelector(
+    `.code-execution-progress--running:not([data-execution-id="${BACKGROUND_EXECUTION_ID}"])`,
+  );
+  if (runningRealCard) return null;
 
   showCodePanel();
   let card = getExecutionCard(BACKGROUND_EXECUTION_ID);
@@ -624,6 +641,19 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
   });
   scrollCodePanelToBottom();
   return card;
+}
+
+function removeBackgroundExecutionCard() {
+  const card = getExecutionCard(BACKGROUND_EXECUTION_ID);
+  if (card) card.remove();
+  const chat = getActiveChatRecord();
+  if (!chat?.codePanel) return;
+  const before = chat.codePanel.length;
+  chat.codePanel = chat.codePanel.filter(
+    (item) => !(item.type === "execution" && item.id === BACKGROUND_EXECUTION_ID),
+  );
+  if (chat.codePanel.length !== before) persistActiveChat();
+  syncCodePanelVisibility();
 }
 
 function finishBackgroundExecutionCard() {
@@ -760,7 +790,7 @@ function startBackgroundRunWatch(chatId, { pending = null, assistantEntry = null
 }
 
 async function resumeBackgroundRunIfNeeded(chatId) {
-  if (!chatId || backgroundWatches.has(chatId) || isChatStreaming(chatId)) return;
+  if (!chatId || isChatStreaming(chatId)) return;
   const status = await fetchRunStatus(chatId);
   if (isStaleTaskState(status)) {
     const lastAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant");
@@ -769,12 +799,183 @@ async function resumeBackgroundRunIfNeeded(chatId) {
   }
   if (!isTaskLikelyActive(status, chatId)) return;
 
-  const lastAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant");
-  startBackgroundRunWatch(chatId, { assistantEntry: lastAssistant || null });
+  const lastAssistant = (chatId === activeChatId
+    ? [...chatHistory]
+    : [...(getChatRecord(chatId)?.messages || [])]
+  ).reverse().find((item) => item.role === "assistant");
+
+  // 优先接入服务端实时事件广播（思考流 / 下载进度）
+  void attachLiveEventStream(chatId, status);
+
+  if (!backgroundWatches.has(chatId)) {
+    startBackgroundRunWatch(chatId, { assistantEntry: lastAssistant || null });
+  }
   syncRunStatusToUI(chatId, status, {
     assistantEntry: lastAssistant || null,
     persist: false,
   });
+}
+
+function detachLiveEventStream(chatId) {
+  const follow = liveFollows.get(chatId);
+  if (!follow) return;
+  try {
+    follow.abortController.abort();
+  } catch {
+    // ignore
+  }
+  liveFollows.delete(chatId);
+}
+
+function ensureFollowerStreamShell(chatId, follow, messages, assistantEntry) {
+  if (chatStreams.has(chatId)) return chatStreams.get(chatId);
+  const shell = {
+    generation: -1,
+    runId: follow?.runId || "",
+    abortController: follow?.abortController || new AbortController(),
+    messages,
+    assistantEntry,
+    pending: null,
+    idleTimer: null,
+    statusPollTimer: null,
+    lastStreamEventAt: Date.now(),
+    codeExecutionId: follow?.codeExecutionId || null,
+    isFollower: true,
+  };
+  chatStreams.set(chatId, shell);
+  return shell;
+}
+
+function applyLiveFollowEvent(chatId, event) {
+  if (!chatId || !event?.type) return;
+  const follow = liveFollows.get(chatId);
+  if (follow && event._seq != null) {
+    follow.lastSeq = Math.max(follow.lastSeq || 0, Number(event._seq) || 0);
+  }
+  if (follow && (event.runId || event.type === "live_joined")) {
+    follow.runId = String(event.runId || follow.runId || "");
+  }
+
+  if (event.type === "live_joined") {
+    if (chatId === activeChatId) {
+      const target = getLastAssistantGroup();
+      const textEl = target?.querySelector(".chat-text");
+      if (textEl) {
+        textEl.classList.add("chat-text--loading");
+        textEl.textContent = event.message || "已加入实时同步…";
+      }
+    }
+    return;
+  }
+
+  const chat = ensureChatRecord(chatId);
+  const messages = chat.messages || [];
+  let assistantEntry = [...messages].reverse().find((item) => item.role === "assistant");
+  if (!assistantEntry) {
+    assistantEntry = { role: "assistant", content: "实时同步中…", thinkingSteps: [], executionLog: [] };
+    messages.push(assistantEntry);
+    chat.messages = messages;
+  }
+  if (chatId === activeChatId) {
+    chatHistory = messages;
+  }
+
+  const isVisible = chatId === activeChatId;
+  if (!isVisible) {
+    const shell = ensureFollowerStreamShell(chatId, follow, messages, assistantEntry);
+    if (follow) {
+      shell.runId = follow.runId || shell.runId;
+      shell.codeExecutionId = follow.codeExecutionId;
+    }
+    handleAgentStreamEventBackground(chatId, messages, assistantEntry, event);
+    if (follow) {
+      follow.codeExecutionId = chatStreams.get(chatId)?.codeExecutionId || follow.codeExecutionId;
+    }
+    persistChatMessages(chatId, messages);
+  } else {
+    let target = getLastAssistantGroup();
+    if (!target) {
+      target = appendMessage("assistant", assistantEntry.content || "实时同步中…", {
+        loading: true,
+      });
+    }
+    handleAgentStreamEvent(target, event);
+    if (event.type === "final" && event.content) {
+      assistantEntry.content = stripExecutionMemoryBlock(event.content);
+      persistChatMessages(chatId, messages);
+    }
+    if (event.type === "done" && event.text) {
+      assistantEntry.content = stripExecutionMemoryBlock(event.text);
+      updateMessageGroup(target, assistantEntry.content);
+      persistChatMessages(chatId, messages);
+    }
+    if (follow && activeCodeExecutionId) {
+      follow.codeExecutionId = activeCodeExecutionId;
+    }
+  }
+
+  if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "stream_end") {
+    const stream = chatStreams.get(chatId);
+    if (stream?.isFollower) {
+      chatStreams.delete(chatId);
+    }
+    if (chatId === activeChatId) {
+      window.KernelPanel?.refresh?.({ force: true });
+      syncComposerForActiveChat();
+    }
+  }
+}
+
+async function attachLiveEventStream(chatId, status = null) {
+  if (!chatId || isChatStreaming(chatId) || liveFollows.has(chatId)) return;
+  if (!window.agentLiveEventStream) return;
+
+  let snap = status;
+  if (!snap) {
+    snap = await fetchRunStatus(chatId);
+  }
+  if (!snap?.ok) return;
+  if (!(snap.hasActiveRun || snap.kernelBusy || snap.liveAvailable)) return;
+
+  const abortController = new AbortController();
+  liveFollows.set(chatId, {
+    abortController,
+    runId: String(snap.runId || ""),
+    codeExecutionId: null,
+    lastSeq: 0,
+  });
+
+  if (chatId === activeChatId) {
+    syncComposerForActiveChat();
+    const target = getLastAssistantGroup();
+    if (target) {
+      const textEl = target.querySelector(".chat-text");
+      if (textEl && isPlaceholderAssistantContent(textEl.textContent)) {
+        textEl.classList.add("chat-text--loading");
+        textEl.textContent = "正在接入实时同步…";
+      }
+    }
+  }
+
+  void (async () => {
+    try {
+      await window.agentLiveEventStream({
+        chatId,
+        afterSeq: 0,
+        signal: abortController.signal,
+        onEvent: (event) => applyLiveFollowEvent(chatId, event),
+      });
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        console.warn("live event stream error", error);
+      }
+    } finally {
+      liveFollows.delete(chatId);
+      const stream = chatStreams.get(chatId);
+      if (stream?.isFollower) chatStreams.delete(chatId);
+      if (chatId === activeChatId) syncComposerForActiveChat();
+    }
+  })();
 }
 
 function isStoppedAssistantEntry(item) {
@@ -1038,7 +1239,7 @@ function renderRecentChats() {
   chats.forEach((chat) => {
     const item = document.createElement("div");
     item.className = "sidebar-recent-session";
-    if (isChatStreaming(chat.id)) {
+    if (isChatStreaming(chat.id) || liveFollows.has(chat.id)) {
       item.classList.add("sidebar-recent-session--streaming");
     }
     if (chat.id === activeChatId) item.classList.add("sidebar-recent-session--active");
@@ -1071,13 +1272,23 @@ function renderRecentChats() {
 }
 
 function startNewChat() {
+  const previousChatId = activeChatId;
   persistActiveChat();
   removeEmptyChat(activeChatId);
-  cancelAllChatStreams();
+
+  // 每个 chat 有独立内核：开新对话时不要 cancel/interrupt 旧会话的 Agent / Jupyter。
+  // 旧会话若仍在跑，SSE 继续后台接收事件并写入该会话的记录。
+  if (previousChatId && isChatStreaming(previousChatId)) {
+    renderRecentChats();
+  }
+
+  // 切到新会话时，清掉「当前可见」代码执行指针；后台会话用 stream.codeExecutionId
+  activeCodeExecutionId = null;
 
   activeChatId = createId();
   chatHistory = [];
   chatStore.activeChatId = activeChatId;
+  ensureChatRecord(activeChatId);
   saveChatStore();
 
   renderChatThread();
@@ -1085,6 +1296,7 @@ function startNewChat() {
   syncComposerForActiveChat();
   setPage("agent");
   window.KernelPanel?.refresh?.({ force: true });
+  window.KernelPanel?.startPolling?.(12000);
 }
 
 function loadChat(chatId) {
@@ -1097,6 +1309,8 @@ function loadChat(chatId) {
   activeChatId = chat.id;
   chatStore.activeChatId = activeChatId;
   chatHistory = chat.messages.map((item) => normalizeMessage(item));
+  // 切回仍在跑的会话时，恢复该会话自己的代码执行卡片 ID
+  activeCodeExecutionId = chatStreams.get(chatId)?.codeExecutionId || null;
   saveChatStore();
 
   renderChatThread();
@@ -1367,9 +1581,13 @@ function markRunningExecutionsStopped() {
   const chat = ensureActiveChatRecord();
   if (!Array.isArray(chat.codePanel)) return;
 
+  // 背景监控卡直接移除，不要标成「已停止」干扰真实下载进度卡
+  removeBackgroundExecutionCard();
+
   let changed = false;
   chat.codePanel.forEach((item, index) => {
     if (item.type === "execution" && !item.done && !item.stopped) {
+      if (item.id === BACKGROUND_EXECUTION_ID) return;
       chat.codePanel[index] = stripDownloadProgressFields({
         ...item,
         done: true,
@@ -1384,6 +1602,10 @@ function markRunningExecutionsStopped() {
   if (changed) persistActiveChat();
 
   getCodePanelInner()?.querySelectorAll(".code-execution-progress--running").forEach((card) => {
+    if (card.dataset.executionId === BACKGROUND_EXECUTION_ID) {
+      card.remove();
+      return;
+    }
     applyExecutionStoppedCard(card);
   });
   activeCodeExecutionId = null;
@@ -1568,8 +1790,31 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
   const isActiveDownload = !isCompact && Boolean(artifact.isDownloadTask);
   const barWrap = card.querySelector(".code-execution-progress__bar-wrap");
   const barFill = card.querySelector(".code-execution-progress__bar-fill");
-  const overallPct = Number(artifact.progressOverallPct);
-  const hasPct = artifact.progressOverallPct != null && Number.isFinite(overallPct);
+  const bytes = Number(artifact.progressBytes);
+  const bytesTotal = Number(artifact.progressBytesTotal);
+  const fileIndex = Number(artifact.progressFileIndex);
+  const fileTotal = Number(artifact.progressFileTotal);
+  const filePctRaw = Number(artifact.progressFilePct);
+  let filePct = Number.isFinite(filePctRaw) ? filePctRaw : null;
+  if (Number.isFinite(bytes) && Number.isFinite(bytesTotal) && bytesTotal > 0) {
+    filePct = Math.max(0, Math.min(100, (bytes / bytesTotal) * 100));
+  }
+
+  let overallPct = Number(artifact.progressOverallPct);
+  let hasPct = artifact.progressOverallPct != null && Number.isFinite(overallPct);
+  // 整体% 不能用「当前文件序号/总数」冒充完成；有本文件进度时按加权重算
+  if (
+    Number.isFinite(fileIndex)
+    && Number.isFinite(fileTotal)
+    && fileTotal > 0
+    && filePct != null
+  ) {
+    const weighted = ((fileIndex - 1) + filePct / 100) / fileTotal * 100;
+    if (!hasPct || (overallPct >= 99.5 && filePct < 95) || Math.abs(overallPct - weighted) > 8) {
+      overallPct = weighted;
+      hasPct = true;
+    }
+  }
   const hasBytes = Number(artifact.progressBytes) > 0;
   const hasProgress =
     isActiveDownload && isDownloadProgressArtifact(artifact) && (hasPct || hasBytes);
@@ -1595,7 +1840,20 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
 
   const barLabel = card.querySelector(".code-execution-progress__bar-label");
   const barMeta = card.querySelector(".code-execution-progress__bar-meta");
-  const isIndeterminate = Boolean(artifact.progressIndeterminate) && !hasPct && hasBytes;
+  let barPct = hasPct ? overallPct : filePct;
+  if (barPct == null || !Number.isFinite(barPct)) barPct = 0;
+
+  const runLabel = artifact.progressRun || "";
+  let displayLabel = artifact.progressLabel || artifact.stage || "下载中…";
+  if (runLabel && fileIndex && fileTotal && hasPct && filePct != null) {
+    displayLabel = `${runLabel} · 本文件 ${filePct.toFixed(1)}% · 整体 ${Number(barPct).toFixed(1)}% (${fileIndex}/${fileTotal})`;
+  } else if (runLabel && hasPct && filePct != null) {
+    displayLabel = `${runLabel} · 本文件 ${filePct.toFixed(1)}% · 整体 ${Number(barPct).toFixed(1)}%`;
+  } else if (runLabel && hasPct) {
+    displayLabel = `${runLabel} · 整体 ${Number(barPct).toFixed(1)}%`;
+  }
+
+  const isIndeterminate = Boolean(artifact.progressIndeterminate) && !hasPct && hasBytes && filePct == null;
   if (barWrap && barFill) {
     barFill.classList.remove("code-execution-progress__bar-fill--indeterminate");
     if (!hasProgress) {
@@ -1610,27 +1868,28 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
       if (isIndeterminate) {
         barFill.style.width = "";
       } else {
-        const pct = Math.max(0, Math.min(100, overallPct));
+        const pct = Math.max(0, Math.min(100, barPct));
         barFill.style.width = `${pct}%`;
       }
       if (barLabel) {
-        barLabel.textContent = artifact.progressLabel || artifact.stage || "下载中…";
+        barLabel.textContent = displayLabel;
       }
       if (barMeta) {
-        const bytes = Number(artifact.progressBytes);
-        const bytesTotal = Number(artifact.progressBytesTotal);
         if (Number.isFinite(bytes) && Number.isFinite(bytesTotal) && bytesTotal > 0) {
           const fmt = (value) => `${(value / 1024 / 1024).toFixed(1)} MB`;
-          const pctText = hasPct ? ` · ${overallPct.toFixed(1)}%` : "";
-          barMeta.textContent = `${fmt(bytes)} / ${fmt(bytesTotal)}${pctText}`;
+          const fileText = filePct != null ? `本文件 ${filePct.toFixed(1)}%` : "";
+          const overallText = `整体 ${Number(barPct).toFixed(1)}%`;
+          barMeta.textContent = [fmt(bytes) + " / " + fmt(bytesTotal), fileText, overallText]
+            .filter(Boolean)
+            .join(" · ");
         } else if (Number.isFinite(bytes) && bytes > 0) {
           barMeta.textContent = hasPct
-            ? `${overallPct.toFixed(1)}% · ${(bytes / 1024 / 1024).toFixed(1)} MB`
+            ? `整体 ${Number(barPct).toFixed(1)}% · ${(bytes / 1024 / 1024).toFixed(1)} MB`
             : `${(bytes / 1024 / 1024).toFixed(1)} MB 已下载`;
         } else if (artifact.progressFileIndex && artifact.progressFileTotal) {
-          barMeta.textContent = `文件 ${artifact.progressFileIndex}/${artifact.progressFileTotal}${hasPct ? ` · ${overallPct.toFixed(1)}%` : ""}`;
+          barMeta.textContent = `文件 ${artifact.progressFileIndex}/${artifact.progressFileTotal}${hasPct ? ` · 整体 ${Number(barPct).toFixed(1)}%` : ""}`;
         } else if (hasPct) {
-          barMeta.textContent = `${overallPct.toFixed(1)}%`;
+          barMeta.textContent = `整体 ${Number(barPct).toFixed(1)}%`;
         } else {
           barMeta.textContent = "下载中…";
         }
@@ -1919,7 +2178,10 @@ function ensureCodeExecutionProgress(_group, executionId) {
 function updateCodeExecutionProgress(group, event) {
   if (event.type === "code_execution_started") {
     markRunningExecutionsStopped();
+    removeBackgroundExecutionCard();
     activeCodeExecutionId = createId();
+    const stream = chatStreams.get(activeChatId);
+    if (stream) stream.codeExecutionId = activeCodeExecutionId;
   }
 
   const executionId = activeCodeExecutionId;
@@ -1934,15 +2196,27 @@ function updateCodeExecutionProgress(group, event) {
   const card = ensureCodeExecutionProgress(group, executionId);
   if (!card) return;
 
-  const executionCode = resolveExecutionCode(event) || pendingExecutionCode || "";
+  const executionCode = resolveExecutionCode(event) || pendingExecutionCode || existing?.code || "";
   if (event.type === "code_execution_started" && executionCode) {
     pendingExecutionCode = "";
   }
 
-  const elapsed = event.elapsedLabel || (event.elapsedSec != null ? `${event.elapsedSec} 秒` : "");
+  const elapsed = event.elapsedLabel || (event.elapsedSec != null ? `${event.elapsedSec} 秒` : "") || existing?.elapsedLabel || "";
   const title = event.type === "code_execution_started" ? "代码已开始运行" : "代码仍在运行";
   const stageText = event.stage || (event.type === "code_execution_started" ? "已启动，等待输出" : "运行中");
-  const isDownloadTask = Boolean(event.isDownloadTask);
+
+  const hasProgressFields = Boolean(
+    event.progressOverallPct != null
+    || event.progressFilePct != null
+    || event.progressRun
+    || event.progressFileTotal
+    || event.progressBytesTotal
+    || event.progressLabel
+    || Number(event.progressBytes) > 0
+    || event.progressIndeterminate,
+  );
+  const isDownloadTask = Boolean(event.isDownloadTask || existing?.isDownloadTask || hasProgressFields);
+
   const rawHighlights = Array.isArray(event.highlights)
     ? event.highlights.filter(Boolean)
     : String(event.snippet || "")
@@ -1952,18 +2226,17 @@ function updateCodeExecutionProgress(group, event) {
   const highlights = filterExecutionHighlights(rawHighlights, { isDownloadTask });
 
   let hint = "点击「停止」将中断 Jupyter 内核中的代码。";
-  const nextUpdate = Number(event.nextUpdateSec);
-  if (event.type === "code_execution_started") {
-    hint = `首次进度更新约 ${formatWaitTime(nextUpdate || 10)} 后；点击「停止」可中断内核。`;
-  } else if (Number.isFinite(nextUpdate) && nextUpdate > 0) {
-    hint = `下次进度更新约 ${formatWaitTime(nextUpdate)} 后；点击「停止」可中断内核。`;
+  if (isDownloadTask) {
+    hint = "下载进度实时更新；点击「停止」可中断内核。";
+  } else if (event.type === "code_execution_started") {
+    hint = "代码已启动，进度将实时刷新；点击「停止」可中断内核。";
   }
 
   const artifact = {
     type: "execution",
     id: executionId,
     title,
-    description: event.description || event.summary || "",
+    description: event.description || event.summary || existing?.description || "",
     code: executionCode,
     stage: stageText,
     highlights: highlights.slice(-4),
@@ -1975,24 +2248,46 @@ function updateCodeExecutionProgress(group, event) {
   };
 
   if (isDownloadTask) {
+    const pick = (key) => (event[key] != null ? event[key] : existing?.[key]);
     Object.assign(artifact, {
-      progressOverallPct: event.progressOverallPct,
-      progressFilePct: event.progressFilePct,
-      progressRun: event.progressRun,
-      progressFileIndex: event.progressFileIndex,
-      progressFileTotal: event.progressFileTotal,
-      progressBytes: event.progressBytes,
-      progressBytesTotal: event.progressBytesTotal,
-      progressLabel: event.progressLabel,
-      progressIndeterminate: event.progressIndeterminate,
+      progressOverallPct: pick("progressOverallPct"),
+      progressFilePct: pick("progressFilePct"),
+      progressRun: pick("progressRun"),
+      progressFileIndex: pick("progressFileIndex"),
+      progressFileTotal: pick("progressFileTotal"),
+      progressBytes: pick("progressBytes"),
+      progressBytesTotal: pick("progressBytesTotal"),
+      progressLabel: pick("progressLabel"),
+      progressIndeterminate: event.progressIndeterminate != null
+        ? event.progressIndeterminate
+        : existing?.progressIndeterminate,
     });
+    // 事件缺字段时 pick 会残留旧整体%；用当前字节纠偏，避免 21MB/218MB 却显示 100%
+    const b = Number(artifact.progressBytes);
+    const bt = Number(artifact.progressBytesTotal);
+    const fi = Number(artifact.progressFileIndex);
+    const ft = Number(artifact.progressFileTotal);
+    if (Number.isFinite(b) && Number.isFinite(bt) && bt > 0) {
+      const fp = Math.max(0, Math.min(100, (b / bt) * 100));
+      artifact.progressFilePct = fp;
+      if (Number.isFinite(fi) && Number.isFinite(ft) && ft > 0) {
+        const weighted = ((fi - 1) + fp / 100) / ft * 100;
+        const reported = Number(artifact.progressOverallPct);
+        if (!Number.isFinite(reported) || (reported >= 99.5 && fp < 95) || Math.abs(reported - weighted) > 8) {
+          artifact.progressOverallPct = Math.round(weighted * 10) / 10;
+          artifact.progressLabel = `${artifact.progressRun || "FASTQ"} · 本文件 ${fp.toFixed(1)}% · 整体 ${artifact.progressOverallPct.toFixed(1)}% (${fi}/${ft})`;
+        }
+      }
+    }
   }
 
   applyExecutionCardState(card, artifact, { showStop: isActiveChatSending() });
   recordCodeArtifact(artifact);
 
-  scrollCodePanelToBottom();
-  scrollThreadToBottom();
+  // 下载进度更新时不要反复把面板滚到底，避免进度条视觉跳动
+  if (!isDownloadTask || event.type === "code_execution_started") {
+    scrollCodePanelToBottom();
+  }
 }
 
 function finishCodeExecutionProgress(_group) {
@@ -2020,10 +2315,156 @@ function finishCodeExecutionProgress(_group) {
   applyExecutionCardState(card, artifact);
   recordCodeArtifact(artifact);
   activeCodeExecutionId = null;
+  const stream = chatStreams.get(activeChatId);
+  if (stream) stream.codeExecutionId = null;
 
   scrollCodePanelToBottom();
   scrollThreadToBottom();
   void hydrateExecutionCodes();
+  // 每步代码执行结束后立即刷新右侧 Environment / Visualization
+  window.KernelPanel?.refresh?.({ force: true });
+}
+
+function buildCodeProgressArtifact(event, existing, executionId) {
+  const elapsed = event.elapsedLabel
+    || (event.elapsedSec != null ? `${event.elapsedSec} 秒` : "")
+    || existing?.elapsedLabel
+    || "";
+  const title = event.type === "code_execution_started" ? "代码已开始运行" : "代码仍在运行";
+  const stageText = event.stage
+    || (event.type === "code_execution_started" ? "已启动，等待输出" : "运行中");
+  const hasProgressFields = Boolean(
+    event.progressOverallPct != null
+    || event.progressFilePct != null
+    || event.progressRun
+    || event.progressFileTotal
+    || event.progressBytesTotal
+    || event.progressLabel
+    || Number(event.progressBytes) > 0
+    || event.progressIndeterminate,
+  );
+  const isDownloadTask = Boolean(event.isDownloadTask || existing?.isDownloadTask || hasProgressFields);
+  const executionCode = resolveExecutionCode(event) || existing?.code || "";
+  const rawHighlights = Array.isArray(event.highlights)
+    ? event.highlights.filter(Boolean)
+    : String(event.snippet || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+  const highlights = filterExecutionHighlights(rawHighlights, { isDownloadTask });
+
+  const artifact = {
+    type: "execution",
+    id: executionId,
+    title,
+    description: event.description || event.summary || existing?.description || "",
+    code: executionCode,
+    stage: stageText,
+    highlights: highlights.slice(-4),
+    elapsedLabel: elapsed,
+    hint: isDownloadTask
+      ? "下载进度实时更新；点击「停止」可中断内核。"
+      : "代码已启动，进度将实时刷新；点击「停止」可中断内核。",
+    done: false,
+    stopped: false,
+    isDownloadTask,
+  };
+
+  if (isDownloadTask) {
+    const pick = (key) => (event[key] != null ? event[key] : existing?.[key]);
+    Object.assign(artifact, {
+      progressOverallPct: pick("progressOverallPct"),
+      progressFilePct: pick("progressFilePct"),
+      progressRun: pick("progressRun"),
+      progressFileIndex: pick("progressFileIndex"),
+      progressFileTotal: pick("progressFileTotal"),
+      progressBytes: pick("progressBytes"),
+      progressBytesTotal: pick("progressBytesTotal"),
+      progressLabel: pick("progressLabel"),
+      progressIndeterminate: event.progressIndeterminate != null
+        ? event.progressIndeterminate
+        : existing?.progressIndeterminate,
+    });
+    // 事件缺字段时 pick 会残留旧整体%；用当前字节纠偏，避免 21MB/218MB 却显示 100%
+    const b = Number(artifact.progressBytes);
+    const bt = Number(artifact.progressBytesTotal);
+    const fi = Number(artifact.progressFileIndex);
+    const ft = Number(artifact.progressFileTotal);
+    if (Number.isFinite(b) && Number.isFinite(bt) && bt > 0) {
+      const fp = Math.max(0, Math.min(100, (b / bt) * 100));
+      artifact.progressFilePct = fp;
+      if (Number.isFinite(fi) && Number.isFinite(ft) && ft > 0) {
+        const weighted = ((fi - 1) + fp / 100) / ft * 100;
+        const reported = Number(artifact.progressOverallPct);
+        if (!Number.isFinite(reported) || (reported >= 99.5 && fp < 95) || Math.abs(reported - weighted) > 8) {
+          artifact.progressOverallPct = Math.round(weighted * 10) / 10;
+          artifact.progressLabel = `${artifact.progressRun || "FASTQ"} · 本文件 ${fp.toFixed(1)}% · 整体 ${artifact.progressOverallPct.toFixed(1)}% (${fi}/${ft})`;
+        }
+      }
+    }
+  }
+  return artifact;
+}
+
+/** 非当前可见会话：只落盘进度到该 chat 的 codePanel，不改当前 DOM */
+function recordBackgroundCodeProgress(streamChatId, event) {
+  const stream = chatStreams.get(streamChatId);
+  if (!stream || !streamChatId) return;
+  const chat = ensureChatRecord(streamChatId);
+  if (!Array.isArray(chat.codePanel)) chat.codePanel = [];
+
+  if (event.type === "code_execution_started") {
+    chat.codePanel = chat.codePanel.map((item) => {
+      if (item.type === "execution" && !item.done && !item.stopped && item.id !== BACKGROUND_EXECUTION_ID) {
+        return stripDownloadProgressFields({
+          ...item,
+          done: true,
+          stopped: true,
+          title: "代码已停止",
+          stage: "已终止",
+          hint: "",
+        });
+      }
+      return item;
+    });
+    stream.codeExecutionId = createId();
+  }
+
+  const executionId = stream.codeExecutionId;
+  if (!executionId) return;
+
+  const existing = chat.codePanel.find(
+    (item) => item.type === "execution" && item.id === executionId,
+  );
+  if (existing?.done || existing?.stopped) return;
+
+  const artifact = buildCodeProgressArtifact(event, existing, executionId);
+  recordCodeArtifactForChat(streamChatId, artifact);
+}
+
+function finishBackgroundCodeProgress(streamChatId) {
+  const stream = chatStreams.get(streamChatId);
+  const executionId = stream?.codeExecutionId;
+  if (!streamChatId || !executionId) return;
+  const chat = ensureChatRecord(streamChatId);
+  const existing = chat?.codePanel?.find(
+    (item) => item.type === "execution" && item.id === executionId,
+  );
+  recordCodeArtifactForChat(
+    streamChatId,
+    stripDownloadProgressFields({
+      type: "execution",
+      id: executionId,
+      title: "代码运行完成",
+      description: existing?.description || "",
+      code: existing?.code || "",
+      stage: "已完成",
+      done: true,
+      stopped: false,
+      hint: "",
+    }),
+  );
+  stream.codeExecutionId = null;
 }
 
 function appendThinkingStepToEntry(assistantEntry, step) {
@@ -2075,6 +2516,7 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
       title: event.summary || event.description || "代码执行中",
       body: stage,
     });
+    recordBackgroundCodeProgress(streamChatId, event);
     return;
   }
   if (event.type === "done" && event.text) {
@@ -2117,6 +2559,10 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
         title: event.summary || "execute_code 完成",
         body: event.content || "",
       });
+      finishBackgroundCodeProgress(streamChatId);
+      if (streamChatId === activeChatId) {
+        window.KernelPanel?.refresh?.({ force: true });
+      }
     }
   }
 }
@@ -2145,7 +2591,7 @@ function handleAgentStreamEvent(group, event) {
       textEl.classList.add("chat-text--loading");
       textEl.textContent = msg;
     }
-    if (event.kernelBusy) {
+    if (event.kernelBusy && !activeCodeExecutionId) {
       ensureBackgroundExecutionCard(
         {
           ok: true,
@@ -2290,15 +2736,24 @@ function isStreamGenerationLive(chatId, generation) {
 async function handleStop() {
   if (!isActiveChatSending()) return;
   const stream = chatStreams.get(activeChatId);
-  if (!stream) return;
-  stream.generation = -1;
-  stream.abortController?.abort();
+  const follow = liveFollows.get(activeChatId);
+  const runId = stream?.runId || follow?.runId || "";
+
+  if (stream && !stream.isFollower) {
+    stream.generation = -1;
+    stream.abortController?.abort();
+  }
+  if (follow) {
+    // 先取消后端任务，再断开旁观流
+  }
   markRunningExecutionsStopped();
   stopBackgroundRunWatch(activeChatId);
-  if (stream.runId && window.cancelAgentRun) {
-    await window.cancelAgentRun(stream.runId, activeChatId);
-  } else if (window.cancelAgentRun) {
-    await window.cancelAgentRun(null, activeChatId);
+  if (window.cancelAgentRun) {
+    await window.cancelAgentRun(runId || null, activeChatId);
+  }
+  detachLiveEventStream(activeChatId);
+  if (stream?.isFollower) {
+    chatStreams.delete(activeChatId);
   }
   syncComposerForActiveChat();
 }
@@ -2422,6 +2877,11 @@ async function handleSend() {
             assistantEntry,
             messages: streamMessages,
           });
+          return;
+        }
+        // Agent/内核已空闲：收尾轮询期间创建的「Agent 运行中」背景卡片，避免聊天结束后仍显示运行中
+        if (streamChatId === activeChatId) {
+          finishBackgroundExecutionCard();
         }
       })();
     }, STREAM_STATUS_POLL_MS);
@@ -2639,6 +3099,10 @@ async function handleSend() {
       startBackgroundRunWatch(streamChatId, { pending, assistantEntry });
       finishChatStream(streamChatId, { keepBackgroundWatch: true });
       return;
+    }
+    // 流式已结束且任务不在跑：必须收尾背景监控卡片（轮询期间可能已创建「Agent 运行中」）
+    if (streamChatId === activeChatId) {
+      finishBackgroundExecutionCard();
     }
     if (assistantEntry && isPlaceholderAssistantContent(assistantEntry.content)) {
       const fallback = "（流式连接已结束，未检测到后台任务）";

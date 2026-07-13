@@ -180,7 +180,8 @@
 
   async function refresh(options = {}) {
     if (!window.llmIsLocalServer?.()) return;
-    if (window.isAgentSending?.()) return;
+    // Agent 流式进行中默认不轮询；但 force=true（例如每步 execute_code 结束后）仍刷新
+    if (window.isAgentSending?.() && !options.force) return;
     if (refreshInFlight && !options.force) return;
     const now = Date.now();
     if (!options.force && now - lastRefreshAt < MIN_REFRESH_MS) return;

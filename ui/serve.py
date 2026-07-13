@@ -230,6 +230,12 @@ def iter_agent_chat_stream(body: dict[str, Any]):
     yield from run_agent_chat_stream(body)
 
 
+def iter_agent_live_stream(chat_id: str, after_seq: int = 0):
+    from agent_bridge import run_agent_live_stream
+
+    yield from run_agent_live_stream(chat_id, after_seq=after_seq)
+
+
 def forward_agent_run_status(chat_id: str) -> dict[str, Any]:
     try:
         from agent_bridge import agent_run_status
@@ -350,7 +356,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _write_sse_stream(self, event_iter) -> None:
+    def _write_sse_stream(self, event_iter, *, cancel_on_disconnect: bool = True) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -367,11 +373,13 @@ class Handler(SimpleHTTPRequestHandler):
             for event in event_iter:
                 if isinstance(event, dict) and event.get("type") == "run_start":
                     run_id = str(event.get("runId") or "")
+                if isinstance(event, dict) and event.get("type") == "live_joined" and event.get("runId"):
+                    run_id = str(event.get("runId") or run_id)
                 payload = json.dumps(event, ensure_ascii=False).encode("utf-8")
                 self.wfile.write(b"data: " + payload + b"\n\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            if run_id:
+            if cancel_on_disconnect and run_id:
                 try:
                     from agent_bridge import cancel_run, record_sse_disconnect, resolve_chat_id_for_run
 
@@ -408,6 +416,21 @@ class Handler(SimpleHTTPRequestHandler):
                 self._write_json({"ok": False, "error": "chatId 不能为空"}, err_status=400)
                 return
             self._write_json(forward_agent_run_status(chat_id))
+            return
+        if path == "/api/agent/events/stream":
+            if not chat_id:
+                self._write_json({"ok": False, "error": "chatId 不能为空"}, err_status=400)
+                return
+            after_raw = str((query.get("afterSeq") or ["0"])[0]).strip() or "0"
+            try:
+                after_seq = max(0, int(after_raw))
+            except ValueError:
+                after_seq = 0
+            # 旁观端断开绝不能 cancel 主任务
+            self._write_sse_stream(
+                iter_agent_live_stream(chat_id, after_seq=after_seq),
+                cancel_on_disconnect=False,
+            )
             return
         if path == "/api/kernel/environment":
             if not chat_id:
@@ -547,7 +570,7 @@ def main() -> None:
         print(f"OpenClaw UI → http://127.0.0.1:{port}/index.html")
     print(f"Work space  → {workspace}")
     print("LLM proxy   → POST /api/llm/chat")
-    print("sRNAgent    → POST /api/agent/chat  /api/agent/chat/stream  /api/agent/cancel  /api/agent/approve  GET /api/agent/status  GET /api/agent/run-status?chatId=  GET /api/kernel/environment?chatId=  GET /api/kernel/figures?chatId=  GET /api/work_space/files?path=  GET /api/sessions  GET /api/sessions/detail?chatId=  POST /api/sessions/save  POST /api/kernel/release")
+    print("sRNAgent    → POST /api/agent/chat  /api/agent/chat/stream  /api/agent/cancel  /api/agent/approve  GET /api/agent/status  GET /api/agent/run-status?chatId=  GET /api/agent/events/stream?chatId=  GET /api/kernel/environment?chatId=  GET /api/kernel/figures?chatId=  GET /api/work_space/files?path=  GET /api/sessions  GET /api/sessions/detail?chatId=  POST /api/sessions/save  POST /api/kernel/release")
     print("Press Ctrl+C to stop")
     try:
         server.serve_forever()
