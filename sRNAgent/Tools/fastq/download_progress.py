@@ -7,6 +7,8 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 from ...agent.agent_config import DOWNLOAD_STALL_TIMEOUT_SEC
 
 PROGRESS_MARKER = "__SRNAGENT_DL__"
@@ -15,6 +17,14 @@ PROGRESS_MARKER = "__SRNAGENT_DL__"
 def emit_download_progress(payload: Dict[str, Any]) -> None:
     """Print a machine-readable progress marker for the UI stream parser."""
     print(f"{PROGRESS_MARKER} {json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
+def _overall_pct(file_index: int, file_total: int, file_pct: float) -> float:
+    """Weighted overall progress: completed files + current file fraction."""
+    total = max(int(file_total), 1)
+    index = max(1, min(int(file_index), total))
+    pct = max(0.0, min(100.0, float(file_pct)))
+    return round(((index - 1) + pct / 100.0) / total * 100.0, 1)
 
 
 def _download_one_url(
@@ -37,7 +47,7 @@ def _download_one_url(
                 "fileIndex": file_index,
                 "fileTotal": file_total,
                 "filePct": 100.0,
-                "overallPct": round(file_index / max(file_total, 1) * 100, 1),
+                "overallPct": _overall_pct(file_index, file_total, 100.0),
                 "bytes": size,
                 "bytesTotal": size,
                 "skipped": True,
@@ -80,29 +90,27 @@ def _download_one_url(
                 now = time.monotonic()
                 if now - last_emit >= min_interval:
                     file_pct = (downloaded / total * 100) if total else 0.0
-                    overall = ((file_index - 1) + file_pct / 100.0) / max(file_total, 1) * 100
                     emit_download_progress(
                         {
                             "run": run_id,
                             "fileIndex": file_index,
                             "fileTotal": file_total,
                             "filePct": round(file_pct, 1),
-                            "overallPct": round(overall, 1),
+                            "overallPct": _overall_pct(file_index, file_total, file_pct),
                             "bytes": downloaded,
                             "bytesTotal": total,
                         }
                     )
                     last_emit = now
 
-        file_pct = 100.0 if total else 100.0
-        overall = file_index / max(file_total, 1) * 100
+        file_pct = 100.0
         emit_download_progress(
             {
                 "run": run_id,
                 "fileIndex": file_index,
                 "fileTotal": file_total,
                 "filePct": file_pct,
-                "overallPct": round(overall, 1),
+                "overallPct": _overall_pct(file_index, file_total, file_pct),
                 "bytes": downloaded,
                 "bytesTotal": total or downloaded,
             }

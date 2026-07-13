@@ -60,10 +60,6 @@ sa.alignment.bowtie_build("ref/GRCh38.primary_assembly.genome.fa", "ref/grch38",
 
 ## Instructions
 
-> 💡 **推荐流程：优先使用 `quantify_mirna` 定量已知 miRNA。** 它对已知 miRNA 做表达定量，输出表达矩阵到 `adata.X`，速度快、结果可靠。
->
-> `predict_mirna`（预测 novel miRNA）计算量大且结果需要人工验证，仅在有发现新 miRNA 需求时使用。**除非用户明确要求发现新 miRNA，否则默认走已知 miRNA 定量流程。**
-
 > ⚠️ **必须先确认 sRNA-seq 的 3' adapter 序列是否正确 —— 这直接影响 miRNA 定量结果**
 >
 > miRDeep2 的 `mapper.pl` 内置了 adapter 剪切功能（`adapter=` 参数）。如果 adapter 序列给错，reads 无法正确比对到基因组，miRNA 定量和 novel miRNA 预测都会失败。
@@ -82,9 +78,7 @@ sa.alignment.bowtie_build("ref/GRCh38.primary_assembly.genome.fa", "ref/grch38",
 > | QIAseq miRNA | `AACTGTAGGCACCATCAAT` |
 > | SMARTer smRNA-Seq | `GTTCAGAGTTCTACAGTCCGACGATC` |
 
-### 1. 定量已知 miRNA（默认推荐，人类 hsa）
-
-> ⚠️ **样本命名规则：** 默认使用 SRR 开头的 Run ID（如 `SRR26304152`）作为 `adata.obs_names`。从 ENA/SRA 下载的数据自动就是 SRR ID。仅当用户上传自己的数据或明确要求不用 SRR 格式时，才使用自定义名称（如 `S1`、`sample1`）。
+### 1. 定量已知 miRNA（默认，人类 hsa）
 
 单个样本：
 

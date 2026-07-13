@@ -61,8 +61,6 @@ Throughout this skill, we use **SRP464891** -- a real sRNA-seq project with 10 s
 
    The API requires an existing AnnData whose `obs` index lists the sample names. The `accessions` parameter must match the `obs` length.
 
-   > ⚠️ **样本命名规则：** 默认使用 SRR 开头的 Run ID（如 `SRR26304152`）作为 `adata.obs_names`。从 ENA/SRA 下载的数据自动就是 SRR ID，用 Run-level accessions 时直接可以用 SRR ID 作为样本名。仅当用户上传自己的数据或明确要求不用 SRR 格式时，才使用自定义名称（如 `S1`）。
-
    ```python
    # 10 samples labelled S1 through S10
    adata = ad.AnnData(obs=pd.DataFrame(index=[f"S{i}" for i in range(1, 11)]))

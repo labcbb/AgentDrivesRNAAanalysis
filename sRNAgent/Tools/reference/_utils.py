@@ -130,29 +130,10 @@ def resumable_download(
 
     print(f"[download] {out.name} ({_fmt_size(total)}, {jobs} threads)", flush=True)
 
-    completed: list[bool] = [False] * jobs
-    lock = threading.Lock()
-
-    def _download_with_progress(i: int, start: int, end: int, part: Path) -> None:
-        _download_range(url, start, end, part)
-        with lock:
-            done = sum(1 for c in completed if c)
-            completed[i] = True
-            done_now = done + 1
-            pct = done_now / jobs * 100
-            print(
-                f"  [{done_now}/{jobs}] chunk {i} done ({pct:.0f}%)",
-                flush=True,
-            )
-
-    threads = []
+    threads: list[threading.Thread] = []
     for i, (start, end) in enumerate(ranges):
         part = out.with_suffix(f".part.{i}")
-        t = threading.Thread(
-            target=_download_with_progress,
-            args=(i, start, end, part),
-            daemon=True,
-        )
+        t = threading.Thread(target=_download_range, args=(url, start, end, part), daemon=True)
         threads.append(t)
         t.start()
 

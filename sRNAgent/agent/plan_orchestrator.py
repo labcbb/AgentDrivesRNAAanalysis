@@ -140,6 +140,20 @@ def _normalize_steps(raw_steps: Any, *, goal: str) -> List[Dict[str, Any]]:
 
 def _build_planner_system_prompt(skill_overview: str) -> str:
     skills_block = skill_overview or "(no skills loaded)"
+    try:
+        from .srn_agent import _load_agent_constitution
+
+        constitution = _load_agent_constitution()
+    except Exception:
+        constitution = ""
+    constitution_block = ""
+    if constitution:
+        constitution_block = (
+            "\n## Agent constitution (from sRNAgent/AGENT.md)\n"
+            "When planning pipeline steps, respect these hard rules "
+            "(adata must receive return values; check obs columns before re-running steps):\n\n"
+            f"{constitution}\n"
+        )
     return (
         "You are the Planner for sRNAgent, a small RNA-seq analysis assistant.\n"
         "Your job is to break the user's request into clear, sequential subtasks.\n"
@@ -166,6 +180,7 @@ def _build_planner_system_prompt(skill_overview: str) -> str:
         "6. Keep 1–8 steps; split oversized steps rather than one giant step.\n\n"
         "## Registered skills\n"
         f"{skills_block}\n"
+        f"{constitution_block}"
     )
 
 

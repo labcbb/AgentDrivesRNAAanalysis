@@ -29,8 +29,8 @@ ProgressCallback = Callable[[Dict[str, Any]], None]
 CodeApprovalCallback = Callable[[str, str, str], bool]
 StreamCallback = Callable[[str, str], None]
 
-_CODE_PROGRESS_INTERVALS = (10, 15, 20, 30, 30, 30, 30, 30, 30, 30, 30)
-_SSE_PROGRESS_HEARTBEAT_SEC = 12
+_CODE_PROGRESS_INTERVALS = (1, 1, 1, 1, 1, 1, 1, 1)
+_SSE_PROGRESS_HEARTBEAT_SEC = 3
 _PROGRESS_MARKER = "__SRNAGENT_DL__"
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _BROKEN_ESCAPE_RE = re.compile(r"\[(?:\[[0-9;]*[A-Za-z]|[0-9;]*[A-Za-z])")
@@ -216,15 +216,28 @@ def _parse_download_progress_marker(text: str) -> Dict[str, Any]:
         if bytes_total > 0:
             result["progressBytesTotal"] = bytes_total
             result["progressBytes"] = bytes_done
+            # Prefer bytes-based filePct when available — more trustworthy than emit side effects.
+            file_pct = min(100.0, bytes_done / bytes_total * 100.0)
+            result["progressFilePct"] = file_pct
         if result:
             run = result.get("progressRun") or "FASTQ"
             file_i = result.get("progressFileIndex")
             file_n = result.get("progressFileTotal")
+            file_pct = result.get("progressFilePct")
+            # Recompute overall from (completed files + current fraction), never use bare index/total.
+            if file_i and file_n and file_pct is not None:
+                overall = ((int(file_i) - 1) + float(file_pct) / 100.0) / max(int(file_n), 1) * 100.0
+                result["progressOverallPct"] = round(overall, 1)
             overall = result.get("progressOverallPct")
-            if file_i and file_n and overall is not None:
-                result["progressLabel"] = f"{run} · 文件 {file_i}/{file_n} · 总进度 {overall:.1f}%"
+            if file_i and file_n and overall is not None and file_pct is not None:
+                result["progressLabel"] = (
+                    f"{run} · 本文件 {float(file_pct):.1f}% · 整体 {float(overall):.1f}% "
+                    f"({int(file_i)}/{int(file_n)})"
+                )
+            elif file_i and file_n and overall is not None:
+                result["progressLabel"] = f"{run} · 整体 {float(overall):.1f}% ({int(file_i)}/{int(file_n)})"
             elif overall is not None:
-                result["progressLabel"] = f"{run} · 总进度 {overall:.1f}%"
+                result["progressLabel"] = f"{run} · 总进度 {float(overall):.1f}%"
         return result
     return {}
 
@@ -507,19 +520,6 @@ def _infer_file_download_progress(
         if active_path is None:
             active_acc, active_path = targets[-1]
 
-        total_expected = 0
-        total_bytes = 0
-        for acc, path in targets:
-            expected = _expected_download_total(
-                workspace, acc, text, code, filename=path.name,
-            )
-            got = _download_bytes_on_disk(path)
-            if expected > 0:
-                total_expected += expected
-                total_bytes += min(got, expected)
-            else:
-                total_bytes += got
-
         active_expected = _expected_download_total(
             workspace,
             active_acc,
@@ -530,6 +530,27 @@ def _infer_file_download_progress(
         active_got = _download_bytes_on_disk(active_path)
         file_index = next(i for i, (acc, _) in enumerate(targets, start=1) if acc == active_acc)
         file_total = len(targets)
+
+        total_expected = 0
+        total_bytes = 0
+        unknown_incomplete = False
+        for acc, path in targets:
+            expected = _expected_download_total(
+                workspace, acc, text, code, filename=path.name,
+            )
+            got = _download_bytes_on_disk(path)
+            if expected > 0:
+                total_expected += expected
+                total_bytes += min(got, expected)
+                if got < expected * 0.98 and acc == active_acc:
+                    pass  # still in progress; counted above
+            else:
+                # Unknown size: never fold partial bytes into a byte-ratio overall,
+                # otherwise finished siblings alone can make overall look like 100%.
+                if acc == active_acc and got > 0:
+                    unknown_incomplete = True
+                elif got <= 0:
+                    unknown_incomplete = True
 
         result: Dict[str, Any] = {
             "isDownloadTask": True,
@@ -545,26 +566,43 @@ def _infer_file_download_progress(
             result["progressFilePct"] = file_pct
             result["progressBytesTotal"] = active_expected
 
-        if total_expected > 0:
+        weighted_overall: Optional[float] = None
+        if file_pct is not None:
+            weighted_overall = (
+                ((file_index - 1) + float(file_pct) / 100.0) / max(file_total, 1) * 100.0
+            )
+
+        overall_pct: Optional[float] = None
+        if total_expected > 0 and not unknown_incomplete:
             overall_pct = min(100.0, total_bytes / total_expected * 100.0)
+            # Guard: byte-ratio near 100% while current file clearly unfinished.
+            if file_pct is not None and overall_pct >= 99.5 and file_pct < 95.0:
+                overall_pct = weighted_overall
+        elif weighted_overall is not None:
+            overall_pct = weighted_overall
+        elif unknown_incomplete:
+            # Known-size siblings only — cap below 100% while an unknown file is active.
+            if total_expected > 0:
+                sibling_pct = min(99.0, total_bytes / total_expected * 100.0)
+                overall_pct = min(
+                    sibling_pct,
+                    (file_index - 1) / max(file_total, 1) * 100.0,
+                )
+            else:
+                overall_pct = (file_index - 1) / max(file_total, 1) * 100.0
+
+        if overall_pct is not None:
+            overall_pct = round(float(overall_pct), 1)
             result["progressOverallPct"] = overall_pct
             if file_pct is not None:
                 result["progressLabel"] = (
-                    f"{active_acc} · {file_pct:.1f}% · 整体 {overall_pct:.1f}% · "
-                    f"{_format_bytes(total_bytes)} / {_format_bytes(total_expected)} "
+                    f"{active_acc} · 本文件 {file_pct:.1f}% · 整体 {overall_pct:.1f}% "
                     f"({file_index}/{file_total})"
                 )
             else:
                 result["progressLabel"] = (
                     f"{active_acc} · 整体 {overall_pct:.1f}% ({file_index}/{file_total})"
                 )
-        elif file_pct is not None:
-            result["progressOverallPct"] = file_pct
-            result["progressLabel"] = (
-                f"{active_acc} · {file_pct:.1f}% · "
-                f"{_format_bytes(active_got)} / {_format_bytes(active_expected)} "
-                f"({file_index}/{file_total})"
-            )
         elif active_got > 0:
             result["progressIndeterminate"] = True
             result["progressLabel"] = (
@@ -652,16 +690,24 @@ def _merge_execution_progress(
         return merged
 
     file_progress = _infer_file_download_progress(workspace, text, code)
-    if not file_progress:
-        return merged
     marker = _parse_download_progress_marker(text)
-    if marker.get("progressOverallPct") is not None and not file_progress.get("progressFileTotal"):
+
+    # Prefer realtime __SRNAGENT_DL__ marker for UI progress; disk inference only fills gaps.
+    if marker:
         merged["isDownloadTask"] = True
         merged.update({k: v for k, v in marker.items() if v is not None})
-    elif merged.get("progressOverallPct") is None:
+        if file_progress:
+            for key in (
+                "progressRun",
+                "progressFileIndex",
+                "progressFileTotal",
+                "progressLabel",
+            ):
+                if merged.get(key) in (None, "", 0) and file_progress.get(key) not in (None, ""):
+                    merged[key] = file_progress[key]
+    elif file_progress:
         merged.update({k: v for k, v in file_progress.items() if v is not None})
-    else:
-        merged.update({k: v for k, v in file_progress.items() if v is not None})
+
     if merged.get("isDownloadTask"):
         merged["highlights"] = []
         if merged.get("progressLabel"):
@@ -740,6 +786,17 @@ def _project_root() -> Path:
     return _package_root().parent
 
 
+def _load_agent_constitution() -> str:
+    """Load sRNAgent/AGENT.md — project hard rules injected into every agent system prompt."""
+    path = _package_root() / "AGENT.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        logger.debug("AGENT.md not found at %s", path)
+        return ""
+    return text
+
+
 def _build_system_prompt(skill_overview: str, extra_system: str = "") -> str:
     skills_block = skill_overview or "(no skills loaded)"
     base = (
@@ -755,6 +812,16 @@ def _build_system_prompt(skill_overview: str, extra_system: str = "") -> str:
         "## Registered skills\n"
         f"{skills_block}\n"
     )
+    constitution = _load_agent_constitution()
+    if constitution:
+        base = (
+            f"{base}\n"
+            "## Agent constitution (always follow; from sRNAgent/AGENT.md)\n"
+            "These are hard project rules for sRNAgent analysis code. "
+            "Obey them whenever you write or call pipeline APIs "
+            "(especially AnnData / adata mutate-and-return patterns).\n\n"
+            f"{constitution}\n"
+        )
     extra = (extra_system or "").strip()
     if extra:
         return f"{base}\n## Additional instructions\n{extra}\n"
@@ -951,7 +1018,7 @@ class SRNAgent:
             now = time.monotonic()
             if start_box[0] is None:
                 start_box[0] = now
-            if now - last_stream_progress[0] < 0.4:
+            if now - last_stream_progress[0] < 0.2:
                 return
             combined = stream_state["stdout"] or stream_state["stderr"]
             parsed = _parse_progress_output(combined, workspace=workspace, code=code_text)

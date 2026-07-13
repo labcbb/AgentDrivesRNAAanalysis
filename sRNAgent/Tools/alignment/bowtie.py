@@ -60,7 +60,7 @@ def bowtie_build(
     index_basename: str,
     offrate: Optional[int] = None,
     threads: int = 1,
-    verbose: bool = True,
+    verbose: bool = False,
     extra_args: Optional[Sequence[str]] = None,
 ) -> Dict[str, str]:
     """Build a Bowtie index from reference FASTA sequences.
@@ -77,7 +77,7 @@ def bowtie_build(
     threads
         Threads for index building (``-p``).
     verbose
-        Print verbose output from bowtie-build (``--verbose``). Default ``True``.
+        Print verbose output (``--verbose``).
     extra_args
         Additional arguments passed directly to bowtie-build.
 
