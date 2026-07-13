@@ -1,0 +1,13 @@
+{
+  "chatId": "89b24924-1f9e-428c-8c89-510ad223dbb2",
+  "steps": [
+    {
+      "tool": "finish",
+      "summary": "结论: hello test",
+      "detail": "hello test",
+      "at": "2026-07-11T20:20:21+00:00"
+    }
+  ],
+  "artifacts": [],
+  "updatedAt": "2026-07-11T20:20:21+00:00"
+}
