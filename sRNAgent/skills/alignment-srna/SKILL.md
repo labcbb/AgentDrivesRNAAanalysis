@@ -31,6 +31,12 @@ Bowtie alignment ─── single-end mode
 Aligned SAM file → downstream analysis (miRNA quantification, etc.)
 ```
 
+> ⚡ **批量样本时务必使用 `jobs=N` 并行比对**
+>
+> `sa.alignment.bowtie` 支持 `jobs` 参数控制并行比对的样本数（通过线程池，每个样本一个 bowtie 进程）。
+> 样本多时（比如 >3 个），设置 `jobs=4` 可显著缩短总耗时。
+> 如果用户没主动提并行数，**agent 应该根据样本量推荐一个合理的 `jobs` 值**。
+
 ## Instructions
 
 ### 1. 下载并构建参考基因组索引
@@ -227,6 +233,9 @@ adata = sa.alignment.bowtie(
 
 print(f"Aligned SAM: {adata.obs['sam_path'].iloc[0]}")
 print(f"Genome index: {adata.uns['genome_index']}")
+
+# 查看比对统计指标
+print(adata.obs.filter(like="bowtie_").to_string())
 ```
 
 ### 输出存储
@@ -236,11 +245,18 @@ print(f"Genome index: {adata.uns['genome_index']}")
 {"index_basename": "/path/to/grch38", "directory": "/path/to/"}
 
 # bowtie 修改 adata in-place 并返回
-adata.obs["sam_path"]       # 每个样本的 SAM 文件路径
-adata.uns["genome_index"]   # 使用的基因组索引 basename
+adata.obs["sam_path"]                    # 每个样本的 SAM 文件路径
+adata.obs["bowtie_log"]                  # bowtie 日志路径（含完整比对信息）
+adata.obs["bowtie_total_reads"]          # 总 reads 数
+adata.obs["bowtie_aligned_reads"]        # 比对上的 reads 数
+adata.obs["bowtie_alignment_rate"]       # 比对率 (%)
+adata.obs["bowtie_unaligned_reads"]      # 未比对上的 reads 数
+adata.obs["bowtie_suppressed_reads"]     # 因 -m 参数被抑制的 reads 数
+adata.obs["bowtie_reported_alignments"]  # 报告的比对总数
+adata.uns["genome_index"]                # 使用的基因组索引 basename
 
 # 批量比对时，adata.obs 每一行对应一个样本
-print(adata.obs[["sam_path"]])
+print(adata.obs[["sam_path", "bowtie_alignment_rate"]])
 ```
 
 ## Troubleshooting

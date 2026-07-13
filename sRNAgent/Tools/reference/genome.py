@@ -1,7 +1,10 @@
-"""Ensembl genome reference download API.
+"""Genome reference download API.
 
 Provides functions to download reference genome sequences and annotation
-files from `Ensembl FTP <https://ftp.ensembl.org/pub/current/>`_.
+files. For human (``homo_sapiens``) and mouse (``mus_musculus``), downloads
+from `GENCODE <https://www.gencodegenes.org/>`_ (primary assembly genome +
+primary assembly GTF). For all other species, downloads from
+`Ensembl FTP <https://ftp.ensembl.org/pub/current/>`_.
 Supports multi-threaded resumable download via ``_utils.py``.
 """
 
@@ -24,6 +27,25 @@ from ._utils import resumable_download
 ENSEMBL_CURRENT = "https://ftp.ensembl.org/pub/current"
 FASTA_BASE = f"{ENSEMBL_CURRENT}/fasta"
 GTF_BASE = f"{ENSEMBL_CURRENT}/gtf"
+
+GENCODE_BASE = "https://ftp.ebi.ac.uk/pub/databases/gencode"
+GENCODE_HUMAN = f"{GENCODE_BASE}/Gencode_human/latest_release"
+GENCODE_MOUSE = f"{GENCODE_BASE}/Gencode_mouse/latest_release"
+
+# Species names that use GENCODE instead of Ensembl
+_GENCODE_SPECIES = {"homo_sapiens", "mus_musculus"}
+_GENCODE_CONFIG = {
+    "homo_sapiens": {
+        "base_url": GENCODE_HUMAN,
+        "genome_suffix": "primary_assembly.genome.fa.gz",
+        "gtf_suffix": "primary_assembly.annotation.gtf.gz",
+    },
+    "mus_musculus": {
+        "base_url": GENCODE_MOUSE,
+        "genome_suffix": "primary_assembly.genome.fa.gz",
+        "gtf_suffix": "primary_assembly.annotation.gtf.gz",
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +72,11 @@ def _species_filename(name: str) -> str:
     return "_".join(part.capitalize() for part in name.strip().lower().split("_"))
 
 
+def _is_gencode_species(species: str) -> bool:
+    """Check if a species should use GENCODE instead of Ensembl."""
+    return _species_dirname(species) in _GENCODE_SPECIES
+
+
 def _parse_html_listing(url: str) -> List[str]:
     """Fetch and parse an HTML/FTP directory listing, returning entry names."""
     entries: List[str] = []
@@ -73,7 +100,6 @@ def _parse_html_listing(url: str) -> List[str]:
         for line in html.splitlines():
             line = line.strip()
             if line and not line.startswith(("total", "d", "-", "l")):
-                # Could be FTP LIST format
                 parts = line.split()
                 if parts:
                     name = parts[-1]
@@ -83,54 +109,72 @@ def _parse_html_listing(url: str) -> List[str]:
     return sorted(set(entries))
 
 
-def _find_dna_file(species: str, assembly: Optional[str] = None) -> str:
-    """Find the primary assembly FASTA filename for a species."""
-    species_file = _species_filename(species)
+def _find_gencode_genome(species: str) -> str:
+    """Find the primary assembly genome FASTA filename from GENCODE."""
+    sp = _species_dirname(species)
+    cfg = _GENCODE_CONFIG[sp]
+    url = f"{cfg['base_url']}/"
+    files = _parse_html_listing(url)
+    candidates = [f for f in files if f.endswith(cfg["genome_suffix"])]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No GENCODE primary assembly genome found for '{species}' at {url}"
+        )
+    return candidates[0]
+
+
+def _find_gencode_gtf(species: str) -> str:
+    """Find the primary assembly annotation GTF filename from GENCODE."""
+    sp = _species_dirname(species)
+    cfg = _GENCODE_CONFIG[sp]
+    url = f"{cfg['base_url']}/"
+    files = _parse_html_listing(url)
+    candidates = [f for f in files if f.endswith(cfg["gtf_suffix"])]
+    if not candidates:
+        raise FileNotFoundError(
+            f"No GENCODE primary assembly GTF found for '{species}' at {url}"
+        )
+    return candidates[0]
+
+
+def _find_ensembl_dna_file(species: str, assembly: Optional[str] = None) -> str:
+    """Find the primary assembly FASTA filename for a species from Ensembl."""
     dna_url = f"{FASTA_BASE}/{_species_dirname(species)}/dna/"
     files = _parse_html_listing(dna_url)
 
-    # Find primary assembly file
     candidates = [f for f in files if f.endswith(".fa.gz") and "primary_assembly" in f]
     if not candidates:
-        # Fall back to toplevel
         candidates = [f for f in files if f.endswith(".fa.gz") and "toplevel" in f]
     if not candidates:
-        # Fall back to any .dna. file
         candidates = [f for f in files if f.endswith(".fa.gz") and ".dna." in f]
     if not candidates:
         raise FileNotFoundError(
             f"No primary assembly FASTA found for '{species}' at {dna_url}"
         )
-
     return candidates[0]
 
 
-def _find_gtf_file(species: str, assembly: Optional[str] = None) -> str:
-    """Find the GTF annotation filename for a species."""
-    species_file = _species_filename(species)
+def _find_ensembl_gtf_file(species: str, assembly: Optional[str] = None) -> str:
+    """Find the GTF annotation filename for a species from Ensembl."""
     gtf_url = f"{GTF_BASE}/{_species_dirname(species)}/"
     files = _parse_html_listing(gtf_url)
 
-    # Find the main GTF (largest, no "abinitio" or "chr_patch")
     candidates = [
         f for f in files
         if f.endswith(".gtf.gz") and "abinitio" not in f and "chr_patch" not in f
     ]
     if not candidates:
         candidates = [f for f in files if f.endswith(".gtf.gz")]
-
     if not candidates:
         raise FileNotFoundError(
             f"No GTF file found for '{species}' at {gtf_url}"
         )
-
-    # If multiple, take the most specific one (longest name)
     candidates.sort(key=len, reverse=True)
     return candidates[0]
 
 
-def _find_ncrna_file(species: str) -> str:
-    """Find the ncRNA FASTA filename for a species."""
+def _find_ensembl_ncrna_file(species: str) -> str:
+    """Find the ncRNA FASTA filename for a species from Ensembl."""
     species_dir = _species_dirname(species)
     ncrna_url = f"{FASTA_BASE}/{species_dir}/ncrna/"
     files = _parse_html_listing(ncrna_url)
@@ -140,7 +184,6 @@ def _find_ncrna_file(species: str) -> str:
         raise FileNotFoundError(
             f"No ncRNA FASTA file found for '{species}' at {ncrna_url}"
         )
-
     return candidates[0]
 
 
@@ -178,7 +221,9 @@ def _generate_dict(fasta_gz: str | Path) -> str:
     description=(
         "List all available species in the current Ensembl release. "
         "Returns species directory names (e.g. ``homo_sapiens``, ``mus_musculus``) "
-        "that can be passed to ``download_genome()``, ``download_gtf()``, etc."
+        "that can be passed to ``download_genome()``, ``download_gtf()``, etc. "
+        "Note: ``homo_sapiens`` and ``mus_musculus`` download from GENCODE; "
+        "all other species download from Ensembl."
     ),
     examples=[
         'species = sa.reference.list_species()',
@@ -207,9 +252,12 @@ def list_species() -> List[str]:
     ],
     category="reference",
     description=(
-        "Download a reference genome FASTA (primary assembly) from Ensembl "
-        "and automatically generate a ``.dict`` sequence dictionary file "
-        "using ``samtools dict``."
+        "Download a reference genome FASTA (primary assembly).\n\n"
+        "For **human** (homo_sapiens) and **mouse** (mus_musculus), downloads "
+        "from **GENCODE** "
+        "(e.g. ``GRCh38.primary_assembly.genome.fa.gz``).\n"
+        "For all other species, downloads from **Ensembl**.\n"
+        "Automatically generates a ``.dict`` sequence dictionary file."
     ),
     examples=[
         'sa.reference.download_genome("homo_sapiens", output_dir="ref", jobs=8)',
@@ -229,24 +277,22 @@ def download_genome(
     force: bool = False,
     generate_dict: bool = True,
 ) -> Dict[str, str]:
-    """Download an Ensembl reference genome FASTA (primary assembly).
+    """Download a reference genome FASTA (primary assembly).
 
     Parameters
     ----------
     species
-        Ensembl species name, e.g. ``"homo_sapiens"``, ``"mus_musculus"``.
+        Species name, e.g. ``"homo_sapiens"``, ``"mus_musculus"``.
     output_dir
         Directory to save the downloaded files.
     assembly
-        Assembly name (e.g. ``"GRCh38"``). If ``None``, auto-detected from
-        the filename on the FTP server.
+        Assembly name (e.g. ``"GRCh38"``). Ignored for GENCODE species.
     jobs
         Number of download threads. Default 4.
     force
         Re-download even if the file already exists.
     generate_dict
         Generate a ``.dict`` file using ``samtools dict`` after download.
-        Default ``True``.
 
     Returns
     -------
@@ -256,16 +302,18 @@ def download_genome(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find the correct FASTA filename
-    filename = _find_dna_file(species, assembly)
-    species_dir = _species_dirname(species)
-    url = f"{FASTA_BASE}/{species_dir}/dna/{filename}"
-    output_path = out_dir / filename
+    if _is_gencode_species(species):
+        filename = _find_gencode_genome(species)
+        sp = _species_dirname(species)
+        url = f"{_GENCODE_CONFIG[sp]['base_url']}/{filename}"
+    else:
+        filename = _find_ensembl_dna_file(species, assembly)
+        url = f"{FASTA_BASE}/{_species_dirname(species)}/dna/{filename}"
 
+    output_path = out_dir / filename
     fasta_path = resumable_download(url, output_path, jobs=jobs, force=force)
 
     result: Dict[str, str] = {"fasta": fasta_path}
-
     if generate_dict:
         dict_path = _generate_dict(fasta_path)
         result["dict"] = dict_path
@@ -280,8 +328,10 @@ def download_genome(
     ],
     category="reference",
     description=(
-        "Download a GTF annotation file from Ensembl. Auto-discovers the "
-        "current release version number (e.g. ``116``) for the given species."
+        "Download a GTF annotation file.\n\n"
+        "For **human** (homo_sapiens) and **mouse** (mus_musculus), downloads "
+        "GENCODE ``primary_assembly.annotation.gtf.gz``.\n"
+        "For all other species, downloads from Ensembl."
     ),
     examples=[
         'sa.reference.download_gtf("homo_sapiens", output_dir="ref")',
@@ -300,16 +350,16 @@ def download_gtf(
     jobs: int = 4,
     force: bool = False,
 ) -> Dict[str, str]:
-    """Download an Ensembl GTF annotation file.
+    """Download a GTF annotation file.
 
     Parameters
     ----------
     species
-        Ensembl species name, e.g. ``"homo_sapiens"``, ``"mus_musculus"``.
+        Species name, e.g. ``"homo_sapiens"``, ``"mus_musculus"``.
     output_dir
         Directory to save the downloaded file.
     assembly
-        Assembly name. If ``None``, auto-detected.
+        Assembly name. Ignored for GENCODE species.
     jobs
         Number of download threads. Default 4.
     force
@@ -323,11 +373,15 @@ def download_gtf(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = _find_gtf_file(species, assembly)
-    species_dir = _species_dirname(species)
-    url = f"{GTF_BASE}/{species_dir}/{filename}"
-    output_path = out_dir / filename
+    if _is_gencode_species(species):
+        filename = _find_gencode_gtf(species)
+        sp = _species_dirname(species)
+        url = f"{_GENCODE_CONFIG[sp]['base_url']}/{filename}"
+    else:
+        filename = _find_ensembl_gtf_file(species, assembly)
+        url = f"{GTF_BASE}/{_species_dirname(species)}/{filename}"
 
+    output_path = out_dir / filename
     gtf_path = resumable_download(url, output_path, jobs=jobs, force=force)
     return {"gtf": gtf_path}
 
@@ -340,7 +394,8 @@ def download_gtf(
     category="reference",
     description=(
         "Download a non-coding RNA FASTA file from Ensembl. Contains "
-        "miRNA, piRNA, snoRNA, lncRNA, and other non-coding sequences."
+        "miRNA, piRNA, snoRNA, lncRNA, and other non-coding sequences. "
+        "Only available from Ensembl (not GENCODE)."
     ),
     examples=[
         'sa.reference.download_ncrna("homo_sapiens", output_dir="ref")',
@@ -379,7 +434,7 @@ def download_ncrna(
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = _find_ncrna_file(species)
+    filename = _find_ensembl_ncrna_file(species)
     species_dir = _species_dirname(species)
     url = f"{FASTA_BASE}/{species_dir}/ncrna/{filename}"
     output_path = out_dir / filename

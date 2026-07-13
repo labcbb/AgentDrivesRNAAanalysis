@@ -13,6 +13,8 @@ Key sRNA-seq use cases:
 
 from __future__ import annotations
 
+import re
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -168,7 +170,8 @@ def _run_bowtie_one(
     # Skip if output already exists
     if sam_path.exists() and sam_path.stat().st_size > 0:
         print(f"[bowtie] Skipping {sample}: {sam_path} already exists", flush=True)
-        return {"sample": sample, "sam": str(sam_path)}
+        log_out = str(sample_dir / f"{sample}.bowtie.log")
+        return {"sample": sample, "sam": str(sam_path), "log": log_out, "metrics": {}}
 
     cmd = ["bowtie"]
 
@@ -275,12 +278,67 @@ def _run_bowtie_one(
     # Redirect SAM output to file
     cmd.extend([str(sam_path)])
 
-    run_cli_cmd(cmd)
+    # Run with log capture
+    log_out = str(sample_dir / f"{sample}.bowtie.log")
+    print(">>", " ".join(str(c) for c in cmd), flush=True)
+    log_metrics: Dict[str, Union[str, float, int, None]] = {}
+    with open(log_out, "w") as log_f:
+        proc = subprocess.Popen(
+            list(cmd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                log_f.write(line)
+        finally:
+            proc.stdout.close()
+        ret = proc.wait()
+    if ret != 0:
+        raise RuntimeError(f"bowtie failed for {sample} (exit code {ret})")
 
     if not sam_path.exists():
         raise RuntimeError(f"bowtie failed to produce {sam_path}")
 
-    return {"sample": sample, "sam": str(sam_path)}
+    # Parse bowtie alignment metrics from log
+    with open(log_out) as f:
+        log_text = f.read()
+
+    m_total = re.search(r"# reads processed:\s+(\d+)", log_text)
+    m_aligned = re.search(
+        r"# reads with at least one reported alignment:\s+(\d+)\s+\((\d+\.?\d*)%\)",
+        log_text,
+    )
+    m_failed = re.search(
+        r"# reads that failed to align:\s+(\d+)\s+\((\d+\.?\d*)%\)", log_text,
+    )
+    m_suppressed = re.search(
+        r"# reads with alignments suppressed due to -m:\s+(\d+)", log_text,
+    )
+    m_reported = re.search(r"Reported\s+(\d+)\s+alignments", log_text)
+
+    if m_total:
+        log_metrics["total_reads"] = int(m_total.group(1))
+    if m_aligned:
+        log_metrics["aligned_reads"] = int(m_aligned.group(1))
+        log_metrics["alignment_rate"] = float(m_aligned.group(2))
+    if m_failed:
+        log_metrics["unaligned_reads"] = int(m_failed.group(1))
+    if m_suppressed:
+        log_metrics["suppressed_reads"] = int(m_suppressed.group(1))
+    if m_reported:
+        log_metrics["reported_alignments"] = int(m_reported.group(1))
+
+    return {
+        "sample": sample,
+        "sam": str(sam_path),
+        "log": log_out,
+        "metrics": log_metrics,
+    }
 
 
 @register_function(
@@ -309,7 +367,15 @@ def _run_bowtie_one(
     related=[
         "alignment.bowtie_build",
     ],
-    produces={"obs": ["sam_path"], "uns": ["genome_index"]},
+    produces={
+        "obs": [
+            "sam_path", "bowtie_log",
+            "bowtie_total_reads", "bowtie_aligned_reads",
+            "bowtie_alignment_rate", "bowtie_unaligned_reads",
+            "bowtie_suppressed_reads", "bowtie_reported_alignments",
+        ],
+        "uns": ["genome_index"],
+    },
 )
 def bowtie(
     adata: AnnData,
@@ -550,10 +616,15 @@ def bowtie(
 
     results = run_threads(sample_list, _run_one, jobs)
 
-    # Write SAM paths back to adata.obs
+    # Write SAM paths and bowtie metrics back to adata.obs
     for result in results:
         sample_name = result["sample"]
         adata.obs.loc[sample_name, "sam_path"] = result["sam"]
+        adata.obs.loc[sample_name, "bowtie_log"] = result.get("log", "")
+
+        metrics = result.get("metrics", {})
+        for key, val in metrics.items():
+            adata.obs.loc[sample_name, f"bowtie_{key}"] = val
 
     # Store genome index in adata.uns
     adata.uns["genome_index"] = index_basename

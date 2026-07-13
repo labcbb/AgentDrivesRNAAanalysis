@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -155,6 +156,7 @@ def _run_cutadapt(
     # Determine output paths
     fq1_out = str(sample_dir / f"{sample}_trimmed.fastq.gz")
     json_out = str(sample_dir / f"{sample}.cutadapt.json")
+    log_out = str(sample_dir / f"{sample}.cutadapt.log")
 
     # Guard: skip if output already exists (unless overwrite)
     if not overwrite and os.path.isfile(fq1_out) and os.path.getsize(fq1_out) > 0:
@@ -163,6 +165,7 @@ def _run_cutadapt(
             "sample": sample,
             "fq1": fq1_out,
             "json": json_out,
+            "log": log_out,
         }
         if paired:
             fq2_out = str(sample_dir / f"{sample}_trimmed_R2.fastq.gz")
@@ -254,13 +257,32 @@ def _run_cutadapt(
     # Input files
     cmd.extend(_build_sample_input(fq1, fq2, paired and fq2 is not None))
 
-    # Run
-    run_cli_cmd(cmd)
+    # Run with log capture
+    print(">>", " ".join(str(c) for c in cmd), flush=True)
+    with open(log_out, "w") as log_f:
+        proc = subprocess.Popen(
+            list(cmd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                log_f.write(line)
+        finally:
+            proc.stdout.close()
+        ret = proc.wait()
+    if ret != 0:
+        raise RuntimeError(f"cutadapt failed for {sample} (exit code {ret})")
 
     result: Dict[str, Union[str, dict]] = {
         "sample": sample,
         "fq1": fq1_out,
         "json": json_out,
+        "log": log_out,
     }
     if paired:
         result["fq2"] = fq2_out
@@ -304,7 +326,7 @@ def _run_cutadapt(
     related=[
         "fastq.fastqc", "fastq.fastq_dl",
     ],
-    produces={"obs": ["trimmed_path", "cutadapt_json", "cutadapt_report"]},
+    produces={"obs": ["trimmed_path", "cutadapt_json", "cutadapt_report", "cutadapt_log"]},
 )
 def cutadapt(
     adata: AnnData,
@@ -555,6 +577,10 @@ def cutadapt(
     report_map = {r["sample"]: r.get("report", {}) for r in results}
     adata.obs["cutadapt_report"] = pd.Series(
         report_map, index=adata.obs_names, dtype="object"
+    )
+    log_map = {r["sample"]: r.get("log", "") for r in results}
+    adata.obs["cutadapt_log"] = pd.Series(
+        log_map, index=adata.obs_names, dtype="object"
     )
 
     return adata

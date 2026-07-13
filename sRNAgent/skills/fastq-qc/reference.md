@@ -20,6 +20,8 @@ adata = ad.AnnData(obs=pd.DataFrame(index=["S1"]))
 adata.obs["fastq_path"] = ["srna_fastq/SRR26304152.fastq.gz"]
 
 # ── Trim 3' adapter with TruSeq Small RNA adapter ──
+# ⚠️  必须确认 adapter 序列与建库试剂盒匹配！不同试剂盒 adapter 不同
+#     常见: TruSeq=TGGAATTCTCGGGTGCCAAGG, NEBNext=AGATCGGAAGAGCACACGTCTGAAC
 adata = sa.fastq.cutadapt(
     adata,
     adapter_3="TGGAATTCTCGGGTGCCAAGG",
@@ -36,6 +38,8 @@ adata = sa.fastq.fastqc(adata, output_dir="fastqc_reports")
 # ── MultiQC ──
 adata = sa.fastq.multiqc(adata, output_dir="multiqc_out", force=True)
 
+# multiqc 自动提取质控指标到 adata.obs
+print(adata.obs.filter(like="multiqc_").to_string())
 print(f"MultiQC report: {adata.uns['multiqc_html']}")
 print(f"MultiQC data dir: {adata.uns['multiqc_data_dir']}")
 print(f"MultiQC output dir: {adata.uns['multiqc_dir']}")

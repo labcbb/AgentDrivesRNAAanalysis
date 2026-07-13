@@ -57,12 +57,14 @@ print(f"miRNA IDs:      {adata.var['mirna_id'].tolist()[:5]}")
 ## Quantify with adapter clipping
 
 ```python
+# ⚠️  adapter 序列必须与建库试剂盒匹配！错误 = 比对失败
+#     常见: TruSeq=TGGAATTCTCGGGTGCCAAGG, NEBNext=AGATCGGAAGAGCACACGTCTGAAC
 adata = sa.quant.quantify_mirna(
     adata,
     genome_index="ref/grch38",
     mature_fa="ref/mature_hsa.fa",
     hairpin_fa="ref/hairpin_hsa.fa",
-    adapter="TGGAATTCTCGGGTGCCAAGG",
+    adapter="TGGAATTCTCGGGTGCCAAGG",   # ← 确认 adapter 序列正确
     min_length=18,
     output_dir="mirdeep2",
 )

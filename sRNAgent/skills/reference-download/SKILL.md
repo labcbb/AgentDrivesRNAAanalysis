@@ -1,23 +1,23 @@
 ---
 name: reference-download
-title: Download reference data (Ensembl + miRBase)
-description: "Download reference genomes, GTF annotations, and miRNA data from Ensembl and miRBase with multi-threaded resumable download."
+title: Download reference data (GENCODE + Ensembl + miRBase)
+description: "Download reference genomes, GTF annotations, and miRNA data from GENCODE (human/mouse), Ensembl (other species), and miRBase with multi-threaded resumable download."
 ---
 
 # Download Reference Data
 
 ## Overview
 
-This skill covers downloading genome reference data from **Ensembl** and miRNA reference data from **miRBase**. All downloads use multi-threaded resumable download — interrupted transfers can be resumed, and large files download faster with parallel threads.
+This skill covers downloading genome reference data — **GENCODE** for human/mouse, **Ensembl** for other species — and miRNA reference data from **miRBase**. All downloads use multi-threaded resumable download.
 
-**Ensembl** tools (`sa.reference.*`):
+**Reference genome tools** (`sa.reference.*`):
 
-| Step | Function | Purpose |
-|------|----------|---------|
-| 1 | `sa.reference.list_species` | List available species in the current Ensembl release |
-| 2 | `sa.reference.download_genome` | Download primary assembly FASTA + auto-generate ``.dict`` |
-| 3 | `sa.reference.download_gtf` | Download GTF gene annotation file |
-| 4 | `sa.reference.download_ncrna` | Download non-coding RNA FASTA (miRNA, piRNA, etc.) |
+| Step | Function | Purpose | Source |
+|------|----------|---------|--------|
+| 1 | `sa.reference.list_species` | List available species in current Ensembl release | Ensembl |
+| 2 | `sa.reference.download_genome` | Download primary assembly FASTA + auto-generate ``.dict`` | **GENCODE** (human/mouse), Ensembl (others) |
+| 3 | `sa.reference.download_gtf` | Download GTF gene annotation file | **GENCODE** (human/mouse), Ensembl (others) |
+| 4 | `sa.reference.download_ncrna` | Download non-coding RNA FASTA | Ensembl (all species) |
 
 **miRBase** tools (`sa.reference.*`):
 
@@ -26,13 +26,17 @@ This skill covers downloading genome reference data from **Ensembl** and miRNA r
 | 1 | `sa.reference.list_mirbase_codes` | List all species 3-letter codes in miRBase |
 | 2 | `sa.reference.download_mirbase` | Download all-species hairpin/mature FASTA + GFF3; extract per-species sequences |
 
-Ensembl file naming conventions:
+File naming conventions:
 
-| File | Pattern | Example |
-|------|---------|---------|
-| Primary assembly FASTA | ``{Genus}_{species}.{Assembly}.dna.primary_assembly.fa.gz`` | ``Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz`` |
-| GTF annotation | ``{Genus}_{species}.{Assembly}.{Version}.gtf.gz`` | ``Homo_sapiens.GRCh38.116.gtf.gz`` |
-| ncRNA FASTA | ``{Genus}_{species}.{Assembly}.ncrna.fa.gz`` | ``Homo_sapiens.GRCh38.ncrna.fa.gz`` |
+| Source | File | Example |
+|--------|------|---------|
+| GENCODE (human) | Primary assembly genome FASTA | ``GRCh38.primary_assembly.genome.fa.gz`` |
+| GENCODE (human) | Primary assembly annotation GTF | ``gencode.v50.primary_assembly.annotation.gtf.gz`` |
+| GENCODE (mouse) | Primary assembly genome FASTA | ``GRCm39.primary_assembly.genome.fa.gz`` |
+| GENCODE (mouse) | Primary assembly annotation GTF | ``gencode.vM39.primary_assembly.annotation.gtf.gz`` |
+| Ensembl | Primary assembly FASTA | ``Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz`` |
+| Ensembl | GTF annotation | ``Homo_sapiens.GRCh38.116.gtf.gz`` |
+| Ensembl | ncRNA FASTA | ``Homo_sapiens.GRCh38.ncrna.fa.gz`` |
 
 ## Instructions
 
@@ -57,22 +61,22 @@ print(f"Human: {human}")
 print(f"Mouse: {mouse}")
 ```
 
-### 2. 下载人类参考基因组 (GRCh38)
+### 2. 下载人类参考基因组 (GENCODE GRCh38)
 
-下载 primary assembly FASTA（约 841 MB），完成后自动生成 `.dict` 序列字典文件：
+人类基因组从 **GENCODE** 下载，文件名格为 `GRCh38.primary_assembly.genome.fa.gz`（约 841 MB），完成后自动生成 `.dict` 序列字典文件：
 
 ```python
-# 4 线程并行下载
+# 8 线程并行下载
 result = sa.reference.download_genome(
     "homo_sapiens",
     output_dir="ref",
-    jobs=4,
+    jobs=8,
 )
 
 print(f"Genome FASTA: {result['fasta']}")
 print(f"Dict file:    {result['dict']}")
-# Genome FASTA: /path/to/ref/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
-# Dict file:    /path/to/ref/Homo_sapiens.GRCh38.dna.primary_assembly.dict
+# Genome FASTA: /path/to/ref/GRCh38.primary_assembly.genome.fa.gz
+# Dict file:    /path/to/ref/GRCh38.primary_assembly.genome.dict
 ```
 
 **CORRECT — 不生成 .dict 文件（如果不需要）：**
@@ -120,7 +124,8 @@ sa.alignment.bowtie_build(
 )
 ```
 
-> Bowtie 索引是 **`sa.alignment.bowtie`** 比对和 **miRDeep2 mapper.pl** 的必需输入。`bowtie_build` 需要未压缩的 FASTA 文件。如果已解压过则跳过解压步骤，直接指向 `.fa` 文件即可。具体用法见 `alignment-srna` skill。
+> Bowtie 索引所需的参考序列现在来自 **GENCODE**（`GRCh38.primary_assembly.genome.fa.gz`），不再是 Ensembl 命名格式。
+> Bowtie 索引是 **`sa.alignment.bowtie`** 比对和 **miRDeep2 mapper.pl** 的必需输入。`bowtie_build` 需要未压缩的 FASTA 文件。具体用法见 `alignment-srna` skill。
 
 **WRONG — 物种名拼写错误:**
 
@@ -133,9 +138,9 @@ sa.alignment.bowtie_build(
 sa.reference.download_genome("homo_sapiens", ...)
 ```
 
-### 3. 下载 GTF 注释文件
+### 3. 下载 GTF 注释文件（人类来自 GENCODE）
 
-自动发现当前 Ensembl 版本号（如 116）：
+人类基因组注释从 **GENCODE** 下载，命名为 `gencode.v{version}.primary_assembly.annotation.gtf.gz`（版本号自动发现）：
 
 ```python
 result = sa.reference.download_gtf(
@@ -145,7 +150,23 @@ result = sa.reference.download_gtf(
 )
 
 print(f"GTF: {result['gtf']}")
-# GTF: /path/to/ref/Homo_sapiens.GRCh38.116.gtf.gz
+# GTF: /path/to/ref/gencode.v50.primary_assembly.annotation.gtf.gz
+```
+
+**CORRECT — 小鼠 GTF 也来自 GENCODE：**
+
+```python
+result = sa.reference.download_gtf("mus_musculus", output_dir="ref", jobs=4)
+print(f"GTF: {result['gtf']}")
+# GTF: /path/to/ref/gencode.vM39.primary_assembly.annotation.gtf.gz
+```
+
+**CORRECT — 其他物种 GTF 从 Ensembl 下载：**
+
+```python
+result = sa.reference.download_gtf("danio_rerio", output_dir="ref", jobs=4)
+print(f"GTF: {result['gtf']}")
+# GTF: /path/to/ref/Danio_rerio.GRCz11.116.gtf.gz
 ```
 
 ### 4. 下载非编码 RNA 序列
@@ -332,17 +353,24 @@ gtf = sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
 ncrna = sa.reference.download_ncrna("homo_sapiens", output_dir="ref", jobs=4)
 ```
 
-### 返回值格式
+### 返回值格式（以人类 hsa 为例）
 
 ```python
-# download_genome
-{"fasta": "ref/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz",
- "dict":  "ref/Homo_sapiens.GRCh38.dna.primary_assembly.dict"}
+# download_genome (GENCODE)
+{"fasta": "ref/GRCh38.primary_assembly.genome.fa.gz",
+ "dict":  "ref/GRCh38.primary_assembly.genome.dict"}
 
-# download_gtf
-{"gtf": "ref/Homo_sapiens.GRCh38.116.gtf.gz"}
+# download_genome (其他物种，从 Ensembl)
+{"fasta": "ref/Danio_rerio.GRCz11.dna.primary_assembly.fa.gz",
+ "dict":  "ref/Danio_rerio.GRCz11.dna.primary_assembly.dict"}
 
-# download_ncrna
+# download_gtf (人类，GENCODE)
+{"gtf": "ref/gencode.v50.primary_assembly.annotation.gtf.gz"}
+
+# download_gtf (其他物种，Ensembl)
+{"gtf": "ref/Danio_rerio.GRCz11.116.gtf.gz"}
+
+# download_ncrna (Ensembl, 所有物种)
 {"ncrna": "ref/Homo_sapiens.GRCh38.ncrna.fa.gz"}
 
 # download_mirbase (with species)

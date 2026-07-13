@@ -28,6 +28,12 @@ Trimmed FASTQ  ──→  mapper.pl  ──→  quantifier.pl  ──→  adata.
 Trimmed FASTQ  ──→  mapper.pl  ──→  miRDeep2.pl  ──→  result.html + result.csv + pdfs/
 ```
 
+> ⚡ **批量样本时务必使用 `jobs=N` 并行定量/预测**
+>
+> `sa.quant.quantify_mirna` 和 `sa.quant.predict_mirna` 都支持 `jobs` 参数控制并行处理的样本数（每个样本独立跑 mapper.pl + quantifier.pl 或 miRDeep2.pl）。
+> 样本多时（比如 >3 个），设置 `jobs=3` 可显著缩短总耗时。
+> 如果用户没主动提并行数，**agent 应该根据样本量推荐一个合理的 `jobs` 值**。
+
 ## Prerequisites
 
 Before running miRDeep2, you need:
@@ -53,6 +59,24 @@ sa.alignment.bowtie_build("ref/GRCh38.primary_assembly.genome.fa", "ref/grch38",
 ```
 
 ## Instructions
+
+> ⚠️ **必须先确认 sRNA-seq 的 3' adapter 序列是否正确 —— 这直接影响 miRNA 定量结果**
+>
+> miRDeep2 的 `mapper.pl` 内置了 adapter 剪切功能（`adapter=` 参数）。如果 adapter 序列给错，reads 无法正确比对到基因组，miRNA 定量和 novel miRNA 预测都会失败。
+>
+> **Agent 行动要求：不要默认使用 TruSeq 的 adapter！必须先问用户：**
+> 1. 询问用户使用的建库试剂盒名称
+> 2. 让用户确认是否使用下面的默认序列，还是自己指定
+> 3. 如果用户不确定，让对方查一下实验方法的 "Library preparation" 部分
+>
+> **建议在 cutadapt 中完成 adapter 剪切**（见 `fastq-qc` skill），`mapper.pl` 中不再重复做，分工更清晰。若需要 mapper.pl 做 adapter 剪切，务必先让用户确认正确的 adapter 序列：
+>
+> | 建库试剂盒 | 3' adapter 序列 |
+> |-----------|----------------|
+> | TruSeq Small RNA (Illumina) | `TGGAATTCTCGGGTGCCAAGG` |
+> | NEBNext Small RNA | `AGATCGGAAGAGCACACGTCTGAAC` |
+> | QIAseq miRNA | `AACTGTAGGCACCATCAAT` |
+> | SMARTer smRNA-Seq | `GTTCAGAGTTCTACAGTCCGACGATC` |
 
 ### 1. 定量已知 miRNA（默认，人类 hsa）
 

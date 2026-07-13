@@ -28,6 +28,22 @@ MATURE_URL = f"{MIRBASE_BASE}/mature.fa"
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _is_gzip(path: Path) -> bool:
+    """Check if a file has valid gzip magic bytes."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
+
+
+def _open_fasta(path: Path, mode: str = "rt", **kwargs):
+    """Open a FASTA file — handles .gz extension even if not actual gzip."""
+    if str(path).endswith(".gz") and not _is_gzip(path):
+        return open(path, mode, **kwargs)
+    return gzip.open(path, mode, **kwargs)
+
+
 def _extract_fasta_by_prefix(
     input_path: Path,
     output_path: Path,
@@ -37,7 +53,7 @@ def _extract_fasta_by_prefix(
 
     Returns the number of sequences extracted.
     """
-    opener = gzip.open if str(input_path).endswith(".gz") else open
+    opener = _open_fasta if str(input_path).endswith(".gz") else open
     count = 0
     write_mode = False
 
@@ -48,7 +64,10 @@ def _extract_fasta_by_prefix(
                 write_mode = line[1:].startswith(f"{prefix}-")
                 if write_mode:
                     count += 1
-                    f_out.write(line)
+                    # Keep only the first identifier (before any space)
+                    # e.g. ">hsa-let-7a-5p MIMAT... Homo sapiens..." → ">hsa-let-7a-5p"
+                    ident = line[1:].split(None, 1)[0]
+                    f_out.write(f">{ident}\n")
             elif write_mode:
                 f_out.write(line)
 
@@ -58,7 +77,7 @@ def _extract_fasta_by_prefix(
 def _scan_species_codes(fasta_path: Path) -> List[str]:
     """Scan a miRBase FASTA file and extract all unique 3-letter species codes."""
     codes: set[str] = set()
-    opener = gzip.open if str(fasta_path).endswith(".gz") else open
+    opener = _open_fasta if str(fasta_path).endswith(".gz") else open
 
     with opener(fasta_path, "rt", errors="replace") as f:
         for line in f:

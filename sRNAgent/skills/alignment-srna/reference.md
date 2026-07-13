@@ -247,4 +247,14 @@ sa.alignment.bowtie(
     jobs=None,                     # samples to process concurrently
     extra_args=None,
 )
+
+# bowtie outputs (written to adata.obs):
+#   sam_path                     — SAM file path
+#   bowtie_log                   — bowtie log path
+#   bowtie_total_reads           — total reads processed
+#   bowtie_aligned_reads         — reads with ≥1 alignment
+#   bowtie_alignment_rate (%)    — alignment rate
+#   bowtie_unaligned_reads       — reads that failed to align
+#   bowtie_suppressed_reads      — reads suppressed by -m
+#   bowtie_reported_alignments   — total reported alignments
 ```

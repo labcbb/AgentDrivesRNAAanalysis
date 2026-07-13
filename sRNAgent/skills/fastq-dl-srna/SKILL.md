@@ -10,6 +10,12 @@ description: "sRNA-seq FASTQ download via fastq-dl: AnnData-based API, single-en
 
 Small RNA sequencing (sRNA-seq, miRNA-seq, piRNA-seq) is typically **single-end** (36-50 bp). Even when a dataset was sequenced as **paired-end, only R1 is biologically meaningful** -- R2 contains adapter/index and is discarded. This skill covers downloading sRNA-seq FASTQ files using `sa.fastq.fastq_dl`, a wrapper around [fastq-dl](https://github.com/rpetit3/fastq-dl) that:
 
+> ⚡ **批量样本时务必使用 `jobs=N` 参数并行下载**
+>
+> `sa.fastq.fastq_dl` 支持 `jobs` 参数控制并行下载的样本数（通过线程池实现）。
+> 样本多时（比如 >5 个），设置 `jobs=4` 或 `jobs=5` 可大幅缩短总耗时。
+> 如果用户没主动提并行数，**agent 应该根据样本量推荐一个合理的 `jobs` 值**。
+
 - Accepts **any accession level**: BioProject (`PRJNA...`), SRA Study (`SRP...`), BioSample (`SRS/SAMN...`), Experiment (`SRX...`), Run (`SRR/ERR/DRR...`)
 - Queries ENA's Data Warehouse API to resolve all associated Runs automatically
 - Downloads from **ENA** (direct FASTQ via FTP/HTTPS, faster) or **SRA** (via `sra-tools`)

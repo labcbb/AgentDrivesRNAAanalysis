@@ -124,6 +124,10 @@ def _discover_metadata_file(out_dir: Path, accession: str, prefix: Optional[str]
         out_dir / f"{prefix or 'fastq'}-{accession}-metadata.tsv",
         out_dir / f"{accession}-metadata.tsv",
     ]
+    # fastq-dl >= 1.x emits fastq-run-info.tsv (no accession in filename)
+    run_info = out_dir / "fastq-run-info.tsv"
+    if run_info.exists():
+        return str(run_info)
     candidates.extend(sorted(out_dir.glob(f"*{accession}*metadata*.tsv")))
     for path in candidates:
         if path.exists() and path.is_file():
