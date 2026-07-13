@@ -1,6 +1,29 @@
 # sRNAgent Agent Guide
 
-## 核心规则
+## 核心规则：维护同一个 adata
+
+所有 `sa.fastq.*`、`sa.alignment.*`、`sa.quant.*` 工具都操作并返回**同一个 AnnData 对象**。
+
+```python
+import anndata as ad
+import pandas as pd
+
+# 初始化一次
+adata = ad.AnnData(obs=pd.DataFrame(index=["S1", "S2"]))
+
+# 沿流程传递同一个 adata，不断扩展 obs/uns/X
+adata = sa.fastq.fastq_dl(adata, ...)      # → obs["fastq_path"]
+adata = sa.fastq.cutadapt(adata, ...)      # → obs["trimmed_path"]
+adata = sa.fastq.fastqc(adata, ...)        # → obs["fastqc_html"]
+adata = sa.alignment.bowtie(adata, ...)    # → obs["sam_path"]
+adata = sa.quant.quantify_mirna(adata, ...) # → obs["collapsed_path"], adata.X
+
+print(adata.obs.columns)  # 所有步骤的结果都在同一个 adata 里
+```
+
+**禁止**：
+- ❌ 每个工具创建新的 AnnData 对象
+- ❌ 忘记接收返回值（工具是 in-place 修改，但必须用返回值覆盖）
 
 ```python
 adata = sa.fastq.cutadapt(adata, ...)   # ✅ 必须接收返回值

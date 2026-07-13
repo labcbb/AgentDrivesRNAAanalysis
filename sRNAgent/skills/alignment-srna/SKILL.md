@@ -62,6 +62,8 @@ sa.alignment.bowtie_build(
 
 ### 2. sRNA-seq 单端比对
 
+> ⚠️ **样本命名规则：** 默认使用 SRR 开头的 Run ID（如 `SRR26304152`）作为 `adata.obs_names`。从 ENA/SRA 下载的数据自动就是 SRR ID。仅当用户上传自己的数据或明确要求不用 SRR 格式时，才使用自定义名称（如 `S1`）。
+
 sRNA-seq 是**单端测序**。函数从 `adata.obs["trimmed_path"]`（或回退到 `adata.obs["fastq_path"]`）读取 FASTQ 路径。以下是几种常用的比对策略：
 
 #### 2a. 严谨比对 — perfect match, unique only

@@ -57,6 +57,8 @@ import pandas as pd
 adata = ad.AnnData(obs=pd.DataFrame(index=["S1", "S2", "S3"]))
 ```
 
+> ⚠️ **样本命名规则：** 默认使用 SRR 开头的 Run ID（如 `SRR26304152`）作为 `adata.obs_names`。从 ENA/SRA 下载的数据自动就是 SRR ID。仅当用户上传自己的数据或明确要求不用 SRR 格式时，才使用自定义名称（如 `S1`）。
+
 Each sample in `adata.obs.index` becomes a row that the pipeline populates with file paths and QC metrics.
 
 > ⚠️ **必须提醒用户确认 adapter 序列 —— 这是 sRNA-seq 质控最关键的一步**
