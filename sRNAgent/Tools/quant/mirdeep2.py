@@ -360,13 +360,13 @@ def _build_sample_list(adata: AnnData) -> List[Tuple[str, str]]:
     category="quant",
     description=(
         "Quantify known miRNAs with miRDeep2 (anndata mode). "
-        "Reads FASTQ paths from ``adata.obs["fastq_path"]`` (preferring "
-        "``adata.obs["trimmed_path"]`` if present). Runs ``mapper.pl`` "
+        "Reads FASTQ paths from ``adata.obs['fastq_path']`` (preferring "
+        "``adata.obs['trimmed_path']`` if present). Runs ``mapper.pl`` "
         "to preprocess and map reads, then ``quantifier.pl`` to quantify "
         "known miRNAs against miRBase. Writes results into the AnnData "
         "object: ``adata.obs`` (collapsed_path, arf_path, counts_csv), "
         "``adata.X`` (count matrix, samples x miRNAs), "
-        "``adata.var["mirna_id"]``, and ``adata.uns`` (reference paths)."
+        "``adata.var['mirna_id']``, and ``adata.uns`` (reference paths)."
     ),
     examples=[
         "sa.quant.quantify_mirna(adata, genome_index='grch38', "
@@ -523,8 +523,8 @@ def quantify_mirna(
     category="quant",
     description=(
         "Predict known and novel miRNAs with miRDeep2 (anndata mode). "
-        "Reads FASTQ paths from ``adata.obs["fastq_path"]`` (preferring "
-        "``adata.obs["trimmed_path"]`` if present). Runs ``mapper.pl`` "
+        "Reads FASTQ paths from ``adata.obs['fastq_path']`` (preferring "
+        "``adata.obs['trimmed_path']`` if present). Runs ``mapper.pl`` "
         "to preprocess and map reads, then ``miRDeep2.pl`` to identify "
         "known miRNAs and predict novel candidates (structure prediction, "
         "randfold analysis, score estimation). Writes results into the "
