@@ -38,6 +38,8 @@ File naming conventions:
 | Ensembl | GTF annotation | ``Homo_sapiens.GRCh38.116.gtf.gz`` |
 | Ensembl | ncRNA FASTA | ``Homo_sapiens.GRCh38.ncrna.fa.gz`` |
 
+> ℹ️ **hsa/mmu ↔ species name 映射：** 在 sRNA-seq 分析中，hsa（人）和 mmu（鼠）是 miRBase 的物种代码。调用 `download_genome` / `download_gtf` 时，使用 Ensembl 物种名 `homo_sapiens` 或 `mus_musculus`，**API 自动走 GENCODE 下载**。无需手动切换来源。
+
 ## Instructions
 
 ### 1. 查看当前 Ensembl 版本可用的物种
