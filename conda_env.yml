@@ -11,6 +11,8 @@ dependencies:
   - ipykernel
   - samtools
   - mirdeep2
+  - subread
+  - pysam
   - pip:
       - anndata
       - fastq-dl
