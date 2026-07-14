@@ -17,4 +17,5 @@ dependencies:
       - anndata
       - fastq-dl
       - tqdm
+      - pylimma
 
