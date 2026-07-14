@@ -161,7 +161,7 @@ def _run_quantifier(
     if discard_multimappers:
         cmd.append("-U")
 
-    run_cli_cmd(cmd)
+    run_cli_cmd(cmd, cwd=str(sample_dir))
 
     # Find the freshly created CSV
     raw_csv = _find_latest_quantifier_csv(sample_dir)
@@ -316,7 +316,7 @@ def _run_mirdeep2(
     if overwrite:
         cmd.append("-n")
 
-    run_cli_cmd(cmd)
+    run_cli_cmd(cmd, cwd=str(sample_dir))
 
     return {
         "sample": sample,
