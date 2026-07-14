@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme-mode="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>sRNA Agent</title>
+    <!-- 不加载 Google Fonts：国内/部分网络会阻塞导致白屏；styles.css 已含系统字体 fallback -->
+    <link rel="stylesheet" href="./styles.css?v=28" />
+  </head>
+  <body>
+    <div class="shell shell--chat" id="shell">
+      <button class="shell-nav-backdrop" id="nav-backdrop" type="button" aria-label="关闭侧栏"></button>
+
+      <header class="topbar">
+        <div class="topnav-shell">
+          <button class="icon-btn" id="nav-toggle" type="button" aria-label="打开导航">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 7h16M4 12h16M4 17h16" />
+            </svg>
+          </button>
+          <div class="topnav-shell__content">
+            <nav class="breadcrumb" aria-label="breadcrumb">
+              <span class="breadcrumb__link">sRNA</span>
+              <span class="breadcrumb__sep">›</span>
+              <span class="breadcrumb__current" id="breadcrumb-current">Agent</span>
+            </nav>
+          </div>
+          <div class="topnav-shell__actions">
+            <button class="icon-btn" type="button" aria-label="搜索">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="7"></circle>
+                <path d="m20 20-3.5-3.5"></path>
+              </svg>
+            </button>
+            <button class="icon-btn" id="theme-toggle" type="button" aria-label="切换主题">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 3a6 6 0 1 0 9 9 9 9 0 0 1-9-9Z"></path>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div class="shell-nav">
+        <aside class="sidebar">
+          <div class="sidebar-shell">
+            <div class="sidebar-shell__body">
+              <div class="brand">
+                <div class="brand__mark">sRNA</div>
+                <div class="brand__name">sRNA</div>
+              </div>
+
+              <nav class="sidebar-nav" aria-label="主导航">
+                <div class="nav-section__label">Pinned</div>
+                <a class="nav-item" data-page="overview" href="#">
+                  <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M4 19V5M10 19V9M16 19V13M22 19V7"></path>
+                  </svg>
+                  <span class="nav-item__text">Overview</span>
+                </a>
+                <a class="nav-item nav-item--active" data-page="agent" href="#">
+                  <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"></path>
+                  </svg>
+                  <span class="nav-item__text">Agent</span>
+                </a>
+                <a class="nav-item" data-page="analysis" href="#">
+                  <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M3 3v18h18"></path>
+                    <path d="M7 16l4-5 4 3 5-7"></path>
+                  </svg>
+                  <span class="nav-item__text">Analysis</span>
+                </a>
+                <a class="nav-item" data-page="skills" href="#">
+                  <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M13 2 3 14h7l-1 8 10-12h-7z"></path>
+                  </svg>
+                  <span class="nav-item__text">Skills</span>
+                </a>
+                <a class="nav-item" data-page="config" href="#">
+                  <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"></circle>
+                    <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path>
+                  </svg>
+                  <span class="nav-item__text">Config</span>
+                </a>
+                <a class="nav-item" data-page="cron" href="#">
+                  <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="9"></circle>
+                    <path d="M12 7v5l3 2"></path>
+                  </svg>
+                  <span class="nav-item__text">Cron</span>
+                </a>
+              </nav>
+
+              <section class="sidebar-sessions" id="agent-sessions">
+                <button class="sidebar-new-session" type="button" id="new-chat-btn">
+                  <span class="sidebar-new-session__icon">+</span>
+                  <span class="sidebar-new-session__label">New Chat</span>
+                </button>
+                <div class="sidebar-recent-sessions">
+                  <div class="sidebar-recent-sessions__head">Recent</div>
+                  <div id="chat-recent-list"></div>
+                </div>
+              </section>
+            </div>
+          </div>
+        </aside>
+      </div>
+
+      <main class="content">
+        <!-- Agent 聊天页 -->
+        <section class="page-view page-view--active" data-view="agent">
+          <div class="agent-workspace">
+            <aside class="code" id="agent-code-panel" hidden aria-label="代码执行">
+              <div class="code__header">
+                <span class="code__header-title">Code</span>
+                <button
+                  class="code__auto-approve-btn"
+                  type="button"
+                  id="auto-approve-toggle"
+                  aria-pressed="false"
+                  title="开启后自动批准所有代码运行请求"
+                >
+                  自动批准：关
+                </button>
+              </div>
+              <div class="code__inner" id="agent-code-inner"></div>
+            </aside>
+            <div class="card chat">
+            <div class="chat-layout">
+              <div class="chat-scroll" id="chat-scroll" role="log" aria-live="polite">
+                <div class="chat-column">
+                  <div id="chat-thread-inner"></div>
+                </div>
+              </div>
+
+              <div class="chat-composer-bar">
+                <div class="chat-column">
+                  <form class="agent-chat__input" id="composer-form">
+                    <div class="agent-chat__composer-input-row">
+                      <button class="icon-btn composer-icon-btn" type="button" aria-label="附件">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <path d="M21.44 11.05 12.25 20.24a6 6 0 1 1-8.49-8.49l9.19-9.19a4 4 0 1 1 5.66 5.66L9.88 17.66a2 2 0 1 1-2.83-2.83l8.49-8.48"></path>
+                        </svg>
+                      </button>
+                      <div class="agent-chat__composer-combobox">
+                        <textarea id="composer" rows="1" placeholder="Message Agent…"></textarea>
+                      </div>
+                      <button class="chat-send-btn" id="send-btn" type="submit" aria-label="发送" data-mode="send">
+                        <svg class="chat-send-btn__icon chat-send-btn__icon--send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                          <path d="m22 2-11 11"></path>
+                          <path d="M22 2 15 22l-4-9-9-4z"></path>
+                        </svg>
+                        <svg class="chat-send-btn__icon chat-send-btn__icon--stop" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                          <rect x="7" y="7" width="10" height="10" rx="1.5"></rect>
+                        </svg>
+                      </button>
+                    </div>
+                    <div class="agent-chat__composer-footer">
+                      <span class="status-pill">
+                        <span class="sidebar-status__dot"></span>
+                        检测后端连接…
+                      </span>
+                      <span>Enter 发送 · Shift+Enter 换行</span>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            </div>
+            </div>
+            <aside class="agent-workspace__rail" id="agent-side-rail" aria-label="内核环境">
+              <section class="kernel-panel kernel-panel--env" aria-label="Environment">
+                <div class="kernel-panel__header">
+                  <span class="kernel-panel__title">Environment</span>
+                  <button class="kernel-panel__refresh" type="button" id="kernel-env-refresh" title="刷新变量">↻</button>
+                </div>
+                <div class="kernel-panel__body" id="kernel-env-body">
+                  <div class="kernel-panel__empty">内核变量将在代码执行后显示</div>
+                  <table class="kernel-env-table" id="kernel-env-table" hidden>
+                    <thead>
+                      <tr>
+                        <th>Name</th>
+                        <th>Type</th>
+                        <th>Info</th>
+                      </tr>
+                    </thead>
+                    <tbody id="kernel-env-tbody"></tbody>
+                  </table>
+                </div>
+              </section>
+              <section class="kernel-panel kernel-panel--viz" aria-label="Visualization">
+                <div class="kernel-panel__header">
+                  <span class="kernel-panel__title">Visualization</span>
+                  <button class="kernel-panel__refresh" type="button" id="kernel-viz-refresh" title="刷新图表">↻</button>
+                </div>
+                <div class="kernel-panel__body kernel-viz__body" id="kernel-viz-body">
+                  <div class="kernel-panel__empty">绘图输出将显示在这里</div>
+                  <div class="kernel-viz-gallery" id="kernel-viz-gallery" hidden></div>
+                </div>
+              </section>
+            </aside>
+          </div>
+        </section>
+
+        <!-- Analysis 单细胞分析页 -->
+        <section class="page-view" data-view="analysis">
+          <div class="analysis-workspace">
+            <div class="analysis-workspace__grid">
+              <aside class="analysis-panel analysis-panel--sidebar">
+                <div class="panel-card">
+                  <div class="panel-card__header">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path></svg>
+                    Parameters
+                  </div>
+                  <div class="panel-card__body">
+                    <div class="analysis-empty-hint" id="parameter-hint">
+                      <span class="analysis-empty-hint__icon">👈</span>
+                      <p>Select an analysis type from the left menu</p>
+                    </div>
+                    <div class="parameter-form" id="parameter-form" hidden>
+                      <label class="field-label" for="param-resolution">Resolution</label>
+                      <input class="field-input" id="param-resolution" type="number" value="0.5" step="0.1" min="0.1" max="2" />
+                      <label class="field-label" for="param-n-neighbors">n_neighbors</label>
+                      <input class="field-input" id="param-n-neighbors" type="number" value="15" step="1" min="2" />
+                      <button class="btn btn--primary" type="button" id="run-analysis-btn">Run Analysis</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="panel-card panel-card--grow">
+                  <div class="panel-card__header">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path><path d="M3 12c0 1.66 4 3 9 3s9-1.34 9-3"></path></svg>
+                    adata Status
+                  </div>
+                  <div class="panel-card__body">
+                    <div class="analysis-empty-hint">
+                      <span class="analysis-empty-hint__icon">🗄️</span>
+                      <p>Upload an <code>.h5ad</code> file on the right or load adata from the code editor</p>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="panel-card">
+                  <div class="panel-card__header">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><path d="M12 16v-4M12 8h.01"></path></svg>
+                    Analysis Status
+                  </div>
+                  <div class="panel-card__body panel-card__body--log">
+                    <div class="analysis-log" id="analysis-log">Waiting for data upload...</div>
+                  </div>
+                </div>
+              </aside>
+
+              <div class="analysis-panel analysis-panel--main">
+                <div class="upload-grid">
+                  <div class="upload-card upload-card--analysis" id="drop-zone-analysis" tabindex="0" role="button">
+                    <div class="upload-card__icon upload-card__icon--accent">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4m0 0 8-4m-8 4 4 4"></path><path d="M20 16.5A4.5 4.5 0 0 0 15.5 12H14a6 6 0 1 0-5.92 7"></path></svg>
+                    </div>
+                    <h3>Analysis Mode</h3>
+                    <p>Load data fully into memory — all analysis tools enabled</p>
+                    <p class="upload-card__hint">Drag &amp; drop or click to select a file</p>
+                    <button class="btn btn--primary" type="button">Select File</button>
+                    <input type="file" id="file-input-analysis" accept=".h5ad" hidden />
+                  </div>
+
+                  <div class="upload-card upload-card--preview" id="drop-zone-preview" tabindex="0" role="button">
+                    <div class="upload-card__icon">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                    </div>
+                    <h3>Preview Mode</h3>
+                    <p>Low-memory read (backed='r') — analysis tools disabled</p>
+                    <p class="upload-card__hint">Drag &amp; drop or click to select a file</p>
+                    <button class="btn btn--outline" type="button">Preview File</button>
+                    <input type="file" id="file-input-preview" accept=".h5ad" hidden />
+                  </div>
+                </div>
+
+                <div class="viz-placeholder" id="viz-placeholder">
+                  <div class="viz-placeholder__inner">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"></path><path d="M7 16l4-5 4 3 5-7"></path></svg>
+                    <p>Visualization area — UMAP / plots will render here after data upload</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 其他页面占位 -->
+        <section class="page-view" data-view="overview">
+          <div class="placeholder-page">
+            <h2>Overview</h2>
+            <p>静态占位页，后续可接入 OpenClaw Dashboard。</p>
+          </div>
+        </section>
+        <section class="page-view" data-view="skills">
+          <div class="placeholder-page">
+            <h2>Skills</h2>
+            <p>静态占位页，后续可接入 Skills Store。</p>
+          </div>
+        </section>
+        <section class="page-view" data-view="config">
+          <div class="config-page">
+            <div class="config-scroll">
+              <header class="config-header">
+                <div>
+                  <h1>LLM Config</h1>
+                  <p>配置 Agent 使用的模型、API Key 与上下文参数。布局参考 ClawX Providers，样式沿用 OpenClaw 主题。</p>
+                </div>
+                <div class="config-active-summary" id="config-active-summary">
+                  <strong>☁️ MiniMax (CN)</strong>
+                  <span>MiniMax-M3</span>
+                </div>
+              </header>
+
+              <div class="config-toolbar">
+                <div class="config-chip-group" id="config-vendor-filter"></div>
+                <div class="config-toolbar__actions">
+                  <select class="field-input field-input--compact" id="config-add-vendor" aria-label="选择厂商"></select>
+                  <button class="btn btn--outline" type="button" id="config-add-provider">+ 添加 Provider</button>
+                </div>
+              </div>
+
+              <div class="config-layout">
+                <aside class="config-sidebar panel-card">
+                  <div class="panel-card__header">已配置的 Providers</div>
+                  <div class="panel-card__body panel-card__body--flush">
+                    <div class="config-provider-list" id="config-provider-list"></div>
+                  </div>
+                </aside>
+
+                <div class="config-main">
+                  <div class="config-editor-empty" id="config-editor-empty">
+                    <span>👈</span>
+                    <p>从左侧选择 Provider，或点击「添加 Provider」接入你的 API</p>
+                  </div>
+
+                  <form class="config-editor panel-card" id="config-editor" hidden>
+                    <div class="panel-card__header">
+                      Provider 设置
+                      <div class="config-editor__actions">
+                        <button class="btn btn--ghost btn--sm" type="button" id="config-set-default">设为默认</button>
+                        <button class="btn btn--ghost btn--sm btn--danger" type="button" id="config-delete-provider">删除</button>
+                      </div>
+                    </div>
+                    <div class="panel-card__body">
+                      <div class="config-form-grid">
+                        <div class="field">
+                          <label class="field-label" for="cfg-label">显示名称</label>
+                          <input class="field-input" id="cfg-label" type="text" />
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-auth-mode">认证方式</label>
+                          <select class="field-input" id="cfg-auth-mode"></select>
+                        </div>
+                        <div class="field field--full">
+                          <label class="field-label" for="cfg-api-key">API Key</label>
+                          <div class="field-input-row">
+                            <input class="field-input" id="cfg-api-key" type="password" autocomplete="off" />
+                            <button class="btn btn--outline btn--sm" type="button" id="cfg-toggle-api-key">显示</button>
+                          </div>
+                          <p class="field-hint">MiniMax 国内站 Key 可在 <a href="https://platform.minimaxi.com/" target="_blank" rel="noopener">platform.minimaxi.com</a> 获取</p>
+                        </div>
+                        <div class="field field--full">
+                          <label class="field-label" for="cfg-base-url">API Base URL</label>
+                          <input class="field-input field-input--mono" id="cfg-base-url" type="url" />
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-api-protocol">API 协议</label>
+                          <select class="field-input field-input--mono" id="cfg-api-protocol">
+                            <option value="openai-completions">OpenAI Completions</option>
+                            <option value="openai-responses">OpenAI Responses</option>
+                            <option value="anthropic-messages">Anthropic Messages</option>
+                            <option value="google-generative-ai">Google Generative AI</option>
+                            <option value="azure-openai-responses">Azure OpenAI</option>
+                            <option value="bedrock-converse-stream">AWS Bedrock</option>
+                            <option value="ollama">Ollama</option>
+                          </select>
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-model">模型</label>
+                          <select class="field-input field-input--mono" id="cfg-model"></select>
+                          <input class="field-input field-input--mono" id="cfg-custom-model" type="text" placeholder="自定义 model id" hidden />
+                        </div>
+                        <div class="field field--checkbox">
+                          <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-enabled" checked />
+                            <span>启用此 Provider</span>
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                  </form>
+
+                  <section class="config-section panel-card">
+                    <div class="panel-card__header">Agent 上下文</div>
+                    <div class="panel-card__body">
+                      <div class="config-form-grid">
+                        <div class="field field--full">
+                          <label class="field-label" for="cfg-system-prompt">System Prompt</label>
+                          <textarea class="field-input field-input--textarea" id="cfg-system-prompt" rows="4"></textarea>
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-temperature">Temperature</label>
+                          <input class="field-input" id="cfg-temperature" type="number" min="0" max="2" step="0.1" />
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-top-p">Top P</label>
+                          <input class="field-input" id="cfg-top-p" type="number" min="0" max="1" step="0.05" />
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-max-tokens">Max Tokens</label>
+                          <input class="field-input" id="cfg-max-tokens" type="number" min="256" step="256" />
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-max-history">最大历史消息数</label>
+                          <input class="field-input" id="cfg-max-history" type="number" min="4" step="2" />
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-max-turns">Agent 最大轮数</label>
+                          <input class="field-input" id="cfg-max-turns" type="number" min="1" max="100" step="1" />
+                        </div>
+                        <div class="field">
+                          <label class="field-label" for="cfg-context-window">Context Window</label>
+                          <input class="field-input" id="cfg-context-window" type="number" min="4096" step="1024" />
+                        </div>
+                        <div class="field field--checkbox">
+                          <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-stream" checked />
+                            <span>流式输出（Stream）</span>
+                          </label>
+                        </div>
+                        <div class="field field--checkbox">
+                          <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-remember-key" checked />
+                            <span>记住 API Key（保存在浏览器 localStorage）</span>
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                </div>
+              </div>
+
+              <footer class="config-footer">
+                <button class="btn btn--outline" type="button" id="config-reset">恢复默认</button>
+                <button class="btn btn--outline" type="button" id="config-test">测试连接</button>
+                <button class="btn btn--primary" type="button" id="config-save">保存配置</button>
+                <span class="config-status" id="config-status"></span>
+              </footer>
+            </div>
+          </div>
+        </section>
+
+        <section class="page-view" data-view="cron">
+          <div class="placeholder-page">
+            <h2>Cron</h2>
+            <p>静态占位页，后续可接入定时任务。</p>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./config-providers.js?v=11"></script>
+    <script src="./config.js?v=16"></script>
+    <script src="./llm-client.js?v=33"></script>
+    <script src="./kernel-panel.js?v=6"></script>
+    <script src="./app.js?v=93"></script>
+  </body>
+</html>

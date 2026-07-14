@@ -1,0 +1,664 @@
+"""miRDeep2 wrapper for miRNA quantification and novel miRNA prediction (anndata mode).
+
+Wraps `miRDeep2 <https://github.com/rajewsky-lab/mirdeep2>`_ tools:
+- ``mapper.pl`` — preprocess reads and map to reference genome
+- ``quantifier.pl`` — quantify known miRNAs against miRBase
+- ``miRDeep2.pl`` — predict known and novel miRNAs
+
+Input is taken from ``adata.obs["fastq_path"]`` (set by the ``fastq_dl`` step).
+If ``adata.obs["trimmed_path"]`` exists, it is preferred (trimmed reads).
+"""
+
+from __future__ import annotations
+
+import csv
+import gzip
+import os
+import shutil
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+from anndata import AnnData
+
+from ..._registry import register_function
+from ..._utils import run_cli_cmd, run_threads
+
+
+# ---------------------------------------------------------------------------
+# Internal: mapper.pl
+# ---------------------------------------------------------------------------
+
+def _run_mapper(
+    sample: str,
+    fastq: str,
+    genome_index: str,
+    output_dir: str,
+    adapter: Optional[str],
+    min_length: int,
+    max_multi: int,
+    one_mismatch_seed: bool,
+    prefix: str,
+    overwrite: bool,
+) -> Dict[str, str]:
+    """Preprocess FASTQ reads and map to genome via mapper.pl.
+
+    Returns paths to collapsed FASTA and ARF mapping file.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    collapsed = out_dir / f"{sample}_collapsed.fa"
+    arf = out_dir / f"{sample}_vs_genome.arf"
+
+    # Skip if outputs already exist
+    if not overwrite and collapsed.exists() and arf.exists():
+        print(f"[mapper.pl] Skipping {sample}: outputs already exist", flush=True)
+        return {"sample": sample, "collapsed": str(collapsed), "arf": str(arf)}
+
+    # Decompress .gz FASTQ if needed
+    fastq_path = Path(fastq)
+    input_fastq = str(fastq_path)
+    temp_dir: Optional[Path] = None
+
+    if str(fastq_path).endswith(".gz"):
+        temp_dir = out_dir / f".tmp_{sample}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        decompressed = temp_dir / fastq_path.name.replace(".gz", "")
+        print(f"[mapper.pl] Decompressing {fastq_path.name} -> {decompressed.name}", flush=True)
+        with gzip.open(fastq_path, "rb") as f_in, open(decompressed, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+        input_fastq = str(decompressed)
+
+    cmd = ["mapper.pl", input_fastq]
+
+    # Input format: fastq
+    cmd.append("-e")
+
+    # Preprocessing
+    if adapter:
+        cmd.extend(["-k", adapter])
+    cmd.extend(["-l", str(min_length)])
+    cmd.append("-m")           # collapse reads
+    cmd.append("-h")           # parse to fasta
+    cmd.append("-i")           # RNA -> DNA
+    cmd.append("-j")           # filter invalid chars
+
+    # Mapping
+    cmd.extend(["-p", genome_index])
+    if one_mismatch_seed:
+        cmd.append("-q")
+    cmd.extend(["-r", str(max_multi)])
+
+    # Prefix for read IDs
+    cmd.extend(["-g", prefix])
+
+    # Output
+    cmd.extend(["-s", str(collapsed)])
+    cmd.extend(["-t", str(arf)])
+    cmd.append("-v")           # progress output
+
+    if overwrite:
+        cmd.append("-n")
+
+    try:
+        run_cli_cmd(cmd)
+    finally:
+        # Clean up temp decompressed file
+        if temp_dir and temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    return {"sample": sample, "collapsed": str(collapsed), "arf": str(arf)}
+
+
+# ---------------------------------------------------------------------------
+# Internal: quantifier.pl
+# ---------------------------------------------------------------------------
+
+def _run_quantifier(
+    sample: str,
+    collapsed_fa: str,
+    mature_fa: str,
+    hairpin_fa: str,
+    output_dir: str,
+    species: str,
+    mismatches: int,
+    upstream: int,
+    downstream: int,
+    discard_multimappers: bool,
+    overwrite: bool,
+) -> Dict[str, str]:
+    """Quantify known miRNAs via quantifier.pl.
+
+    quantifier.pl creates ``expression_analyses/expression_analyses_<ts>/``
+    in the directory where it is run. We run it inside ``output_dir/<sample>/``
+    so outputs stay organised per-sample.
+    """
+    out_dir = Path(output_dir)
+    sample_dir = out_dir / sample
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    # Find existing timestamped output
+    existing_csv = _find_latest_quantifier_csv(sample_dir)
+    if not overwrite and existing_csv:
+        print(f"[quantifier.pl] Skipping {sample}: output already exists", flush=True)
+        counts = _aggregate_mirna_counts(existing_csv)
+        return _build_quantifier_result(sample, sample_dir, counts)
+
+    # Run quantifier.pl in sample_dir
+    cmd = ["quantifier.pl"]
+    cmd.extend(["-p", hairpin_fa])
+    cmd.extend(["-m", mature_fa])
+    cmd.extend(["-r", collapsed_fa])
+    cmd.extend(["-t", species])
+    cmd.extend(["-g", str(mismatches)])
+    cmd.extend(["-e", str(upstream)])
+    cmd.extend(["-f", str(downstream)])
+    cmd.append("-j")  # no pdfs
+    cmd.append("-d")  # do not generate pdfs
+
+    if discard_multimappers:
+        cmd.append("-U")
+
+    run_cli_cmd(cmd)
+
+    # Find the freshly created CSV
+    raw_csv = _find_latest_quantifier_csv(sample_dir)
+    if raw_csv:
+        counts = _aggregate_mirna_counts(raw_csv)
+    else:
+        counts = {}
+
+    return _build_quantifier_result(sample, sample_dir, counts)
+
+
+def _find_latest_quantifier_csv(sample_dir: Path) -> Optional[Path]:
+    """Find the most recent ``miRNA_expressed.csv`` in ``expression_analyses/``."""
+    expr_root = sample_dir / "expression_analyses"
+    if not expr_root.is_dir():
+        return None
+    ts_dirs = sorted(expr_root.glob("expression_analyses_*"))
+    if not ts_dirs:
+        return None
+    csv_path = ts_dirs[-1] / "miRNA_expressed.csv"
+    return csv_path if csv_path.exists() else None
+
+
+def _aggregate_mirna_counts(csv_path: Path) -> Dict[str, int]:
+    """Parse ``miRNA_expressed.csv`` and sum counts for identical miRNA names.
+
+    The CSV has columns: #miRNA, read_count, precursor.
+    The same miRNA (e.g. ``hsa-let-7a-5p``) can come from multiple precursors;
+    this function sums them into a single count.
+    """
+    counts: Dict[str, int] = defaultdict(int)
+    with open(csv_path) as f:
+        reader = csv.DictReader(f, delimiter="\t")
+        for row in reader:
+            mirna = row.get("#miRNA", "").strip()
+            if not mirna:
+                continue
+            try:
+                count = int(row.get("read_count", "0"))
+            except ValueError:
+                count = 0
+            counts[mirna] += count
+    return dict(counts)
+
+
+def _build_quantifier_result(
+    sample: str, sample_dir: Path, counts: Dict[str, int],
+) -> Dict[str, str]:
+    """Write aggregated per-sample counts and return result dict."""
+    # Write aggregated counts for matrix building
+    agg_csv = sample_dir / "miRNA_counts.csv"
+    with open(agg_csv, "w") as f:
+        f.write("miRNA\tread_count\n")
+        for mirna in sorted(counts):
+            f.write(f"{mirna}\t{counts[mirna]}\n")
+
+    # Find HTML and miRBase.mrd
+    html = list(sample_dir.glob("expression_*.html"))
+    mrd = sample_dir / "miRBase.mrd"
+
+    return {
+        "sample": sample,
+        "counts_csv": str(agg_csv),
+        "counts": counts,
+        "mrd": str(mrd) if mrd.exists() else "",
+        "html": str(html[0]) if html else "",
+    }
+
+
+def _merge_count_matrices(sample_results: List[Dict], output_dir: str) -> str:
+    """Merge per-sample aggregated counts into a single matrix CSV.
+
+    Rows = unique mature miRNA IDs, columns = samples.
+    Missing entries are filled with 0.
+    """
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    matrix_path = out_dir / "miRNA_count_matrix.csv"
+
+    # Collect all unique miRNAs and per-sample counts
+    all_mirnas: set[str] = set()
+    sample_data: List[Dict[str, str | int]] = []
+
+    for r in sample_results:
+        sample = r["sample"]
+        counts = r.get("counts", {})
+        all_mirnas.update(counts.keys())
+        sample_data.append({"sample": sample, "counts": counts})
+
+    sorted_mirnas = sorted(all_mirnas)
+
+    with open(matrix_path, "w") as f:
+        # Header
+        headers = ["miRNA"] + [sd["sample"] for sd in sample_data]
+        f.write("\t".join(headers) + "\n")
+        # Rows
+        for mirna in sorted_mirnas:
+            row = [mirna]
+            for sd in sample_data:
+                count = sd["counts"].get(mirna, 0)
+                row.append(str(count))
+            f.write("\t".join(row) + "\n")
+
+    return str(matrix_path)
+
+
+# ---------------------------------------------------------------------------
+# Internal: miRDeep2.pl
+# ---------------------------------------------------------------------------
+
+def _run_mirdeep2(
+    sample: str,
+    collapsed_fa: str,
+    genome_fasta: str,
+    arf: str,
+    mature_fa: str,
+    hairpin_fa: str,
+    related_mature_fa: Optional[str],
+    output_dir: str,
+    species: str,
+    score_cutoff: int,
+    min_stack: Optional[int],
+    overwrite: bool,
+) -> Dict[str, str]:
+    """Predict known and novel miRNAs via miRDeep2.pl."""
+    out_dir = Path(output_dir)
+    sample_dir = out_dir / sample
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    result_html = sample_dir / "result.html"
+    result_csv = sample_dir / "result.csv"
+
+    if not overwrite and result_html.exists():
+        print(f"[miRDeep2.pl] Skipping {sample}: output already exists", flush=True)
+        return {
+            "sample": sample,
+            "html": str(result_html),
+            "csv": str(result_csv) if result_csv.exists() else "",
+        }
+
+    # miRDeep2.pl expects: reads genome arf known_mature [related_mature] [precursors]
+    related = related_mature_fa or "none"
+
+    cmd = ["miRDeep2.pl", collapsed_fa, genome_fasta, arf, mature_fa, related, hairpin_fa]
+    cmd.extend(["-t", species])
+    cmd.extend(["-b", str(score_cutoff)])
+
+    if min_stack is not None:
+        cmd.extend(["-a", str(min_stack)])
+    cmd.append("-v")  # clean temp
+
+    if overwrite:
+        cmd.append("-n")
+
+    run_cli_cmd(cmd)
+
+    return {
+        "sample": sample,
+        "html": str(result_html) if result_html.exists() else "",
+        "csv": str(result_csv) if result_csv.exists() else "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helper: build sample list from AnnData
+# ---------------------------------------------------------------------------
+
+def _build_sample_list(adata: AnnData) -> List[Tuple[str, str]]:
+    """Build ``[(sample_name, fastq_path), ...]`` from AnnData obs.
+
+    Reads ``adata.obs["fastq_path"]`` (set by the ``fastq_dl`` step).
+    If ``adata.obs["trimmed_path"]`` exists, that path is preferred (trimmed reads).
+    """
+    has_trimmed = "trimmed_path" in adata.obs.columns
+    sample_list: List[Tuple[str, str]] = []
+    for idx in range(adata.n_obs):
+        name = adata.obs_names[idx]
+        if has_trimmed and pd.notna(adata.obs["trimmed_path"].iloc[idx]):
+            fq_path = adata.obs["trimmed_path"].iloc[idx]
+        else:
+            fq_path = adata.obs["fastq_path"].iloc[idx]
+        sample_list.append((name, fq_path))
+    return sample_list
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+@register_function(
+    aliases=[
+        "quantify_mirna", "mirna_quantification", "mirdeep2_quantifier",
+        "miRNA定量",
+    ],
+    category="quant",
+    description=(
+        "Quantify known miRNAs with miRDeep2 (anndata mode). "
+        "Reads FASTQ paths from ``adata.obs['fastq_path']`` (preferring "
+        "``adata.obs['trimmed_path']`` if present). Runs ``mapper.pl`` "
+        "to preprocess and map reads, then ``quantifier.pl`` to quantify "
+        "known miRNAs against miRBase. Writes results into the AnnData "
+        "object: ``adata.obs`` (collapsed_path, arf_path, counts_csv), "
+        "``adata.X`` (count matrix, samples x miRNAs), "
+        "``adata.var['mirna_id']``, and ``adata.uns`` (reference paths)."
+    ),
+    examples=[
+        "sa.quant.quantify_mirna(adata, genome_index='grch38', "
+        "mature_fa='ref/mature_hsa.fa', hairpin_fa='ref/hairpin_hsa.fa')",
+    ],
+    related=[
+        "quant.predict_mirna", "alignment.bowtie",
+        "reference.download_mirbase", "fastq.cutadapt",
+    ],
+    produces={
+        "obs": ["collapsed_path", "arf_path", "counts_csv"],
+        "var": ["mirna_id"],
+        "uns": ["genome_index", "mature_fa", "hairpin_fa", "species"],
+    },
+)
+def quantify_mirna(
+    adata: AnnData,
+    genome_index: str = "grch38",
+    mature_fa: str = "ref/mature_hsa.fa",
+    hairpin_fa: str = "ref/hairpin_hsa.fa",
+    species: str = "hsa",
+    output_dir: str = "mirdeep2",
+    adapter: Optional[str] = None,
+    min_length: int = 18,
+    max_multi: int = 5,
+    one_mismatch_seed: bool = False,
+    mismatches: int = 1,
+    upstream: int = 2,
+    downstream: int = 5,
+    discard_multimappers: bool = False,
+    prefix: str = "seq",
+    jobs: Optional[int] = None,
+    force: bool = False,
+) -> AnnData:
+    """Quantify known miRNAs with miRDeep2 (mapper.pl + quantifier.pl).
+
+    Parameters
+    ----------
+    adata
+        AnnData object with ``adata.obs["fastq_path"]`` (and optionally
+        ``adata.obs["trimmed_path"]`` for trimmed reads).
+    genome_index
+        Bowtie genome index basename (e.g. ``"grch38"``).
+    mature_fa
+        miRBase mature miRNA FASTA file (species-specific, e.g.
+        ``ref/mature_hsa.fa`` from ``download_mirbase("hsa")``).
+    hairpin_fa
+        miRBase hairpin precursor FASTA file (species-specific).
+    species
+        3-letter species code (default ``"hsa"``).
+    output_dir
+        Output directory. Per-sample subdirectories are created.
+    adapter
+        3' adapter sequence to clip (e.g. ``"TGGAATTCTCGGGTGCCAAGG"``).
+    min_length
+        Minimum read length after adapter clipping. Default 18.
+    max_multi
+        Max mapping positions per read (``-r``). Default 5.
+    one_mismatch_seed
+        Allow one mismatch in seed during mapping (``-q``).
+    mismatches
+        Mismatches allowed when mapping reads to precursors. Default 1.
+    upstream
+        Bases upstream of mature to consider. Default 2.
+    downstream
+        Bases downstream of mature to consider. Default 5.
+    discard_multimappers
+        Discard reads that map to multiple precursors (``-U``).
+    prefix
+        Three-letter prefix for read IDs (``-g``). Default ``"seq"``.
+    jobs
+        Number of samples to process concurrently.
+    force
+        Re-run even if output files exist.
+
+    Returns
+    -------
+    AnnData
+        The input ``adata`` with results written to ``.obs``, ``.X``,
+        ``.var``, and ``.uns``.
+    """
+    sample_list = _build_sample_list(adata)
+
+    def _process(item: Tuple[str, str]) -> Dict:
+        name, fq = item
+        # Step 1: mapper.pl
+        map_result = _run_mapper(
+            sample=name, fastq=fq, genome_index=genome_index,
+            output_dir=output_dir, adapter=adapter,
+            min_length=min_length, max_multi=max_multi,
+            one_mismatch_seed=one_mismatch_seed,
+            prefix=prefix, overwrite=force,
+        )
+        # Step 2: quantifier.pl
+        quant_result = _run_quantifier(
+            sample=name,
+            collapsed_fa=map_result["collapsed"],
+            mature_fa=mature_fa, hairpin_fa=hairpin_fa,
+            output_dir=output_dir, species=species,
+            mismatches=mismatches, upstream=upstream,
+            downstream=downstream,
+            discard_multimappers=discard_multimappers,
+            overwrite=force,
+        )
+        return {**map_result, **quant_result}
+
+    results = run_threads(sample_list, _process, jobs)
+
+    # Merge per-sample counts into a single matrix CSV
+    matrix_path = _merge_count_matrices(results, output_dir)
+    print(f"[mirdeep2] Count matrix written to {matrix_path}", flush=True)
+
+    # Build count matrix (samples x miRNAs) and assign into adata
+    all_mirnas: List[str] = sorted(
+        set().union(*(r.get("counts", {}).keys() for r in results))
+    )
+    n_mirnas = len(all_mirnas)
+    count_matrix = [[0.0] * n_mirnas for _ in range(len(sample_list))]
+
+    for i, r in enumerate(results):
+        counts = r.get("counts", {})
+        for j, mirna in enumerate(all_mirnas):
+            count_matrix[i][j] = float(counts.get(mirna, 0))
+
+    # Write obs paths
+    for i, r in enumerate(results):
+        sample_name = r["sample"]
+        if "collapsed" in r:
+            adata.obs.loc[sample_name, "collapsed_path"] = r["collapsed"]
+        if "arf" in r:
+            adata.obs.loc[sample_name, "arf_path"] = r["arf"]
+        if "counts_csv" in r:
+            adata.obs.loc[sample_name, "counts_csv"] = r["counts_csv"]
+
+    # Assign count matrix and feature data
+    adata.X = count_matrix
+    adata.var = pd.DataFrame(index=[f"mirna_{i}" for i in range(n_mirnas)])
+    adata.var["mirna_id"] = all_mirnas
+
+    # Store reference paths in uns
+    adata.uns["genome_index"] = genome_index
+    adata.uns["mature_fa"] = mature_fa
+    adata.uns["hairpin_fa"] = hairpin_fa
+    adata.uns["species"] = species
+
+    return adata
+
+
+@register_function(
+    aliases=[
+        "predict_mirna", "mirdeep2_predict", "novel_mirna_prediction",
+        "预测新miRNA",
+    ],
+    category="quant",
+    description=(
+        "Predict known and novel miRNAs with miRDeep2 (anndata mode). "
+        "Reads FASTQ paths from ``adata.obs['fastq_path']`` (preferring "
+        "``adata.obs['trimmed_path']`` if present). Runs ``mapper.pl`` "
+        "to preprocess and map reads, then ``miRDeep2.pl`` to identify "
+        "known miRNAs and predict novel candidates (structure prediction, "
+        "randfold analysis, score estimation). Writes results into the "
+        "AnnData object: ``adata.obs`` (collapsed_path, arf_path) and "
+        "``adata.uns`` (reference paths)."
+    ),
+    examples=[
+        "sa.quant.predict_mirna(adata, genome_index='grch38', "
+        "genome_fasta='ref/GRCh38.fa', mature_fa='ref/mature_hsa.fa', "
+        "hairpin_fa='ref/hairpin_hsa.fa')",
+    ],
+    related=[
+        "quant.quantify_mirna", "alignment.bowtie",
+        "reference.download_mirbase", "reference.download_genome",
+    ],
+    produces={
+        "obs": ["collapsed_path", "arf_path", "prediction_csv", "prediction_html"],
+        "uns": ["genome_index", "mature_fa", "hairpin_fa", "species"],
+    },
+)
+def predict_mirna(
+    adata: AnnData,
+    genome_index: str = "grch38",
+    genome_fasta: str = "ref/GRCh38.primary_assembly.genome.fa",
+    mature_fa: str = "ref/mature_hsa.fa",
+    hairpin_fa: str = "ref/hairpin_hsa.fa",
+    related_mature_fa: Optional[str] = None,
+    species: str = "hsa",
+    output_dir: str = "mirdeep2",
+    adapter: Optional[str] = None,
+    min_length: int = 18,
+    max_multi: int = 5,
+    one_mismatch_seed: bool = False,
+    score_cutoff: int = 0,
+    min_stack: Optional[int] = None,
+    prefix: str = "seq",
+    jobs: Optional[int] = None,
+    force: bool = False,
+) -> AnnData:
+    """Predict known and novel miRNAs with miRDeep2.
+
+    Parameters
+    ----------
+    adata
+        AnnData object with ``adata.obs["fastq_path"]`` (and optionally
+        ``adata.obs["trimmed_path"]`` for trimmed reads).
+    genome_index
+        Bowtie genome index basename (e.g. ``"grch38"``).
+    genome_fasta
+        Reference genome FASTA file (uncompressed). Required by miRDeep2.pl.
+    mature_fa
+        miRBase mature miRNA FASTA for current species.
+    hairpin_fa
+        miRBase hairpin precursor FASTA for current species.
+    related_mature_fa
+        Optional miRBase mature miRNA FASTA from related species.
+        Improves detection of conserved miRNAs.
+    species
+        3-letter species code (default ``"hsa"``).
+    output_dir
+        Output directory. Per-sample subdirectories are created.
+    adapter
+        3' adapter sequence to clip.
+    min_length
+        Minimum read length. Default 18.
+    max_multi
+        Max mapping positions per read. Default 5.
+    one_mismatch_seed
+        Allow one seed mismatch during mapping.
+    score_cutoff
+        Minimum score cut-off for novel miRNAs. Default 0.
+    min_stack
+        Minimum read stack height for analysis. Auto-estimated when
+        not set.
+    prefix
+        Three-letter prefix for read IDs (``-g``). Default ``"seq"``.
+    jobs
+        Number of samples to process concurrently.
+    force
+        Re-run even if output files exist.
+
+    Returns
+    -------
+    AnnData
+        The input ``adata`` with results written to ``.obs`` and ``.uns``.
+    """
+    sample_list = _build_sample_list(adata)
+
+    def _process(item: Tuple[str, str]) -> Dict:
+        name, fq = item
+        # Step 1: mapper.pl
+        map_result = _run_mapper(
+            sample=name, fastq=fq, genome_index=genome_index,
+            output_dir=output_dir, adapter=adapter,
+            min_length=min_length, max_multi=max_multi,
+            one_mismatch_seed=one_mismatch_seed,
+            prefix=prefix, overwrite=force,
+        )
+        # Step 2: miRDeep2.pl
+        deep_result = _run_mirdeep2(
+            sample=name,
+            collapsed_fa=map_result["collapsed"],
+            genome_fasta=genome_fasta,
+            arf=map_result["arf"],
+            mature_fa=mature_fa,
+            hairpin_fa=hairpin_fa,
+            related_mature_fa=related_mature_fa,
+            output_dir=output_dir,
+            species=species,
+            score_cutoff=score_cutoff,
+            min_stack=min_stack,
+            overwrite=force,
+        )
+        return {**map_result, **deep_result}
+
+    results = run_threads(sample_list, _process, jobs)
+
+    # Write obs paths
+    for i, r in enumerate(results):
+        sample_name = r["sample"]
+        if "collapsed" in r:
+            adata.obs.loc[sample_name, "collapsed_path"] = r["collapsed"]
+        if "arf" in r:
+            adata.obs.loc[sample_name, "arf_path"] = r["arf"]
+        # prediction result CSV/HTML are per-sample; store in obs as well
+        if "csv" in r and r.get("csv"):
+            adata.obs.loc[sample_name, "prediction_csv"] = r["csv"]
+        if "html" in r and r.get("html"):
+            adata.obs.loc[sample_name, "prediction_html"] = r["html"]
+
+    # Store reference paths in uns
+    adata.uns["genome_index"] = genome_index
+    adata.uns["mature_fa"] = mature_fa
+    adata.uns["hairpin_fa"] = hairpin_fa
+    adata.uns["species"] = species
+
+    return adata
