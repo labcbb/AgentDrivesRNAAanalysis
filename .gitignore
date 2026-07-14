@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 *.cpython-*.pyc
 *.nfs000*
+.qwen/
