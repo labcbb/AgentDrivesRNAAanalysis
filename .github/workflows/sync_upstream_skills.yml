@@ -1,8 +1,5 @@
 name: Auto Sync Nature Figure Skill
 on:
-  schedule:
-    # 每天北京时间早上 8:00 (UTC 0:00) 自动执行
-    - cron: '0 0 * * *'
   workflow_dispatch: # 支持手动点击运行
 
 # 必须显式赋予 Action 写入权限，否则推送代码会报 403 权限错误
@@ -14,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout current repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
