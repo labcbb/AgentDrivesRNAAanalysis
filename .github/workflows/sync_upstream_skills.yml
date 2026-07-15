@@ -13,30 +13,39 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Add upstream remote for nature-skills
+      - name: Prepare upstream remote
         run: |
-          git remote add upstream-nature https://github.com/Yuan1z0825/nature-skills.git
+          git remote add upstream-nature https://github.com/Yuan1z0825/nature-skills.git || true
           git fetch upstream-nature main
 
-      # 1. 同步 nature-figure
+      # 同步 nature-figure，自动区分首次add / 后续pull
       - name: Sync nature-figure to sRNAgent/skills/nature-figure
         run: |
-          git subtree pull \
-            --prefix=sRNAgent/skills/nature-figure \
-            upstream-nature main:skills/nature-figure \
-            --squash
+          PREFIX="sRNAgent/skills/nature-figure"
+          if [ ! -d "$PREFIX" ]; then
+            echo "First time import, run subtree add"
+            git subtree add --prefix="$PREFIX" upstream-nature main:skills/nature-figure --squash
+          else
+            echo "Update existing subtree, run subtree pull"
+            git subtree pull --prefix="$PREFIX" upstream-nature main:skills/nature-figure --squash
+          fi
 
-      # 后续新增其他工具同步直接追加步骤即可
+      # 后续新增其他skill在这里追加
       # - name: Sync xxx-skill
       #   run: |
-      #     git remote add upstream-xxx https://xxx.git
+      #     PREFIX="sRNAgent/skills/xxx"
+      #     git remote add upstream-xxx https://xxx.git || true
       #     git fetch upstream-xxx main
-      #     git subtree pull --prefix=sRNAgent/skills/xxx upstream-xxx main:xxx-path --squash
+      #     if [ ! -d "$PREFIX" ]; then
+      #       git subtree add --prefix="$PREFIX" upstream-xxx main:xxx-path --squash
+      #     else
+      #       git subtree pull --prefix="$PREFIX" upstream-xxx main:xxx-path --squash
+      #     fi
 
       - name: Commit & push changes
         run: |
           git config --global user.name "Sync Bot"
           git config --global user.email "sync-bot@github.com"
           git add .
-          git commit -m "Auto sync third-party skills" || echo "No updates"
+          git commit -m "Auto sync third-party skills" || echo "No updates to commit"
           git push
