@@ -6,6 +6,14 @@ description: "Quantify known miRNAs and predict novel miRNAs using miRDeep2, wit
 
 # miRNA Quantification with miRDeep2
 
+## ⚠️ 默认行为：只定量已知 miRNA，不鉴定 novel miRNA
+
+**除非用户明确要求鉴定 novel miRNA，否则 agent 只调用 `sa.quant.quantify_mirna`（定量已知 miRNA），绝不调用 `sa.quant.predict_mirna`（预测新 miRNA）。**
+
+- `quantify_mirna` → 只定量已知 miRNA（mapper.pl + quantifier.pl），速度快，结果稳定
+- `predict_mirna` → 预测已知 + novel miRNA（mapper.pl + miRDeep2.pl），计算量大，结果需人工验证
+- **禁止在未被告知的情况下帮用户跑 novel miRNA 预测**
+
 ## Overview
 
 miRDeep2 is a widely used tool for identifying known and novel miRNAs from small RNA-seq data. This skill wraps three miRDeep2 modules:
@@ -16,13 +24,13 @@ miRDeep2 is a widely used tool for identifying known and novel miRNAs from small
 | 2 | quantifier.pl | `sa.quant.quantify_mirna` | Quantify known miRNAs against miRBase |
 | 3 | miRDeep2.pl | `sa.quant.predict_mirna` | Predict known + novel miRNAs with structure and randfold analysis |
 
-**默认流程（只定量已知 miRNA）：**
+**定量已知 miRNA（默认流程）：**
 
 ```
 Trimmed FASTQ  ──→  mapper.pl  ──→  quantifier.pl  ──→  adata.X (count matrix)
 ```
 
-**预测新 miRNA 流程（额外步骤）：**
+**预测新 miRNA（仅当用户明确要求时）：**
 
 ```
 Trimmed FASTQ  ──→  mapper.pl  ──→  miRDeep2.pl  ──→  result.html + result.csv + pdfs/

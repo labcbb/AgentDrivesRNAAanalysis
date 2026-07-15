@@ -10,6 +10,7 @@ dependencies:
   - jupyter
   - ipykernel
   - samtools
+  - viennarna=1.8.5
   - mirdeep2
   - subread
   - pysam
