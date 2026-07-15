@@ -1,39 +1,17 @@
-name: Force Fresh Sync Skills
-on:
-  schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch:
-
-permissions:
-  contents: write
-
-jobs:
-  sync_all:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout current repo
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Sync nature-figure via giget
+- name: Sync nature-figure to sRNAgent/skills/nature-figure
         run: |
-          # 彻底清理旧目录
-          rm -rf sRNAgent/skills/nature-figure
-          mkdir -p sRNAgent/skills/nature-figure
+          PREFIX="sRNAgent/skills/nature-figure"
           
-          # 使用 giget 直接下载远程仓库的指定子文件夹，完全绕开本地 Git 冲突
-          npx giget gh:Yuan1z0825/nature-skills/skills/nature-figure sRNAgent/skills/nature-figure --force
-
-      - name: Commit and push
-        run: |
-          git config --global user.name "Sync Bot"
-          git config --global user.email "sync-bot@github.com"
-          git add sRNAgent/skills/nature-figure
+          # 确保添加了 upstream 远程源（如果之前步骤没加的话）
+          git remote add upstream-nature https://github.com/Yuan1z0825/nature-skills.git || true
+          git fetch upstream-nature main
           
-          if ! git diff --cached --quiet; then
-            git commit -m "Auto sync latest nature-figure"
-            git push origin HEAD:${{ github.ref_name }}
+          if [ ! -d "$PREFIX" ]; then
+            echo "First time import, run subtree add"
+            # 正确语法：只指定分支 main，不要带冒号和路径
+            git subtree add --prefix="$PREFIX" upstream-nature main --squash
           else
-            echo "No changes detected, skipping push."
+            echo "Update existing subtree, run subtree pull"
+            # 正确语法：只指定分支 main，不要带冒号和路径
+            git subtree pull --prefix="$PREFIX" upstream-nature main --squash
           fi
