@@ -1,17 +1,13 @@
 - name: Sync nature-figure to sRNAgent/skills/nature-figure
-        run: |
-          PREFIX="sRNAgent/skills/nature-figure"
-          
-          # 确保添加了 upstream 远程源（如果之前步骤没加的话）
-          git remote add upstream-nature https://github.com/Yuan1z0825/nature-skills.git || true
-          git fetch upstream-nature main
-          
-          if [ ! -d "$PREFIX" ]; then
-            echo "First time import, run subtree add"
-            # 正确语法：只指定分支 main，不要带冒号和路径
-            git subtree add --prefix="$PREFIX" upstream-nature main --squash
-          else
-            echo "Update existing subtree, run subtree pull"
-            # 正确语法：只指定分支 main，不要带冒号和路径
-            git subtree pull --prefix="$PREFIX" upstream-nature main --squash
-          fi
+  run: |
+    PREFIX="sRNAgent/skills/nature-figure"
+    # Create a branch with only the skills/nature-figure subdirectory
+    git subtree split --prefix=skills/nature-figure --branch nature-figure-only upstream-nature/main || true
+    
+    if [ ! -d "$PREFIX" ]; then
+      echo "First time import, run subtree add"
+      git subtree add --prefix="$PREFIX" nature-figure-only --squash
+    else
+      echo "Update existing subtree, run subtree pull"
+      git subtree pull --prefix="$PREFIX" nature-figure-only --squash
+    fi
