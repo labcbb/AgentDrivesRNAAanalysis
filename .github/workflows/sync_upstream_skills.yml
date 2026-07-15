@@ -8,39 +8,38 @@ jobs:
   sync_all:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout your repo
+      - name: Checkout current repo
         uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
-      - name: Sync nature-figure folder
+      - name: Sync nature-figure
         run: |
-          TMP_DIR=tmp_nature_skill
-          TARGET=sRNAgent/skills/nature-figure
-          
-          # 清理旧临时目录
-          rm -rf $TMP_DIR
-          # 清理本地旧的目标文件夹
-          rm -rf $TARGET
-          
-          # 稀疏克隆上游仓库，只拉取 skills/nature-figure
-          git clone --depth 1 --filter=blob:none --sparse https://github.com/Yuan1z0825/nature-skills.git $TMP_DIR
-          cd $TMP_DIR
-          git sparse-checkout set skills/nature-figure
-          git checkout main
-          
-          # 拷贝目标文件夹到你的项目
-          cd ..
-          mkdir -p sRNAgent/skills
-          cp -r $TMP_DIR/skills/nature-figure $TARGET
-          
-          # 删除临时仓库
-          rm -rf $TMP_DIR
+          # 定义路径
+          TMP=tmp_upstream
+          DEST=sRNAgent/skills/nature-figure
+          SRC=skills/nature-figure
+          UPSTREAM_URL=https://github.com/Yuan1z0825/nature-skills.git
 
-      - name: Commit & push changes
+          # 清理临时目录和旧目标文件夹
+          rm -rf "$TMP" "$DEST"
+          mkdir -p sRNAgent/skills
+
+          # 稀疏克隆只拉需要的文件夹
+          git clone --depth 1 --sparse "$UPSTREAM_URL" "$TMP"
+          cd "$TMP"
+          git sparse-checkout set "$SRC"
+          git checkout main
+          cd ..
+
+          # 复制文件夹到你的项目
+          cp -r "$TMP/$SRC" "$DEST"
+
+          # 删除临时仓库
+          rm -rf "$TMP"
+
+      - name: Commit and push
         run: |
           git config --global user.name "Sync Bot"
           git config --global user.email "sync-bot@github.com"
           git add sRNAgent/skills/nature-figure
-          git commit -m "Auto sync nature-figure upstream latest" || echo "No file changes"
+          git commit -m "Auto sync latest nature-figure" || echo "No changes detected"
           git push
