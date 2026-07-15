@@ -1,13 +1,21 @@
-- name: Sync nature-figure and commit
+- name: Prepare upstream remote
   run: |
-    mkdir -p sRNAgent/skills
-    rm -rf sRNAgent/skills/nature-figure || true
+    git remote add upstream-nature https://github.com/Yuan1z0825/nature-skills.git || true
+    git fetch upstream-nature main
+
+- name: Sync nature-figure to sRNAgent/skills/nature-figure
+  run: |
+    PREFIX="sRNAgent/skills/nature-figure"
+    UPSTREAM_BRANCH="upstream-nature/main"
+    UPSTREAM_DIR="skills/nature-figure"
     
-    git archive --remote=https://github.com/Yuan1z0825/nature-skills.git \
-      main:skills/nature-figure | tar x -C sRNAgent/skills/
-    
-    git config --global user.name "Sync Bot"
-    git config --global user.email "sync-bot@github.com"
-    git add sRNAgent/skills/nature-figure
-    git commit -m "Auto sync nature-figure from upstream" || echo "No updates to commit"
-    git push
+    if [ ! -d "$PREFIX" ]; then
+      echo "First time import, run subtree add"
+      # 使用 subtree split 提取子目录，然后 add
+      git subtree add --prefix="$PREFIX" --squash \
+        $(git subtree split --prefix="$UPSTREAM_DIR" "$UPSTREAM_BRANCH")
+    else
+      echo "Update existing subtree, run subtree pull"
+      git subtree pull --prefix="$PREFIX" --squash \
+        $(git subtree split --prefix="$UPSTREAM_DIR" "$UPSTREAM_BRANCH")
+    fi
