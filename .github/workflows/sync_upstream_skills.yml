@@ -8,39 +8,39 @@ jobs:
   sync_all:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repo full history
+      - name: Checkout your repo
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Prepare upstream remote
+      - name: Sync nature-figure folder
         run: |
-          git remote add upstream-nature https://github.com/Yuan1z0825/nature-skills.git || true
-          git config --global http.timeout 300
-          git fetch upstream-nature main
-
-      # 同步 nature-figure 修复版
-      - name: Sync nature-figure to sRNAgent/skills/nature-figure
-        run: |
-          PREFIX="sRNAgent/skills/nature-figure"
-          UPSTREAM=upstream-nature
-          BRANCH=main
-          SRC_DIR=skills/nature-figure
-
-          TMP_COMMIT=$(git subtree split --prefix=${SRC_DIR} ${UPSTREAM}/${BRANCH})
-
-          if [ ! -d "$PREFIX" ]; then
-            echo "First time import, run subtree add"
-            git subtree add --prefix="$PREFIX" ${TMP_COMMIT} --squash
-          else
-            echo "Update existing subtree, run subtree pull"
-            git subtree pull --prefix="$PREFIX" ${TMP_COMMIT} --squash
-          fi
+          TMP_DIR=tmp_nature_skill
+          TARGET=sRNAgent/skills/nature-figure
+          
+          # 清理旧临时目录
+          rm -rf $TMP_DIR
+          # 清理本地旧的目标文件夹
+          rm -rf $TARGET
+          
+          # 稀疏克隆上游仓库，只拉取 skills/nature-figure
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/Yuan1z0825/nature-skills.git $TMP_DIR
+          cd $TMP_DIR
+          git sparse-checkout set skills/nature-figure
+          git checkout main
+          
+          # 拷贝目标文件夹到你的项目
+          cd ..
+          mkdir -p sRNAgent/skills
+          cp -r $TMP_DIR/skills/nature-figure $TARGET
+          
+          # 删除临时仓库
+          rm -rf $TMP_DIR
 
       - name: Commit & push changes
         run: |
           git config --global user.name "Sync Bot"
           git config --global user.email "sync-bot@github.com"
-          git add .
-          git commit -m "Auto sync third-party skills" || echo "No updates to commit"
+          git add sRNAgent/skills/nature-figure
+          git commit -m "Auto sync nature-figure upstream latest" || echo "No file changes"
           git push
