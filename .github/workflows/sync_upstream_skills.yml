@@ -1,0 +1,42 @@
+name: Auto Sync All ThirdParty Skills
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync_all:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream remote for nature-skills
+        run: |
+          git remote add upstream-nature https://github.com/Yuan1z0825/nature-skills.git
+          git fetch upstream-nature main
+
+      # 1. 同步 nature-figure
+      - name: Sync nature-figure to sRNAgent/skills/nature-figure
+        run: |
+          git subtree pull \
+            --prefix=sRNAgent/skills/nature-figure \
+            upstream-nature main:skills/nature-figure \
+            --squash
+
+      # 后续新增其他工具同步直接追加步骤即可
+      # - name: Sync xxx-skill
+      #   run: |
+      #     git remote add upstream-xxx https://xxx.git
+      #     git fetch upstream-xxx main
+      #     git subtree pull --prefix=sRNAgent/skills/xxx upstream-xxx main:xxx-path --squash
+
+      - name: Commit & push changes
+        run: |
+          git config --global user.name "Sync Bot"
+          git config --global user.email "sync-bot@github.com"
+          git add .
+          git commit -m "Auto sync third-party skills" || echo "No updates"
+          git push
