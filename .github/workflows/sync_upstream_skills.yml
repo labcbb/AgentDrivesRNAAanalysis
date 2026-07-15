@@ -16,31 +16,26 @@ jobs:
       - name: Prepare upstream remote
         run: |
           git remote add upstream-nature https://github.com/Yuan1z0825/nature-skills.git || true
+          git config --global http.timeout 300
           git fetch upstream-nature main
 
-      # 同步 nature-figure，自动区分首次add / 后续pull
+      # 同步 nature-figure 修复版
       - name: Sync nature-figure to sRNAgent/skills/nature-figure
         run: |
           PREFIX="sRNAgent/skills/nature-figure"
+          UPSTREAM=upstream-nature
+          BRANCH=main
+          SRC_DIR=skills/nature-figure
+
+          TMP_COMMIT=$(git subtree split --prefix=${SRC_DIR} ${UPSTREAM}/${BRANCH})
+
           if [ ! -d "$PREFIX" ]; then
             echo "First time import, run subtree add"
-            git subtree add --prefix="$PREFIX" upstream-nature main:skills/nature-figure --squash
+            git subtree add --prefix="$PREFIX" ${TMP_COMMIT} --squash
           else
             echo "Update existing subtree, run subtree pull"
-            git subtree pull --prefix="$PREFIX" upstream-nature main:skills/nature-figure --squash
+            git subtree pull --prefix="$PREFIX" ${TMP_COMMIT} --squash
           fi
-
-      # 后续新增其他skill在这里追加
-      # - name: Sync xxx-skill
-      #   run: |
-      #     PREFIX="sRNAgent/skills/xxx"
-      #     git remote add upstream-xxx https://xxx.git || true
-      #     git fetch upstream-xxx main
-      #     if [ ! -d "$PREFIX" ]; then
-      #       git subtree add --prefix="$PREFIX" upstream-xxx main:xxx-path --squash
-      #     else
-      #       git subtree pull --prefix="$PREFIX" upstream-xxx main:xxx-path --squash
-      #     fi
 
       - name: Commit & push changes
         run: |
