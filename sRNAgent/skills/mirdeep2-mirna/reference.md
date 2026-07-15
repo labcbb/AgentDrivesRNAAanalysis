@@ -108,6 +108,9 @@ print(adata.obs[["collapsed_path", "arf_path", "counts_csv"]])
 # Count matrix (n_samples x n_mirnas)
 print(adata.X.shape)
 
+# log2(CPM+1) normalized expression layer
+print(adata.layers["logcpm"].shape)
+
 # Export to DataFrame
 import pandas as pd
 exp_df = pd.DataFrame(
@@ -117,8 +120,29 @@ exp_df = pd.DataFrame(
 )
 print(exp_df.iloc[:3, :5])
 
+# Normalized expression
+cpm_df = pd.DataFrame(
+    adata.layers["logcpm"],
+    index=adata.obs_names,
+    columns=adata.var["mirna_id"],
+)
+print(cpm_df.iloc[:3, :5])
+
 # miRNA IDs
 print(adata.var["mirna_id"].head())
+```
+
+## Normalize counts from any quantification tool
+
+```python
+import sRNAgent as sa
+
+# Standalone log2(CPM+1) normalization for any adata with raw counts
+sa.quant.normalize_cpm(adata)
+print(adata.layers["logcpm"])  # shape matches adata.X
+
+# Can also read from a specific layer
+# sa.quant.normalize_cpm(adata, from_layer="raw")
 ```
 
 ## Predict known + novel miRNAs (single sample)

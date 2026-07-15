@@ -174,6 +174,9 @@ adata = sa.quant.quantify_mirna(adata, genome_index="ref/grch38",
 print(f"Count matrix shape: {adata.X.shape}")
 print(f"miRNA IDs: {adata.var['mirna_id'].tolist()[:5]}")
 
+# 查看 log2(CPM+1) 标准化表达量
+print(f"Normalized counts (log2 CPM): shape = {adata.layers['logcpm'].shape}")
+
 # 前 10 个高表达 miRNA
 import pandas as pd
 counts_df = pd.DataFrame(adata.X.toarray() if hasattr(adata.X, 'toarray') else adata.X,
@@ -183,6 +186,23 @@ print(counts_df.iloc[:, :10])
 
 # 每个样本的详细输出文件路径
 print(adata.obs[["collapsed_path", "arf_path", "counts_csv"]])
+```
+
+**CORRECT — 也可以在其他定量工具后单独使用 normalize_cpm:**
+
+```python
+# 如果在 miRDeep2 定量后需要重新计算 log_cpm:
+sa.quant.normalize_cpm(adata)
+
+# 或者在 featureCounts 等其它工具定量后使用:
+# sa.quant.feature_count(adata, ...)
+# sa.quant.normalize_cpm(adata)        # 同样生成 adata.layers["logcpm"]
+
+# 从指定 layer 读取原始 counts:
+# sa.quant.normalize_cpm(adata, from_layer="raw_counts")
+
+# 自定义输出 layer 名称:
+# sa.quant.normalize_cpm(adata, layer="log2cpm")
 ```
 
 ### 3. 查看跨样本表达矩阵
@@ -370,6 +390,8 @@ print(f"Novel miRNA report: {adata.obs['prediction_html'].iloc[0]}")
 #   "counts_csv"       : mirdeep2/S1/miRNA_counts.csv
 
 # adata.X : count 矩阵 (n_samples × n_mirnas)
+# adata.layers["counts"] : 原始 count 备份 (与 adata.X 相同的数值)
+# adata.layers["logcpm"] : log2(CPM+1) 标准化表达量 (CPM = counts per million)
 # adata.var["mirna_id"] : miRNA 名称, 如 hsa-let-7a-5p
 
 # adata.uns["genome_index"] : "ref/grch38"

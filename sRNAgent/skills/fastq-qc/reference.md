@@ -32,6 +32,12 @@ adata = sa.fastq.cutadapt(
 )
 print(f"Trimmed FASTQ: {adata.obs['trimmed_path'].iloc[0]}")
 
+# 查看自动提取的 cutadapt 质控指标
+print(adata.obs[[
+    "cutadapt_in_reads", "cutadapt_out_reads",
+    "cutadapt_trim_rate", "cutadapt_w_adapters",
+]].to_string())
+
 # ── FastQC ──
 adata = sa.fastq.fastqc(adata, output_dir="fastqc_reports")
 

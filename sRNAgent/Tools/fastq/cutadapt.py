@@ -18,13 +18,67 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import pandas as pd
 from anndata import AnnData
 
 from ..._registry import register_function
 from ..._utils import run_cli_cmd, run_threads
+
+
+# ---------------------------------------------------------------------------
+# QC field extraction: cutadapt JSON report → flat adata.obs columns
+# ---------------------------------------------------------------------------
+
+# Mapping: (obs_suffix, [possible JSON keys to try])
+_CUTADAPT_QC_FIELDS: list[tuple[str, list[str]]] = [
+    ("in_reads", ["read_counts"]),
+    ("out_reads", ["read_counts_after_filtering"]),
+    ("too_short", ["too_short"]),
+    ("too_long", ["too_long"]),
+    ("too_many_n", ["too_many_n"]),
+    ("w_adapters", ["with_adapters"]),
+]
+
+
+def _extract_cutadapt_qc(report: dict) -> dict[str, float]:
+    """Extract numeric QC values from a cutadapt JSON report dict.
+
+    Tries top-level keys first, then falls back to keys nested inside
+    any sub-dict (cutadapt 4+ nests read_counts / filtering stats).
+    """
+    result: dict[str, float] = {}
+    for suffix, keys in _CUTADAPT_QC_FIELDS:
+        val = None
+        # Try top-level
+        for k in keys:
+            raw = report.get(k)
+            if raw is not None:
+                val = _to_numeric(raw)
+                break
+        # Try nested (cutadapt 4+ nests inside read_counts, etc.)
+        if val is None:
+            for v in report.values():
+                if isinstance(v, dict):
+                    for k in keys:
+                        raw = v.get(k)
+                        if raw is not None:
+                            val = _to_numeric(raw)
+                            break
+                if val is not None:
+                    break
+        if val is not None:
+            result[suffix] = val
+    return result
+
+
+def _to_numeric(val: Any) -> float | None:
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
 
 
 def _parse_json_report(json_path: Path) -> dict:
@@ -326,7 +380,14 @@ def _run_cutadapt(
     related=[
         "fastq.fastqc", "fastq.fastq_dl",
     ],
-    produces={"obs": ["trimmed_path", "cutadapt_json", "cutadapt_report", "cutadapt_log"]},
+    produces={
+        "obs": [
+            "trimmed_path", "cutadapt_json", "cutadapt_report", "cutadapt_log",
+            "cutadapt_in_reads", "cutadapt_out_reads",
+            "cutadapt_too_short", "cutadapt_too_long", "cutadapt_too_many_n",
+            "cutadapt_w_adapters", "cutadapt_trim_rate",
+        ],
+    },
 )
 def cutadapt(
     adata: AnnData,
@@ -582,5 +643,30 @@ def cutadapt(
     adata.obs["cutadapt_log"] = pd.Series(
         log_map, index=adata.obs_names, dtype="object"
     )
+
+    # ── Extract flat QC columns from cutadapt JSON report ──
+    for suffix, keys in _CUTADAPT_QC_FIELDS:
+        series = {}
+        for name in adata.obs_names:
+            report = report_map.get(name, {})
+            if isinstance(report, dict):
+                vals = _extract_cutadapt_qc(report)
+                series[name] = vals.get(suffix)
+            else:
+                series[name] = None
+        col_name = f"cutadapt_{suffix}"
+        if any(v is not None for v in series.values()):
+            adata.obs[col_name] = pd.Series(series, index=adata.obs_names, dtype="float64")
+
+    # Compute trimming rate = (in - out) / in
+    in_col = "cutadapt_in_reads"
+    out_col = "cutadapt_out_reads"
+    if in_col in adata.obs.columns and out_col in adata.obs.columns:
+        in_vals = adata.obs[in_col].astype(float)
+        out_vals = adata.obs[out_col].astype(float)
+        mask = in_vals > 0
+        trimming_rate = pd.Series(index=adata.obs_names, dtype="float64")
+        trimming_rate[mask] = (in_vals[mask] - out_vals[mask]) / in_vals[mask]
+        adata.obs["cutadapt_trim_rate"] = trimming_rate
 
     return adata

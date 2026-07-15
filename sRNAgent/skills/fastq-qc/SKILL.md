@@ -178,6 +178,23 @@ print(adata.obs["cutadapt_report"].apply(
 ).to_string())
 ```
 
+**查看提取后的平铺 QC 指标（推荐）：**
+
+```python
+# cutadapt 运行后，关键指标已自动提取为 adata.obs 平铺列
+# 可用于筛选低质量样本
+print(adata.obs[[
+    "cutadapt_in_reads", "cutadapt_out_reads",
+    "cutadapt_trim_rate", "cutadapt_too_short",
+]].to_string())
+
+# 标记修剪率过低的样本（< 10% 可能 adapter 序列不对）
+low_trim = adata.obs[adata.obs["cutadapt_trim_rate"] < 0.1]
+if len(low_trim) > 0:
+    print(f"⚠️  {len(low_trim)} 个样本修剪率低于 10%，请检查 adapter 序列是否正确")
+    print(low_trim[["cutadapt_trim_rate"]].to_string())
+```
+
 ### 3. FastQC 质量报告
 
 对修剪后的 FASTQ 文件运行 FastQC：
@@ -257,6 +274,15 @@ qc_cols = [c for c in adata.obs.columns if c.startswith("multiqc_fastqc_")]
 print(adata.obs[qc_cols].to_string())
 ```
 
+**CORRECT — 查看新增的补充质控指标:**
+
+```python
+# multiqc 会自动从 report_saved_raw_data 中提取
+# - multiqc_pct_unique   : 唯一 reads 百分比（与 multiqc_pct_dups 互补）
+# - multiqc_total_bases  : 总测序碱基数 (Mbp)
+print(adata.obs[["multiqc_pct_unique", "multiqc_total_bases"]].to_string())
+```
+
 **CORRECT — 同时包含 cutadapt 日志:**
 
 ```python
@@ -287,6 +313,68 @@ adata = sa.fastq.multiqc(
     data_format="json",
 )
 ```
+
+## 5. 质控检查（Agent 必须执行）
+
+MultiQC 运行后，**agent 必须**检查 `adata.obs` 中的质控指标，并向用户汇报 QC 概况：
+
+```python
+import sRNAgent as sa
+
+# 在所有 cutadapt + FastQC + MultiQC 步骤完成后:
+# adata.obs 中已包含自动提取的 flat QC 指标
+
+# 查看全部 multiqc 质控列
+print("═" * 50)
+print("QC 指标概览")
+print("═" * 50)
+qc_cols = [c for c in adata.obs.columns if c.startswith("multiqc_")]
+print(adata.obs[qc_cols].to_string())
+
+# ── sRNA-seq 关键检查项 ──
+
+# 1. 平均读长 — sRNA-seq 应在 18-30 nt 范围
+avg_len = adata.obs["multiqc_avg_length"]
+print(f"平均读长范围: {avg_len.min():.1f} - {avg_len.max():.1f} nt")
+if avg_len.min() < 18 or avg_len.max() > 36:
+    print("⚠️  部分样本平均读长超出 sRNA 预期范围 (18-36 nt)")
+
+# 2. 重复率 — sRNA-seq 重复率高是正常的（miRNA 短 + PCR 扩增）
+dup_rate = adata.obs["multiqc_pct_dups"]
+print(f"重复率范围: {dup_rate.min():.1f}% - {dup_rate.max():.1f}%")
+
+# 3. 总 reads 数 — 检测低产量样本
+min_seqs = adata.obs["multiqc_total_seqs"].min()
+print(f"最低 reads 数: {min_seqs:,.0f}")
+if min_seqs < 500_000:
+    print(f"⚠️  样本 {adata.obs['multiqc_total_seqs'].idxmin()} 的 reads 数过低 ({min_seqs:,.0f})")
+
+# 4. FastQC 模块失败情况
+fail_cols = [c for c in qc_cols if "fastqc" in c and c != "multiqc_pct_fails"]
+failing_samples = []
+for col in fail_cols:
+    fails = adata.obs[adata.obs[col] == "fail"].index.tolist()
+    if fails:
+        mod_name = col.replace("multiqc_fastqc_", "")
+        failing_samples.append(f"  {mod_name}: {', '.join(fails)}")
+if failing_samples:
+    print("⚠️  FastQC 模块 FAIL:")
+    for line in failing_samples:
+        print(line)
+else:
+    print("✅  所有样本的 FastQC 模块均通过")
+
+# 5. cutadapt 修剪率
+if "cutadapt_trim_rate" in adata.obs.columns:
+    low_trim = adata.obs[adata.obs["cutadapt_trim_rate"] < 0.1]
+    if len(low_trim) > 0:
+        print(f"⚠️  {len(low_trim)} 个样本修剪率 < 10%，可能 adapter 序列不对")
+        print(low_trim[["cutadapt_trim_rate"]].to_string())
+    else:
+        print(f"✅  修剪率正常 ({adata.obs['cutadapt_trim_rate'].mean():.1%})")
+```
+
+> ⚠️ **Agent 行动要求：以上 QC 检查不是可选的。每次跑完 MultiQC 后，必须执行 QC 检查并向用户汇报结果。如果发现异常（低产量、高失败率、读长异常），必须提醒用户。用户确认后再进行下游分析（比对、定量）。**
 
 ## Critical API Reference
 
@@ -342,6 +430,13 @@ print(f"Final report: {adata.uns['multiqc_html']}")
 #     }
 # adata.obs["cutadapt_log"]      — cutadapt 完整 stdout 日志路径
 #                                  (含质控统计，可用于提取报告信息)
+# adata.obs["cutadapt_in_reads"]      — 输入总 reads 数
+# adata.obs["cutadapt_out_reads"]     — 修剪后保留 reads 数
+# adata.obs["cutadapt_too_short"]     — 因太短丢弃 reads 数
+# adata.obs["cutadapt_too_long"]      — 因太长丢弃 reads 数
+# adata.obs["cutadapt_too_many_n"]    — 因 N 碱基过多丢弃 reads 数
+# adata.obs["cutadapt_w_adapters"]    — 含 adapter 的 reads 数
+# adata.obs["cutadapt_trim_rate"]     — 修剪比例 (in - out) / in
 
 # FastQC 写入 adata.obs 的列
 # adata.obs["fastqc_html"]       — HTML 报告路径

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from . import agent
-from .Tools import alignment, fastq, quant, reference
+from .Tools import alignment, diff, fastq, quant, reference
 from ._registry import (
     export_registry,
     find_function,
@@ -22,6 +22,7 @@ __version__ = "0.1.0"
 __all__ = [
     "agent",
     "alignment",
+    "diff",
     "fastq",
     "quant",
     "reference",

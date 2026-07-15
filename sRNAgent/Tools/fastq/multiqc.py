@@ -37,6 +37,13 @@ _QC_METRICS: list[tuple[str, str, type, str]] = [
     ("percent_fails", "pct_fails", float, "FastQC Module Failures (%)"),
 ]
 
+# Additional metrics from report_saved_raw_data.multiqc_fastqc
+# (not in report_general_stats_data)
+_RAW_QC_METRICS: list[tuple[str, str, str]] = [
+    ("total_deduplicated_percentage", "pct_unique", "Unique Reads (%)"),
+    ("Total Bases", "total_bases", "Total Bases (Mbp)"),
+]
+
 _FASTQC_MODULES: list[str] = [
     "basic_statistics", "per_base_sequence_quality",
     "per_sequence_quality_scores", "per_base_sequence_content",
@@ -153,6 +160,49 @@ def _extract_fastqc_modules(
     return result
 
 
+def _extract_raw_qc(
+    data: dict, mapping: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Extract per-sample QC metrics from report_saved_raw_data.multiqc_fastqc.
+
+    Reads fields defined in ``_RAW_QC_METRICS`` (not available in
+    ``report_general_stats_data``, e.g. ``total_deduplicated_percentage``,
+    ``Total Bases``).
+
+    Returns ``{adata_obs_name: {obs_suffix: value, ...}}``.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    raw = data.get("report_saved_raw_data", {}).get("multiqc_fastqc", {})
+    if not raw:
+        return result
+
+    for mqc_name, sample_raw in raw.items():
+        adata_name = mapping.get(mqc_name)
+        if adata_name is None:
+            continue
+        row: dict[str, Any] = {}
+        for raw_key, obs_suffix, _ in _RAW_QC_METRICS:
+            val = sample_raw.get(raw_key)
+            if val is not None:
+                # Parse "Total Bases" like "94.8 Mbp" → 94.8
+                if isinstance(val, str) and raw_key == "Total Bases":
+                    try:
+                        val = float(val.split()[0])
+                    except (ValueError, IndexError):
+                        val = None
+                else:
+                    try:
+                        val = float(val)
+                    except (ValueError, TypeError):
+                        val = None
+            if val is not None:
+                row[obs_suffix] = val
+        if row:
+            result[adata_name] = row
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -185,6 +235,7 @@ def _extract_fastqc_modules(
         "obs": [
             "multiqc_total_seqs", "multiqc_avg_length", "multiqc_med_length",
             "multiqc_pct_gc", "multiqc_pct_dups", "multiqc_pct_fails",
+            "multiqc_pct_unique", "multiqc_total_bases",
             "multiqc_fastqc_basic_statistics",
             "multiqc_fastqc_per_base_sequence_quality",
             "multiqc_fastqc_per_sequence_quality_scores",
@@ -417,5 +468,16 @@ def multiqc(
                     adata.obs[f"multiqc_{mod_key}"] = pd.Series(
                         series, dtype="object"
                     )
+
+            # Raw QC metrics from report_saved_raw_data
+            raw_qc = _extract_raw_qc(mqc_data, sample_map)
+            if raw_qc:
+                for obs_suffix, _ in _RAW_QC_METRICS:
+                    col = f"multiqc_{obs_suffix}"
+                    series = {}
+                    for on in adata.obs_names:
+                        series[on] = raw_qc.get(on, {}).get(obs_suffix, None)
+                    if any(v is not None for v in series.values()):
+                        adata.obs[col] = pd.Series(series, dtype="float64")
 
     return adata

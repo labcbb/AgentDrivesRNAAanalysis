@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import csv
 import gzip
+import math
 import os
 import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 from anndata import AnnData
 
@@ -326,6 +328,32 @@ def _run_mirdeep2(
 
 
 # ---------------------------------------------------------------------------
+# Helper: CPM normalization
+# ---------------------------------------------------------------------------
+
+def _compute_log_cpm(count_matrix) -> np.ndarray:
+    """Compute log2(CPM + 1) from raw count matrix.
+
+    Parameters
+    ----------
+    count_matrix
+        Raw counts, shape (n_samples, n_features).
+        Can be a list of lists or a numpy array.
+
+    Returns
+    -------
+    np.ndarray
+        log2(CPM + 1) values with the same shape.
+    """
+    arr = np.asarray(count_matrix, dtype=np.float64)
+    lib_sizes = arr.sum(axis=1, keepdims=True)
+    # Avoid division by zero for samples with zero total counts
+    lib_sizes = np.where(lib_sizes == 0, 1.0, lib_sizes)
+    cpm = arr / lib_sizes * 1e6
+    return np.log2(cpm + 1.0)
+
+
+# ---------------------------------------------------------------------------
 # Helper: build sample list from AnnData
 # ---------------------------------------------------------------------------
 
@@ -380,6 +408,7 @@ def _build_sample_list(adata: AnnData) -> List[Tuple[str, str]]:
         "obs": ["collapsed_path", "arf_path", "counts_csv"],
         "var": ["mirna_id"],
         "uns": ["genome_index", "mature_fa", "hairpin_fa", "species"],
+        "layers": ["counts", "logcpm"],
     },
 )
 def quantify_mirna(
@@ -446,7 +475,8 @@ def quantify_mirna(
     -------
     AnnData
         The input ``adata`` with results written to ``.obs``, ``.X``,
-        ``.var``, and ``.uns``.
+        ``.layers["counts"]`` (raw counts backup),
+        ``.layers["logcpm"]`` (log2(CPM+1)), ``.var``, and ``.uns``.
     """
     sample_list = _build_sample_list(adata)
 
@@ -503,14 +533,97 @@ def quantify_mirna(
 
     # Assign count matrix and feature data
     adata.X = count_matrix
+    adata.layers["counts"] = np.asarray(count_matrix, dtype=np.float64)
     adata.var = pd.DataFrame(index=[f"mirna_{i}" for i in range(n_mirnas)])
     adata.var["mirna_id"] = all_mirnas
+
+    # CPM normalization and log2(CPM+1) layer
+    adata.layers["logcpm"] = _compute_log_cpm(adata.X)
 
     # Store reference paths in uns
     adata.uns["genome_index"] = genome_index
     adata.uns["mature_fa"] = mature_fa
     adata.uns["hairpin_fa"] = hairpin_fa
     adata.uns["species"] = species
+
+    return adata
+
+
+@register_function(
+    aliases=[
+        "normalize_cpm", "cpm_normalization", "log2_cpm",
+        "CPM标准化",
+    ],
+    category="quant",
+    description=(
+        "Compute log2(CPM + 1) normalization from raw counts in an AnnData "
+        "object. Reads raw counts from ``adata.X`` (or a specified layer), "
+        "computes counts-per-million (CPM) per sample, transforms to "
+        "log2(CPM + 1), and stores the result in "
+        "``adata.layers['logcpm']``.\n\n"
+        "Can be used after any quantification step (miRDeep2, featureCounts, "
+        "etc.) to obtain normalized expression values suitable for "
+        "downstream analysis."
+    ),
+    examples=[
+        "sa.quant.normalize_cpm(adata)",
+        "sa.quant.normalize_cpm(adata, layer='log2_cpm')",
+        "sa.quant.normalize_cpm(adata, from_layer='raw')",
+    ],
+    related=[
+        "quant.quantify_mirna", "quant.feature_count",
+    ],
+    produces={
+        "layers": ["logcpm"],
+    },
+)
+def normalize_cpm(
+    adata: AnnData,
+    layer: str = "logcpm",
+    from_layer: Optional[str] = None,
+) -> AnnData:
+    """Compute log2(CPM + 1) normalization from raw counts.
+
+    Parameters
+    ----------
+    adata
+        AnnData object with raw counts in ``adata.X`` (or in
+        ``adata.layers[from_layer]``).
+    layer
+        Name of the output layer to store normalized values.
+        Default ``"logcpm"``.
+    from_layer
+        If provided, read raw counts from ``adata.layers[from_layer]``
+        instead of ``adata.X``.
+
+    Returns
+    -------
+    AnnData
+        The input ``adata`` with ``adata.layers[layer]`` set to
+        log2(CPM + 1) normalized values.
+
+    Examples
+    --------
+    >>> import sRNAgent as sa
+
+    >>> # After miRDeep2 or featureCounts quantification
+    >>> sa.quant.normalize_cpm(adata)
+    >>> print(adata.layers["logcpm"].shape)
+
+    >>> # Custom layer name
+    >>> sa.quant.normalize_cpm(adata, layer="log2cpm")
+    """
+    if from_layer is not None:
+        counts = adata.layers[from_layer]
+    else:
+        counts = adata.X
+
+    adata.layers[layer] = _compute_log_cpm(counts)
+    print(
+        f"[normalize_cpm] log2(CPM+1) stored in adata.layers['{layer}']"
+        f"  shape={adata.layers[layer].shape}",
+        flush=True,
+    )
 
     return adata
 
