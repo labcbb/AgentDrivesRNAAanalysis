@@ -4,12 +4,19 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch:
 
+# 核心修正 1：显式赋予 Action 写入（Push）代码的权限
+permissions:
+  contents: write
+
 jobs:
   sync_all:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout current repo
         uses: actions/checkout@v5
+        with:
+          # 核心修正 2：如果用默认 GITHUB_TOKEN，需要确保有写权限
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync nature-figure
         run: |
@@ -23,11 +30,12 @@ jobs:
           rm -rf "$TMP" "$DEST"
           mkdir -p sRNAgent/skills
 
-          # 稀疏克隆只拉需要的文件夹
+          # 核心修正 3：优化稀疏克隆顺序，先初始化再拉取指定目录
           git clone --depth 1 --sparse "$UPSTREAM_URL" "$TMP"
           cd "$TMP"
+          git sparse-checkout init --cone
           git sparse-checkout set "$SRC"
-          git checkout main
+          # depth 1 默认就已经拉取了默认分支（main），无需再次 checkout main，直接 cd 回去即可
           cd ..
 
           # 复制文件夹到你的项目
@@ -41,5 +49,11 @@ jobs:
           git config --global user.name "Sync Bot"
           git config --global user.email "sync-bot@github.com"
           git add sRNAgent/skills/nature-figure
-          git commit -m "Auto sync latest nature-figure" || echo "No changes detected"
-          git push
+          
+          # 检查是否有文件变更，有则提交并推送
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto sync latest nature-figure"
+            git push
+          else
+            echo "No changes detected, skipping push."
+          fi
