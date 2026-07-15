@@ -1,13 +1,10 @@
 - name: Sync nature-figure to sRNAgent/skills/nature-figure
   run: |
     PREFIX="sRNAgent/skills/nature-figure"
-    # Create a branch with only the skills/nature-figure subdirectory
-    git subtree split --prefix=skills/nature-figure --branch nature-figure-only upstream-nature/main || true
-    
     if [ ! -d "$PREFIX" ]; then
       echo "First time import, run subtree add"
-      git subtree add --prefix="$PREFIX" nature-figure-only --squash
+      git subtree add --prefix="$PREFIX" upstream-nature main --squash
     else
       echo "Update existing subtree, run subtree pull"
-      git subtree pull --prefix="$PREFIX" nature-figure-only --squash
+      git subtree pull --prefix="$PREFIX" upstream-nature main --squash
     fi
