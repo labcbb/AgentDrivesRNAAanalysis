@@ -1,0 +1,39 @@
+name: Force Fresh Sync Skills
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync_all:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync nature-figure via giget
+        run: |
+          # 彻底清理旧目录
+          rm -rf sRNAgent/skills/nature-figure
+          mkdir -p sRNAgent/skills/nature-figure
+          
+          # 使用 giget 直接下载远程仓库的指定子文件夹，完全绕开本地 Git 冲突
+          npx giget gh:Yuan1z0825/nature-skills/skills/nature-figure sRNAgent/skills/nature-figure --force
+
+      - name: Commit and push
+        run: |
+          git config --global user.name "Sync Bot"
+          git config --global user.email "sync-bot@github.com"
+          git add sRNAgent/skills/nature-figure
+          
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto sync latest nature-figure"
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "No changes detected, skipping push."
+          fi
