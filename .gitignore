@@ -5,3 +5,4 @@ __pycache__/
 *.nfs000*
 .qwen/
 .agents/
+sRNAgent/skills/nature-figure/
