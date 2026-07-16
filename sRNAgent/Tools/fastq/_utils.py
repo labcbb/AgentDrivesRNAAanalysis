@@ -1,4 +1,4 @@
-"""ENA FASTQ download helpers with tqdm + UI progress markers."""
+"""Fastq subpackage internal utilities (download progress, etc.)."""
 from __future__ import annotations
 
 import csv
