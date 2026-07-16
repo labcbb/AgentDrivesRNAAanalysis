@@ -112,22 +112,35 @@
   function renderProviderList() {
     if (!providerListEl) return;
 
+    const canDelete = config.providers.length > 1;
     const items = config.providers
       .map((account) => {
         const vendor = getVendor(account.vendorId);
         const active = account.id === selectedProviderId;
         const defaultBadge = account.isDefault ? '<span class="config-provider-card__badge">默认</span>' : "";
         const statusClass = account.enabled ? "config-provider-card__dot--ok" : "config-provider-card__dot--off";
+        const title = account.label || vendor?.name || account.vendorId;
+        const meta = `${account.model || vendor?.defaultModel || "—"} · ${maskApiKey(account.apiKey)}`;
         return `
-          <button type="button" class="config-provider-card${active ? " config-provider-card--active" : ""}" data-provider-id="${account.id}">
-            <span class="config-provider-card__icon">${vendor?.icon || "⚙️"}</span>
-            <span class="config-provider-card__body">
-              <span class="config-provider-card__title">${account.label || vendor?.name || account.vendorId}</span>
-              <span class="config-provider-card__meta">${account.model || vendor?.defaultModel || "—"} · ${maskApiKey(account.apiKey)}</span>
-            </span>
+          <div class="config-provider-card${active ? " config-provider-card--active" : ""}" data-provider-id="${account.id}">
+            <button type="button" class="config-provider-card__main" data-select-provider="${account.id}" title="${title}">
+              <span class="config-provider-card__icon">${vendor?.icon || "⚙️"}</span>
+              <span class="config-provider-card__body">
+                <span class="config-provider-card__title">${title}</span>
+                <span class="config-provider-card__meta">${meta}</span>
+              </span>
+            </button>
             ${defaultBadge}
-            <span class="config-provider-card__dot ${statusClass}"></span>
-          </button>
+            <button
+              type="button"
+              class="config-provider-card__delete"
+              data-delete-provider="${account.id}"
+              title="${canDelete ? "删除此 Provider" : "至少保留一个 Provider"}"
+              aria-label="删除 ${title}"
+              ${canDelete ? "" : "disabled"}
+            >删除</button>
+            <span class="config-provider-card__dot ${statusClass}" aria-hidden="true"></span>
+          </div>
         `;
       })
       .join("");
@@ -167,9 +180,14 @@
   function renderEditor() {
     const account = getSelectedProvider();
     const hasSelection = Boolean(account);
+    const deleteBtn = document.getElementById("config-delete-provider");
 
     if (editorEmptyEl) editorEmptyEl.hidden = hasSelection;
     if (editorForm) editorForm.hidden = !hasSelection;
+    if (deleteBtn) {
+      deleteBtn.disabled = config.providers.length <= 1;
+      deleteBtn.title = deleteBtn.disabled ? "至少保留一个 Provider" : "删除当前 Provider";
+    }
     if (!account) return;
 
     const vendor = getVendor(account.vendorId);
@@ -278,21 +296,40 @@
   }
 
   function deleteProvider(id) {
+    const idx = config.providers.findIndex((p) => p.id === id);
+    if (idx < 0) return;
+
     if (config.providers.length <= 1) {
       setStatus("至少保留一个 Provider", "error");
       return;
     }
-    const idx = config.providers.findIndex((p) => p.id === id);
-    if (idx < 0) return;
+
+    const account = config.providers[idx];
+    const vendor = getVendor(account.vendorId);
+    const name = account.label || vendor?.name || account.vendorId || id;
+    const tip = account.isDefault
+      ? `「${name}」是当前默认模型，删除后将自动切换到列表中的下一个。确定删除？`
+      : `确定删除「${name}」？`;
+    if (!window.confirm(`${tip}\n删除后会立即保存到本地。`)) return;
+
     const removed = config.providers.splice(idx, 1)[0];
-    if (removed.isDefault) {
-      config.providers[0].isDefault = true;
-      config.defaultProviderId = config.providers[0].id;
+    if (removed.isDefault && config.providers.length) {
+      const nextDefault = config.providers[Math.min(idx, config.providers.length - 1)];
+      config.providers.forEach((p) => {
+        p.isDefault = p.id === nextDefault.id;
+      });
+      config.defaultProviderId = nextDefault.id;
     }
-    selectedProviderId = config.providers[0]?.id || "";
+
+    if (selectedProviderId === id) {
+      const fallback = config.providers[idx] || config.providers[idx - 1] || config.providers[0];
+      selectedProviderId = fallback?.id || "";
+    }
+
+    saveConfig();
     renderProviderList();
     renderEditor();
-    setStatus("已删除 Provider", "success");
+    setStatus(`已删除 ${name}`, "success");
   }
 
   function setDefaultProvider(id) {
@@ -302,6 +339,33 @@
     config.defaultProviderId = id;
     renderProviderList();
     updateActiveSummary();
+  }
+
+  function listLlmProviders() {
+    return config.providers
+      .filter((p) => p.enabled !== false)
+      .map((account) => {
+        const vendor = getVendor(account.vendorId);
+        const model = account.model || vendor?.defaultModel || "";
+        const name = account.label || vendor?.name || account.vendorId || account.id;
+        return {
+          id: account.id,
+          name,
+          model,
+          label: model ? `${name} · ${model}` : name,
+          isDefault: Boolean(account.isDefault),
+          vendorId: account.vendorId,
+        };
+      });
+  }
+
+  function setDefaultLlmProvider(id) {
+    if (!id || !config.providers.some((p) => p.id === id)) return false;
+    setDefaultProvider(id);
+    selectedProviderId = id;
+    renderEditor();
+    saveConfig();
+    return true;
   }
 
   function handleSave() {
@@ -377,9 +441,18 @@
   renderEditor();
 
   providerListEl?.addEventListener("click", (event) => {
+    const deleteBtn = event.target.closest("[data-delete-provider]");
+    if (deleteBtn) {
+      event.preventDefault();
+      event.stopPropagation();
+      deleteProvider(deleteBtn.dataset.deleteProvider);
+      return;
+    }
+    const selectBtn = event.target.closest("[data-select-provider]");
     const card = event.target.closest("[data-provider-id]");
-    if (!card) return;
-    selectProvider(card.dataset.providerId);
+    const id = selectBtn?.dataset.selectProvider || card?.dataset.providerId;
+    if (!id) return;
+    selectProvider(id);
   });
 
   addProviderBtn?.addEventListener("click", () => {
@@ -430,4 +503,6 @@
 
   window.getLlmConfig = getActiveLlmConfig;
   window.loadLlmConfig = loadConfig;
+  window.listLlmProviders = listLlmProviders;
+  window.setDefaultLlmProvider = setDefaultLlmProvider;
 })();

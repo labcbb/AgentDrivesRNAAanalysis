@@ -2386,7 +2386,7 @@ function showCodeApproval(_group, event, options = {}) {
   const runId = options.runId || getChatStream(activeChatId)?.runId || "";
   let desc = event.description || "即将在当前 conda / Jupyter 环境中执行以下 Python 代码。";
   if (event.supervisor?.reason) {
-    desc = `监管者建议人工确认（${event.supervisor.level || "risk"}）：${event.supervisor.reason}\n\n${desc}`;
+    desc = `需用户确认（${event.supervisor.level || "skill"}）：${event.supervisor.reason}\n\n${desc}`;
   }
 
   let card = codeInner.querySelector(`[data-request-id="${event.requestId}"]`);
@@ -3515,27 +3515,55 @@ async function handleSend() {
   }
 }
 
+function escapeStatusHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildModelSwitchSelect() {
+  const providers = window.listLlmProviders?.() || [];
+  if (!providers.length) return "";
+  const modelCounts = providers.reduce((acc, p) => {
+    const key = p.model || p.name || p.id;
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const options = providers
+    .map((p) => {
+      const selected = p.isDefault ? " selected" : "";
+      const model = p.model || p.name || p.id;
+      const text = modelCounts[model] > 1 ? p.label || model : model;
+      return `<option value="${escapeStatusHtml(p.id)}"${selected}>${escapeStatusHtml(text)}</option>`;
+    })
+    .join("");
+  const disabled = providers.length < 2 ? " disabled" : "";
+  return `<select class="status-pill__model-select" aria-label="切换模型"${disabled}>${options}</select>`;
+}
+
 function updateComposerStatus() {
   const statusPill = document.querySelector(".agent-chat__composer-footer .status-pill");
   const llm = window.getLlmConfig?.();
   const account = llm?.account;
-  const vendor = llm?.vendor;
   if (!statusPill) return;
 
   const port = window.location.port || (window.location.protocol === "https:" ? "443" : "80");
   const host = window.location.hostname || "—";
   const backendOk = window.__proxyServerReady === true;
+  const modelSelect = buildModelSwitchSelect();
 
   if (!account) {
     const statusText = `${backendOk ? "后端已连接" : "后端未连接"} · ${host}:${port}`;
     statusPill.innerHTML = `
       <span class="sidebar-status__dot" style="background:${backendOk ? "var(--ok)" : "var(--accent)"}"></span>
-      <a href="#" class="status-pill__link">${statusText}</a>
+      <a href="#" class="status-pill__link">${escapeStatusHtml(statusText)}</a>
+      ${modelSelect}
     `;
     return;
   }
 
-  const model = account.model || vendor?.defaultModel || "—";
   const hasKey = account.authMode === "local" || Boolean(account.apiKey);
   const skillCount = window.__agentBackendSkills?.length || 0;
   const statusParts = [
@@ -3543,12 +3571,13 @@ function updateComposerStatus() {
     `${host}:${port}`,
     "sRNAgent",
     skillCount ? `${skillCount} skill(s)` : "",
-    model,
-    hasKey ? "" : "未配置 Key",
   ].filter(Boolean);
+  const warn = hasKey ? "" : `<span class="status-pill__warn">未配置 Key</span>`;
   statusPill.innerHTML = `
     <span class="sidebar-status__dot" style="background:${backendOk && hasKey ? "var(--ok)" : "var(--accent)"}"></span>
-    <a href="#" class="status-pill__link">${statusParts.join(" · ")}</a>
+    <a href="#" class="status-pill__link">${escapeStatusHtml(statusParts.join(" · "))}</a>
+    ${modelSelect}
+    ${warn}
   `;
 }
 
@@ -3808,10 +3837,18 @@ composerForm?.addEventListener("submit", (event) => {
 });
 
 document.querySelector(".agent-chat__composer-footer")?.addEventListener("click", (event) => {
+  if (event.target.closest(".status-pill__model-select")) return;
   const link = event.target.closest(".status-pill__link");
   if (!link) return;
   event.preventDefault();
   setPage("config");
+});
+
+document.querySelector(".agent-chat__composer-footer")?.addEventListener("change", (event) => {
+  const select = event.target.closest(".status-pill__model-select");
+  if (!select) return;
+  const ok = window.setDefaultLlmProvider?.(select.value);
+  if (!ok) updateComposerStatus();
 });
 
 sendBtn?.addEventListener("click", (event) => {

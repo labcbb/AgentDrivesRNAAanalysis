@@ -1085,15 +1085,13 @@ a {
 .config-provider-card {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: 1px solid transparent;
   border-radius: var(--radius-md);
   background: transparent;
   color: var(--text);
-  text-align: left;
-  cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
 }
 
@@ -1104,6 +1102,20 @@ a {
 .config-provider-card--active {
   background: color-mix(in srgb, var(--accent-subtle) 80%, var(--card));
   border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+}
+
+.config-provider-card__main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 
 .config-provider-card__icon {
@@ -1140,6 +1152,38 @@ a {
   border-radius: var(--radius-full);
   background: var(--accent-subtle);
   color: var(--accent);
+  flex-shrink: 0;
+}
+
+.config-provider-card__delete {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.2;
+  cursor: pointer;
+  opacity: 0.55;
+  transition: opacity 0.15s, color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.config-provider-card:hover .config-provider-card__delete,
+.config-provider-card--active .config-provider-card__delete {
+  opacity: 1;
+}
+
+.config-provider-card__delete:hover:not(:disabled) {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: color-mix(in srgb, var(--accent-subtle) 70%, transparent);
+}
+
+.config-provider-card__delete:disabled {
+  opacity: 0.25;
+  cursor: not-allowed;
 }
 
 .config-provider-card__dot {
@@ -2570,6 +2614,8 @@ a {
   border-radius: var(--radius-full);
   background: var(--bg-hover);
   border: 1px solid var(--border);
+  max-width: 100%;
+  flex-wrap: wrap;
 }
 
 .status-pill__link {
@@ -2582,6 +2628,41 @@ a {
 .status-pill__link:hover {
   color: var(--accent);
   text-decoration: underline;
+}
+
+.status-pill__model-select {
+  appearance: none;
+  -webkit-appearance: none;
+  max-width: 160px;
+  padding: 2px 18px 2px 6px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background-color: color-mix(in srgb, var(--bg) 55%, transparent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%239aa0a6' d='M2.2 3.6L5 6.4l2.8-2.8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 5px center;
+  background-size: 10px 10px;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.status-pill__model-select:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.status-pill__model-select:disabled {
+  opacity: 0.85;
+  cursor: default;
+  background-image: none;
+  padding-right: 6px;
+}
+
+.status-pill__warn {
+  color: var(--accent);
+  font-size: 11px;
 }
 
 .mock-banner {

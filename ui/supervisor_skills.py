@@ -5,7 +5,7 @@ import logging
 import re
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 UI_ROOT = Path(__file__).resolve().parent
 SRNAGENT_PROJECT = UI_ROOT.parent
@@ -15,7 +15,7 @@ from work_space import get_work_space  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-_CACHE_LOCK = threading.Lock()
+_CACHE_LOCK = threading.RLock()
 _SKILL_FILES: Optional[Dict[str, Path]] = None
 _SKILL_FILES_SNAPSHOT: Tuple[Tuple[str, float], ...] = ()
 _SKILL_BODY_CACHE: Dict[str, Tuple[float, str]] = {}
@@ -220,6 +220,32 @@ def build_skill_gate_prompt(code: str) -> str:
         "novel miRNA 需求、QC 后继续等），必须 action=escalate，reason 说明缺失的确认项。"
     )
     return "\n".join(lines)
+
+
+def assess_skill_confirmation_gates(code: str) -> Optional[Dict[str, str]]:
+    """If code hits skills that require explicit user confirmation, return escalate info.
+
+    This is a fast, deterministic check (no LLM). Returns None when no gated skill matches.
+    """
+    slugs = match_skill_slugs_for_code(code)
+    if not slugs:
+        return None
+
+    gated: List[str] = []
+    for slug in slugs:
+        excerpt = _load_skill_confirmation_excerpt(slug)
+        if excerpt:
+            gated.append(slug)
+    if not gated:
+        return None
+
+    label = "、".join(gated)
+    return {
+        "level": "medium",
+        "action": "escalate",
+        "reason": f"代码触发 Skill 强制确认门槛（{label}），需用户批准后再执行",
+        "source": "skill_gate",
+    }
 
 
 def summarize_chat_for_confirmation(chat_id: str, *, max_messages: int = 14) -> str:
