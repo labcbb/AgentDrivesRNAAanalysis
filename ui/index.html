@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>sRNA Agent</title>
     <!-- 不加载 Google Fonts：国内/部分网络会阻塞导致白屏；styles.css 已含系统字体 fallback -->
-    <link rel="stylesheet" href="./styles.css?v=32" />
+    <link rel="stylesheet" href="./styles.css?v=35" />
   </head>
   <body>
     <div class="shell shell--chat" id="shell">
@@ -104,11 +104,6 @@
                   <div class="sidebar-recent-sessions__head">Recent</div>
                   <div id="chat-recent-list"></div>
                 </div>
-                <div class="sidebar-supervisor">
-                  <button class="sidebar-supervisor__btn" type="button" id="supervisor-open-btn" title="切换到监管者 branch chat">
-                    监管者分支
-                  </button>
-                </div>
               </section>
             </div>
           </div>
@@ -119,7 +114,7 @@
         <!-- Agent 聊天页 -->
         <section class="page-view page-view--active" data-view="agent">
           <div class="agent-workspace">
-            <aside class="code" id="agent-left-panel" hidden aria-label="左侧面板">
+            <aside class="code" id="agent-left-panel" aria-label="左侧面板">
               <div class="left-panel-mode" id="agent-code-panel" data-mode="code">
                 <div class="code__header">
                   <span class="code__header-title">Code</span>
@@ -514,6 +509,6 @@
     <script src="./config.js?v=16"></script>
     <script src="./llm-client.js?v=37"></script>
     <script src="./kernel-panel.js?v=6"></script>
-    <script src="./app.js?v=103"></script>
+    <script src="./app.js?v=105"></script>
   </body>
 </html>
