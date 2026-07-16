@@ -231,6 +231,66 @@ sa.reference.download_mirbase(
     extract_only=False,   # extract from existing files only
 )
 
+## piRBase: list available species
+
+```python
+import sRNAgent as sa
+
+species = sa.reference.list_pirna_species()
+print(f"{len(species)} species available")
+for code, name in sorted(species.items())[:10]:
+    print(f"  {code}: {name}")
+```
+
+## piRBase: download human piRNA FASTA
+
+```python
+import sRNAgent as sa
+
+# Full piRNA set
+result = sa.reference.download_pirna("hsa", output_dir="ref", jobs=4)
+print(f"piRNA FASTA: {result['fasta']}")
+
+# Gold standard set
+result = sa.reference.download_pirna("hsa", output_dir="ref", gold=True)
+print(f"Gold FASTA: {result['gold_fasta']}")
+```
+
+## piRBase: download mouse piRNA FASTA
+
+```python
+import sRNAgent as sa
+
+result = sa.reference.download_pirna("mmu", output_dir="ref", jobs=4)
+```
+
+## tRNA: download tRNAscan-SE results (hg38)
+
+```python
+import sRNAgent as sa
+
+result = sa.reference.download_trnascan_hg38(output_dir="ref")
+print(f"tRNA FASTA: {result['trna_fasta']}")
+print(f"tRNA BED:   {result['trna_bed']}")
+```
+
+## tRNA: build tRAX human GTF
+
+```python
+import sRNAgent as sa
+
+# Download GTF first, then build
+sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
+result = sa.reference.build_trax_human_gtf(output_dir="ref")
+print(f"tRAX GTF: {result['trax_gtf']}")
+
+# Or build from existing GTF
+result = sa.reference.build_trax_human_gtf(
+    output_dir="ref",
+    gtf_path="ref/gencode.v50.primary_assembly.annotation.gtf.gz",
+)
+```
+
 sa.reference.list_species()
     # → ["homo_sapiens", "mus_musculus", ...]
 

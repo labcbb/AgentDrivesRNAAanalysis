@@ -358,7 +358,8 @@ def _run_cutadapt(
         "Trim adapters, primers, poly-A tails, and low-quality bases from "
         "FASTQ reads using cutadapt. "
         "Reads input paths from ``adata.obs[\"fastq_path\"]`` (set by "
-        "``fastq_dl``) and writes trimmed paths to "
+        "``fastq_dl``) and writes cleaned FASTQ paths to "
+        "``adata.obs[\"clean_fastq_path\"]`` and "
         "``adata.obs[\"trimmed_path\"]``. "
         "Supports single-end data, multiple adapters, length filtering, "
         "and JSON report output."
@@ -382,7 +383,8 @@ def _run_cutadapt(
     ],
     produces={
         "obs": [
-            "trimmed_path", "cutadapt_json", "cutadapt_report", "cutadapt_log",
+            "clean_fastq_path", "trimmed_path", "cutadapt_json",
+            "cutadapt_report", "cutadapt_log",
             "cutadapt_in_reads", "cutadapt_out_reads",
             "cutadapt_too_short", "cutadapt_too_long", "cutadapt_too_many_n",
             "cutadapt_w_adapters", "cutadapt_trim_rate",
@@ -439,8 +441,9 @@ def cutadapt(
 
     Operates on an :class:`~anndata.AnnData` object whose ``obs``
     contains a ``fastq_path`` column (set by :func:`fastq_dl`).
-    After trimming, each sample's trimmed FASTQ path is stored back
-    in ``adata.obs[\"trimmed_path\"]``.
+    After trimming, each sample's cleaned FASTQ path is stored back in
+    ``adata.obs["clean_fastq_path"]``. ``adata.obs["trimmed_path"]`` is also
+    populated for backward compatibility.
 
     Parameters
     ----------
@@ -523,8 +526,9 @@ def cutadapt(
     Returns
     -------
     AnnData
-        The input ``adata`` with ``adata.obs[\"trimmed_path\"]`` added
-        (path to the trimmed FASTQ for each sample).
+        The input ``adata`` with ``adata.obs["clean_fastq_path"]`` and
+        ``adata.obs["trimmed_path"]`` added (path to the cleaned FASTQ for
+        each sample).
 
     Examples
     --------
@@ -538,16 +542,16 @@ def cutadapt(
     ...     quality_cutoff="20",
     ...     output_dir="trimmed",
     ... )
-    >>> adata.obs["trimmed_path"]
+    >>> adata.obs["clean_fastq_path"]
     S1    trimmed/S1/S1_trimmed.fastq.gz
-    Name: trimmed_path, dtype: object
+    Name: clean_fastq_path, dtype: object
 
     >>> # Multiple samples with batch processing
     >>> adata = sa.fastq.cutadapt(adata, output_dir="trimmed", jobs=2)
-    >>> adata.obs["trimmed_path"]
+    >>> adata.obs["clean_fastq_path"]
     S1    trimmed/S1/S1_trimmed.fastq.gz
     S2    trimmed/S2/S2_trimmed.fastq.gz
-    Name: trimmed_path, dtype: object
+    Name: clean_fastq_path, dtype: object
     """
     # Validate that fastq_path exists in obs
     if "fastq_path" not in adata.obs:
@@ -628,6 +632,9 @@ def cutadapt(
 
     # Write cutadapt outputs back to adata.obs
     trimmed_map = {r["sample"]: r["fq1"] for r in results}
+    adata.obs["clean_fastq_path"] = pd.Series(
+        trimmed_map, index=adata.obs_names, dtype="object"
+    )
     adata.obs["trimmed_path"] = pd.Series(
         trimmed_map, index=adata.obs_names, dtype="object"
     )

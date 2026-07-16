@@ -314,6 +314,138 @@ result = sa.alignment.bowtie(
 )
 ```
 
+---
+
+## piRBase piRNA 参考数据
+
+piRBase 提供 43 个物种的 piRNA FASTA 序列，适用于 piRNA 定量分析。
+
+### 9. 查看 piRBase 可用的物种
+
+```python
+import sRNAgent as sa
+
+species = sa.reference.list_pirna_species()
+print(f"piRBase species: {len(species)}")
+for code, name in list(species.items())[:10]:
+    print(f"  {code}: {name}")
+```
+
+常用物种：
+
+| 物种 | 代码 | 说明 |
+|------|------|------|
+| Human | ``hsa`` | 人 |
+| Mouse | ``mmu`` | 小鼠 |
+| Rat | ``rno`` | 大鼠 |
+| Zebrafish | ``dre`` | 斑马鱼 |
+| Fruit fly | ``dme`` | 果蝇 |
+| C. elegans | ``cel`` | 线虫 |
+| Cow | ``bta`` | 牛 |
+| Pig | ``ssc`` | 猪 |
+| Chicken | ``gga`` | 鸡 |
+
+### 10. 下载 piRNA FASTA
+
+```python
+# 下载人类 piRNA 完整集
+result = sa.reference.download_pirna("hsa", output_dir="ref", jobs=4)
+print(f"piRNA FASTA: {result['fasta']}")
+# piRNA FASTA: ref/hsa.piRNA.fa.gz
+```
+
+**CORRECT — 下载 gold standard piRNA 集（仅部分物种可用）：**
+
+```python
+# Gold standard 仅适用于: hsa, mmu, dme, bta, rno, mfa
+result = sa.reference.download_pirna("hsa", output_dir="ref", gold=True)
+print(f"Gold piRNA: {result['gold_fasta']}")
+# Gold piRNA: ref/hsa.gold.fa.gz
+```
+
+**WRONG — 无效的物种代码：**
+
+```python
+# WRONG! 3 位小写字母代码
+# sa.reference.download_pirna("human", ...)  # 错误
+
+# CORRECT
+sa.reference.download_pirna("hsa", ...)  # 正确
+```
+
+---
+
+## tRNA 参考数据
+
+tRNA 相关工具提供 tRNAscan-SE 预计算结果和 tRAX 所需的 GTF 注释。
+
+### 11. 下载 tRNAscan-SE 结果（hg38）
+
+从 GtRNAdb 下载人类 (hg38) 的 tRNAscan-SE 预计算结果，包括 tRNA 序列、BED 注释和详细预测报告：
+
+```python
+result = sa.reference.download_trnascan_hg38(output_dir="ref")
+print(f"tRNA FASTA:    {result['trna_fasta']}")
+print(f"tRNA BED:      {result['trna_bed']}")
+print(f"Detailed out:  {result['trna_detailed']}")
+```
+
+返回的文件列表：
+- ``hg38-tRNAs.fa`` — 完整 tRNA 序列
+- ``hg38-filtered-tRNAs.fa`` — 过滤后的 tRNA 序列
+- ``hg38-mature-tRNAs.fa`` — 成熟 tRNA 序列
+- ``hg38-tRNAs.bed`` — tRNA BED 注释
+- ``hg38-tRNAs-confidence-set.out`` — 高置信度 tRNA 预测
+- ``hg38-tRNAs-detailed.out`` — 详细 tRNA 预测报告
+- ``hg38-tRNAs_name_map.txt`` — tRNA 名称映射表
+
+### 12. 构建 tRAX 小 RNA GTF 注释
+
+从 GENCODE/Ensembl GTF 中提取 tRAX 定量所需的小 RNA 特征（miRNA、rRNA、snRNA、snoRNA 等）。需先下载 GTF：
+
+```python
+# 先下载 GTF
+sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
+
+# 构建 tRAX 专用 GTF
+result = sa.reference.build_trax_human_gtf(output_dir="ref")
+print(f"tRAX GTF: {result['trax_gtf']}")
+# tRAX GTF: ref/trax_human.gtf
+```
+
+**CORRECT — 从已有的 GTF 文件直接构建（不依赖 download_gtf）：**
+
+```python
+result = sa.reference.build_trax_human_gtf(
+    output_dir="ref",
+    gtf_path="ref/gencode.v50.primary_assembly.annotation.gtf.gz",
+)
+```
+
+构建的 GTF 包含以下特征类型：``Mt_rRNA``、``miRNA``、``misc_RNA``、``rRNA``、``snRNA``、``snoRNA``、``ribozyme``、``sRNA``、``scaRNA``。
+
+## 返回值格式补充
+
+```python
+# download_pirna
+{"fasta":       "ref/hsa.piRNA.fa.gz",       # 完整 piRNA 集
+ "gold_fasta":  "ref/hsa.gold.fa.gz"}        # gold standard（仅 gold=True 时）
+
+# download_trnascan_hg38
+{"trna_fasta":         "ref/hg38-tRNAs.fa",
+ "trna_filtered":      "ref/hg38-filtered-tRNAs.fa",
+ "trna_mature":        "ref/hg38-mature-tRNAs.fa",
+ "trna_bed":           "ref/hg38-tRNAs.bed",
+ "trna_confidence":    "ref/hg38-tRNAs-confidence-set.out",
+ "trna_confidence_ss": "ref/hg38-tRNAs-confidence-set.ss",
+ "trna_detailed":      "ref/hg38-tRNAs-detailed.out",
+ "trna_detailed_ss":   "ref/hg38-tRNAs-detailed.ss",
+ "trna_name_map":      "ref/hg38-tRNAs_name_map.txt"}
+
+# build_trax_human_gtf
+{"trax_gtf": "ref/trax_human.gtf"}
+```
+
 ## Critical API Reference
 
 ### 完整下载流程（Ensembl）

@@ -8,11 +8,18 @@ Provides wrappers for:
 """
 
 from .feature_count import feature_count
+from .idxstats import idxstats, samtools_idxstats
 from .mirdeep2 import normalize_cpm, predict_mirna, quantify_mirna
+from .tRAX import quantify_trna_fragments, tRAX, trax_quant
 
 __all__ = [
     "quantify_mirna",
     "predict_mirna",
     "feature_count",
+    "idxstats",
+    "samtools_idxstats",
     "normalize_cpm",
+    "trax_quant",
+    "tRAX",
+    "quantify_trna_fragments",
 ]

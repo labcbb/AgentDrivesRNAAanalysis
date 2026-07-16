@@ -12,6 +12,7 @@ from multiprocessing import Pool, cpu_count
 import time
 import string
 import random
+import shlex
 
 MAXMAPS = 100
 
@@ -55,7 +56,8 @@ def wrapbowtie2(bowtiedb, unpaired, outfile, scriptdir, trnafile, maxmaps = MAXM
     temploc = os.path.basename(outfile) + ''.join(random.choice(string.ascii_lowercase) for i in range(8))
     print(temploc, file=sys.stderr)
     #bowtiecommand = bowtiecommand + ' | '+scriptdir+'choosemappings.py '+trnafile+' | samtools sort - '+outfile
-    bowtiecommand = bowtiecommand + ' | '+scriptdir+'choosemappings.py '+trnafile+' --progname='+"TRAX"+ ' --fqname=' +unpaired+' --expname='+expname + ' --minnontrnasize='+str(minnontrnasize)+' | samtools sort -T '+tempfile.gettempdir()+"/"+temploc+'temp - -o '+outfile+'.bam'
+    choosemappings = shlex.quote(sys.executable) + ' ' + shlex.quote(scriptdir+'choosemappings.py')
+    bowtiecommand = bowtiecommand + ' | '+choosemappings+' '+shlex.quote(trnafile)+' --progname='+"TRAX"+ ' --fqname=' +shlex.quote(unpaired)+' --expname='+shlex.quote(expname) + ' --minnontrnasize='+str(minnontrnasize)+' | samtools sort -T '+shlex.quote(tempfile.gettempdir()+"/"+temploc+'temp')+' - -o '+shlex.quote(outfile+'.bam')
     print(bowtiecommand, file=sys.stderr)
     if logfile:
         print(bowtiecommand, file=logfile)
@@ -362,5 +364,4 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     main(samplefile = args.samplefile, trnafile= args.trnafile, logfile = args.logfile, bowtiedb = args.bowtiedb, lazy = args.lazy, mapfile = args.mapfile)
-
 
