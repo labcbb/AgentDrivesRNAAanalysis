@@ -20,11 +20,23 @@ from sRNAgent.agent.bootstrap import initialize_registries  # noqa: E402
 from sRNAgent.agent.llm_client import LLMConfig  # noqa: E402
 from sRNAgent.agent.srn_agent import AgentCancelledError, SRNAgent  # noqa: E402
 
-from chat_kernel_manager import get_chat_execution, interrupt_chat_kernel, kernel_is_busy, release_chat_kernel  # noqa: E402
+from chat_kernel_manager import (  # noqa: E402
+    delete_chat_session,
+    get_chat_execution,
+    interrupt_chat_kernel,
+    kernel_is_busy,
+    release_chat_kernel,
+)
 from session_store import (  # noqa: E402
+    SessionSaveConflict,
+    acquire_operator_lease,
+    clear_operator_lease,
+    get_operator_lease,
     load_chat_record,
     load_chat_store,
     load_kernel_state,
+    purge_orphan_sessions,
+    renew_operator_lease,
     save_chat_record,
     save_kernel_state,
     session_artifacts,
@@ -46,6 +58,15 @@ from session_live import (  # noqa: E402
     iter_live_events,
     publish_live_event,
     start_live_bus,
+)
+from run_ledger import append_ledger_event, clear_run_ledger  # noqa: E402
+from supervisor_agent import (  # noqa: E402
+    assess_code_risk,
+    clear_run_report,
+    generate_run_report,
+    load_run_report,
+    render_report_markdown,
+    stream_supervisor_chat,
 )
 from work_space import get_work_space, list_work_space_files  # noqa: E402
 
@@ -128,7 +149,23 @@ def _chat_has_active_run(chat_id: str) -> bool:
 
 
 def kernel_environment(chat_id: str) -> Dict[str, Any]:
-    execution = get_chat_execution(SRNAGENT_PROJECT, chat_id)
+    # Do not create empty session shells just because KernelPanel is polling.
+    execution = get_chat_execution(SRNAGENT_PROJECT, chat_id, create=False)
+    if execution is None:
+        cached_vars = _cached_kernel_variables(chat_id)
+        if cached_vars:
+            return {
+                "ok": True,
+                "ready": True,
+                "variables": cached_vars,
+                "message": "显示缓存的环境快照（内核尚未在本会话中启动）",
+            }
+        return {
+            "ok": True,
+            "ready": False,
+            "variables": [],
+            "message": "内核尚未启动，执行一次代码后将显示变量",
+        }
     if not execution.use_notebook or execution.notebook_executor is None:
         return {
             "ok": True,
@@ -231,8 +268,30 @@ def _build_kernel_snapshot(execution: Any, executor: Any, variables: List[Dict[s
 
 
 def list_sessions() -> Dict[str, Any]:
+    purged = purge_orphan_sessions()
     store = load_chat_store()
-    return {"ok": True, **store}
+    return {"ok": True, "purgedOrphans": purged, **store}
+
+
+def delete_session_api(body: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        chat_id = _resolve_chat_id(body)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    try:
+        deleted = delete_chat_session(chat_id)
+        # Also sweep other empty shells left by abandoned New Chats.
+        purged = purge_orphan_sessions()
+        return {
+            "ok": True,
+            "deleted": deleted or True,
+            "chatId": chat_id,
+            "purgedOrphans": purged,
+        }
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
 
 
 def get_session(chat_id: str) -> Dict[str, Any]:
@@ -262,9 +321,41 @@ def save_session(body: Dict[str, Any]) -> Dict[str, Any]:
     chat = body.get("chat") or {}
     if not isinstance(chat, dict):
         return {"ok": False, "error": "chat 必须是对象"}
+    # Per-device operators: do NOT rewrite shared index.activeChatId by default.
+    update_global_active = bool(body.get("updateGlobalActive", False))
     active_chat_id = str(body.get("activeChatId") or chat_id).strip() or chat_id
-    saved = save_chat_record(chat_id, chat, active_chat_id=active_chat_id)
-    return {"ok": True, "chat": saved, "sessionsRoot": str(get_work_space() / "sessions")}
+    device_id = str(body.get("deviceId") or "").strip() or None
+    force = bool(body.get("force", False))
+    expected_raw = body.get("expectedUpdatedAt", body.get("expected_updated_at"))
+    expected_updated_at = None
+    if expected_raw is not None and str(expected_raw).strip() != "":
+        try:
+            expected_updated_at = int(expected_raw)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "expectedUpdatedAt 无效"}
+    try:
+        saved = save_chat_record(
+            chat_id,
+            chat,
+            active_chat_id=active_chat_id if update_global_active else None,
+            expected_updated_at=expected_updated_at,
+            device_id=device_id,
+            force=force,
+        )
+        return {
+            "ok": True,
+            "chat": saved,
+            "lease": get_operator_lease(chat_id),
+            "sessionsRoot": str(get_work_space() / "sessions"),
+        }
+    except SessionSaveConflict as exc:
+        return {
+            "ok": False,
+            "conflict": True,
+            "error": str(exc) or "会话已被其他设备更新",
+            "chat": exc.chat,
+            "lease": exc.lease or get_operator_lease(chat_id),
+        }
 
 
 def work_space_files(relative_path: str = "", pattern: str = "*", recursive: bool = False) -> Dict[str, Any]:
@@ -278,7 +369,9 @@ def work_space_files(relative_path: str = "", pattern: str = "*", recursive: boo
 
 
 def kernel_figures(chat_id: str) -> Dict[str, Any]:
-    execution = get_chat_execution(SRNAGENT_PROJECT, chat_id)
+    execution = get_chat_execution(SRNAGENT_PROJECT, chat_id, create=False)
+    if execution is None:
+        return {"ok": True, "ready": False, "figures": [], "message": "内核尚未启动"}
     if not execution.use_notebook or execution.notebook_executor is None:
         return {"ok": True, "ready": False, "figures": [], "message": "Notebook 内核未启用"}
     executor = execution.notebook_executor
@@ -495,9 +588,12 @@ def _chat_code_panel_running(chat_id: str) -> bool:
     code_panel = chat.get("codePanel")
     if not isinstance(code_panel, list):
         return False
+    # UI synthetic "Agent 运行中" card must not count as a real stuck execution.
+    background_id = "background-kernel-run"
     return any(
         isinstance(item, dict)
         and item.get("type") == "execution"
+        and str(item.get("id") or "") != background_id
         and not item.get("done")
         and not item.get("stopped")
         for item in code_panel
@@ -612,6 +708,43 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def get_run_report(chat_id: str) -> Dict[str, Any]:
+    try:
+        chat_id = _resolve_chat_id({"chatId": chat_id})
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    report = load_run_report(chat_id)
+    if not report:
+        return {"ok": False, "error": "尚无运行报告"}
+    tasks = report.get("tasks") if isinstance(report.get("tasks"), list) else []
+    return {
+        "ok": True,
+        "report": report,
+        "markdown": render_report_markdown(report),
+        "taskCount": len(tasks),
+    }
+
+
+def clear_run_report_api(body: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        chat_id = _resolve_chat_id(body)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    result = clear_run_report(chat_id)
+    result["ok"] = True
+    return result
+
+
+def _normalize_approval_mode(body: Dict[str, Any]) -> str:
+    raw = str(body.get("approvalMode") or "").strip().lower()
+    if raw in {"manual", "smart", "auto"}:
+        return raw
+    # Backward compatible with legacy autoApproveCode boolean.
+    if body.get("autoApproveCode") is True:
+        return "auto"
+    return "manual"
+
+
 def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     messages: List[Dict[str, str]] = body.get("messages") or []
     if not messages:
@@ -620,15 +753,54 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
     run_id = str(body.get("runId") or uuid.uuid4())
     chat_id = _resolve_chat_id(body)
+    device_id = str(body.get("deviceId") or "").strip()
+    approval_mode = _normalize_approval_mode(body)
+
+    # Exclusive operator lease: another device mid-run cannot steal this chat.
+    existing_lease = get_operator_lease(chat_id)
+    if (
+        existing_lease
+        and device_id
+        and existing_lease.get("deviceId") != device_id
+        and (_chat_has_active_run(chat_id) or kernel_is_busy(SRNAGENT_PROJECT, chat_id))
+    ):
+        yield {
+            "type": "error",
+            "message": "该会话正由其他设备操作中。请新建对话作为本机操作者，或等待对方结束后再进入。",
+            "conflict": True,
+            "lease": existing_lease,
+        }
+        return
+
+    if device_id:
+        try:
+            acquire_operator_lease(chat_id, device_id, run_id=run_id)
+        except SessionSaveConflict as exc:
+            yield {
+                "type": "error",
+                "message": str(exc) or "无法获取会话操作权",
+                "conflict": True,
+                "lease": exc.lease,
+            }
+            return
+
     # Stop any in-flight agent loop for this chat; interrupt kernel only if it is busy.
     cancel_run("", chat_id)
-    auto_approve_code = bool(body.get("autoApproveCode"))
     cancel_event = register_run(run_id, chat_id)
     event_queue: queue.Queue = queue.Queue()
     start_live_bus(chat_id, run_id)
+    try:
+        clear_run_ledger(chat_id, run_id=run_id)
+    except Exception:
+        pass
 
     def _publish(event: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(event or {})
+        if device_id and payload.get("type") in {"heartbeat", "status", "run_start"}:
+            try:
+                renew_operator_lease(chat_id, device_id, run_id=run_id)
+            except Exception:
+                pass
         try:
             publish_live_event(chat_id, payload)
         except Exception:
@@ -641,19 +813,67 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             update_run_context(chat_id, event)
             record_stream_event(chat_id, event)
             record_stream_event_error(chat_id, event)
+            append_ledger_event(chat_id, event, run_id=run_id)
         except Exception:
             pass
         _publish(event)
 
     def request_code_approval(request_id: str, code: str, description: str) -> bool:
-        if auto_approve_code:
+        if approval_mode == "auto":
+            on_progress(
+                {
+                    "type": "supervisor_approval",
+                    "requestId": request_id,
+                    "action": "allow",
+                    "level": "low",
+                    "reason": "全部自动批准",
+                    "mode": "auto",
+                }
+            )
             return True
+
+        decision: Optional[Dict[str, Any]] = None
+        if approval_mode == "smart":
+            on_progress(
+                {
+                    "type": "status",
+                    "message": "监管者正在评估代码风险…",
+                }
+            )
+            decision = assess_code_risk(
+                code,
+                description=description,
+                llm_body=body,
+                chat_id=chat_id,
+            )
+            on_progress(
+                {
+                    "type": "supervisor_approval",
+                    "requestId": request_id,
+                    "action": decision.get("action"),
+                    "level": decision.get("level"),
+                    "reason": decision.get("reason"),
+                    "mode": "smart",
+                    "source": decision.get("source"),
+                    "code": code[:400],
+                    "description": description,
+                }
+            )
+            action = str(decision.get("action") or "escalate")
+            if action == "allow":
+                return True
+            if action == "deny":
+                return False
+            # escalate → fall through to manual gate
+
         on_progress(
             {
                 "type": "code_approval_required",
                 "requestId": request_id,
                 "code": code,
                 "description": description,
+                "supervisor": decision,
+                "approvalMode": approval_mode,
             }
         )
 
@@ -675,6 +895,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         return result
 
     def worker() -> None:
+        final_text = ""
         try:
             on_progress({"type": "status", "message": "正在初始化 Agent 和 Jupyter 内核…"})
             try:
@@ -704,6 +925,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                     cancel_event=cancel_event,
                     code_approval_callback=request_code_approval,
                 )
+            final_text = text
             on_progress(
                 {
                     "type": "done",
@@ -728,13 +950,37 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             )
             on_progress({"type": "error", "message": str(exc)})
         finally:
+            try:
+                report = generate_run_report(
+                    chat_id,
+                    llm_body=body,
+                    final_text=final_text,
+                    run_id=run_id,
+                )
+                tasks = report.get("tasks") if isinstance(report.get("tasks"), list) else []
+                latest = tasks[-1] if tasks else {}
+                on_progress(
+                    {
+                        "type": "run_report_ready",
+                        "message": "运行报告已追加",
+                        "reportSummary": latest.get("summary")
+                        or latest.get("taskLabel")
+                        or "可在左侧 Report 页查看",
+                        "taskLabel": latest.get("taskLabel") or "",
+                        "taskId": latest.get("taskId") or run_id,
+                        "taskCount": len(tasks),
+                        "chatId": chat_id,
+                    }
+                )
+            except Exception:
+                pass
             event_queue.put(_STREAM_SENTINEL)
             cleanup_run(run_id)
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
 
-    yield _publish({"type": "run_start", "runId": run_id, "chatId": chat_id})
+    yield _publish({"type": "run_start", "runId": run_id, "chatId": chat_id, "approvalMode": approval_mode})
     try:
         update_run_context(chat_id, {"type": "run_start", "runId": run_id})
     except Exception:
@@ -769,6 +1015,11 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             # 多数事件在 on_progress 时已 publish；队列取出的终态事件也已 publish
             yield item
     finally:
+        if device_id:
+            try:
+                clear_operator_lease(chat_id, device_id)
+            except Exception:
+                pass
         try:
             close_live_bus(chat_id, run_id=run_id)
         except Exception:

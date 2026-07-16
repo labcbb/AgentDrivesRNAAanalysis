@@ -7,6 +7,11 @@ Provides functions to download reference genomes and annotation from
 
 from .genome import download_genome, download_gtf, download_ncrna, list_species
 from .mirbase import download_mirbase, list_mirbase_codes
+from .tRNAdb import (
+    build_trax_human_gtf,
+    download_trax_human_gtf,
+    download_trnascan_hg38,
+)
 
 __all__ = [
     "list_species",
@@ -15,4 +20,7 @@ __all__ = [
     "download_ncrna",
     "list_mirbase_codes",
     "download_mirbase",
+    "download_trax_human_gtf",
+    "build_trax_human_gtf",
+    "download_trnascan_hg38",
 ]

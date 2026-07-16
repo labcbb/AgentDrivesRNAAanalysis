@@ -53,13 +53,24 @@ def _create_chat_execution(project_root: Path, chat_id: str) -> ExecutionBackend
     return execution
 
 
-def get_chat_execution(project_root: Path, chat_id: str) -> ExecutionBackend:
+def get_chat_execution(
+    project_root: Path,
+    chat_id: str,
+    *,
+    create: bool = True,
+) -> Optional[ExecutionBackend]:
+    """Return per-chat execution backend.
+
+    create=False avoids mkdir/kernel start — used by KernelPanel polling so
+    brand-new chats do not leave empty session shells on disk.
+    """
     chat_id = sanitize_chat_id(chat_id)
     with _CHAT_LOCK:
         execution = _CHAT_EXECUTIONS.get(chat_id)
         if execution is not None:
             return execution
-
+        if not create:
+            return None
         execution = _create_chat_execution(project_root, chat_id)
         _CHAT_EXECUTIONS[chat_id] = execution
         return execution
@@ -126,33 +137,46 @@ def interrupt_chat_kernel(project_root: Path, chat_id: str, *, force: bool = Fal
     return interrupted
 
 
-def release_chat_kernel(chat_id: str) -> bool:
+def release_chat_kernel(chat_id: str, *, remove_session: bool = False) -> bool:
+    """Shutdown in-memory / orphan Jupyter kernel for a chat.
+
+    By default only releases the kernel. Pass remove_session=True (or call
+    delete_chat_session) to also wipe work_space/sessions/{chatId}/.
+    """
     chat_id = sanitize_chat_id(chat_id)
     with _CHAT_LOCK:
         execution = _CHAT_EXECUTIONS.pop(chat_id, None)
 
+    released = False
     if execution is not None:
         executor = execution.notebook_executor
         if executor is not None:
             executor.shutdown(remove_persisted=False)
+            released = True
 
     session_path = _chat_session_dir(chat_id)
-    if not session_path.exists():
-        return False
+    if session_path.exists():
+        connection_file = session_path / "kernel.json"
+        if connection_file.exists():
+            try:
+                from jupyter_client import KernelManager
 
-    connection_file = session_path / "kernel.json"
-    if connection_file.exists():
-        try:
-            from jupyter_client import KernelManager
+                km = KernelManager()
+                km.load_connection_file(str(connection_file))
+                if km.is_alive():
+                    km.shutdown_kernel(now=False, restart=False)
+                    released = True
+            except Exception as exc:
+                logger.debug("Failed to shutdown orphan kernel: %s", exc)
 
-            km = KernelManager()
-            km.load_connection_file(str(connection_file))
-            if km.is_alive():
-                km.shutdown_kernel(now=False, restart=False)
-        except Exception as exc:
-            logger.debug("Failed to shutdown orphan kernel: %s", exc)
+    if remove_session:
+        deleted = delete_session(chat_id)
+        if deleted:
+            logger.info("Removed session directory for chat %s", chat_id)
+            return True
+    return released
 
-    deleted = delete_session(chat_id)
-    if deleted:
-        logger.info("Removed session directory for chat %s", chat_id)
-    return deleted
+
+def delete_chat_session(chat_id: str) -> bool:
+    """Fully delete a chat session directory and release its kernel."""
+    return release_chat_kernel(chat_id, remove_session=True)

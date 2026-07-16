@@ -143,7 +143,9 @@
     executionContext,
     runId,
     chatId,
+    deviceId,
     autoApproveCode,
+    approvalMode,
     signal,
     onEvent,
   }) {
@@ -152,6 +154,9 @@
         "当前是 file:// 打开，无法调用 API。请运行：\n\ncd ui && python3 serve.py\n\n然后打开 http://<服务器IP>:8765/index.html",
       );
     }
+
+    const mode = String(approvalMode || "").trim().toLowerCase()
+      || (autoApproveCode ? "auto" : "manual");
 
     let response;
     try {
@@ -166,7 +171,9 @@
           executionContext: String(executionContext || "").trim(),
           runId,
           chatId,
-          autoApproveCode: Boolean(autoApproveCode),
+          deviceId: deviceId || undefined,
+          approvalMode: mode,
+          autoApproveCode: mode === "auto",
         }),
         signal,
       });
@@ -301,6 +308,119 @@
     }
   }
 
+  async function deleteChatSession(chatId) {
+    if (!chatId) return { ok: true, deleted: false };
+    try {
+      return await postJson("/api/sessions/delete", { chatId });
+    } catch (error) {
+      return {
+        ok: false,
+        deleted: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async function fetchRunReport(chatId) {
+    if (!chatId) return { ok: false, error: "chatId 不能为空" };
+    const qs = `?chatId=${encodeURIComponent(chatId)}`;
+    const response = await fetch(`${PROXY_BASE}/api/supervisor/report${qs}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      return { ok: false, error: data.error || `report HTTP ${response.status}` };
+    }
+    return data;
+  }
+
+  async function clearRunReport(chatId) {
+    if (!chatId) return { ok: false, error: "chatId 不能为空" };
+    const response = await fetch(`${PROXY_BASE}/api/supervisor/report/clear`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chatId }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      return { ok: false, error: data.error || `clear report HTTP ${response.status}` };
+    }
+    return data;
+  }
+
+  async function supervisorChatStream({
+    account,
+    vendor,
+    agent,
+    chatId,
+    parentChatId,
+    messages,
+    question,
+    signal,
+    onEvent,
+  }) {
+    const targetChatId = chatId || parentChatId;
+    if (!targetChatId) throw new Error("chatId 不能为空");
+    if (window.location.protocol === "file:") {
+      throw new Error("file:// 无法调用监管者 API，请通过 serve.py 打开页面");
+    }
+    let response;
+    try {
+      response = await fetch(`${PROXY_BASE}/api/supervisor/chat/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          account,
+          vendor,
+          agent,
+          chatId: targetChatId,
+          parentChatId: parentChatId || targetChatId,
+          messages: Array.isArray(messages) ? messages : undefined,
+          question,
+        }),
+        signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") throw error;
+      throw new Error(
+        `无法连接监管者通道 ${PROXY_BASE}。（${error instanceof Error ? error.message : String(error)}）`,
+      );
+    }
+    if (!response.ok || !response.body) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || data.message || `监管者请求失败 (HTTP ${response.status})`);
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let finalResult = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const parsed = parseSseChunk(buffer);
+      buffer = parsed.rest;
+      for (const event of parsed.events) {
+        onEvent?.(event);
+        if (event.type === "final" && event.content) {
+          finalResult = { text: event.content, meta: {} };
+        }
+        if (event.type === "done") {
+          finalResult = {
+            text: event.text || finalResult?.text || "",
+            meta: event.meta || finalResult?.meta || {},
+          };
+        }
+        if (event.type === "error") {
+          throw new Error(event.message || "监管者执行失败");
+        }
+        if (event.type === "stream_end") {
+          return finalResult || { text: "", meta: {} };
+        }
+      }
+    }
+    return finalResult || { text: "", meta: {} };
+  }
+
   async function fetchChatSessions() {
     const response = await fetch(`${PROXY_BASE}/api/sessions`);
     const data = await response.json().catch(() => ({}));
@@ -310,12 +430,53 @@
     return data;
   }
 
-  async function saveChatSession({ chatId, chat, activeChatId }) {
-    return postJson("/api/sessions/save", {
-      chatId,
-      chat,
-      activeChatId: activeChatId || chatId,
-    });
+  async function saveChatSession({
+    chatId,
+    chat,
+    activeChatId,
+    deviceId,
+    expectedUpdatedAt,
+    updateGlobalActive = false,
+    force = false,
+  }) {
+    // Dedicated fetch: 409 conflict must not throw like generic postJson failures.
+    let response;
+    try {
+      response = await fetch(`${PROXY_BASE}/api/sessions/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chatId,
+          chat,
+          activeChatId: activeChatId || chatId,
+          deviceId: deviceId || undefined,
+          expectedUpdatedAt:
+            expectedUpdatedAt == null || expectedUpdatedAt === ""
+              ? undefined
+              : Number(expectedUpdatedAt),
+          updateGlobalActive: Boolean(updateGlobalActive),
+          force: Boolean(force),
+        }),
+      });
+    } catch (error) {
+      throw new Error(
+        `无法连接 UI 服务 ${PROXY_BASE}。（${error instanceof Error ? error.message : String(error)}）`,
+      );
+    }
+    const data = await response.json().catch(() => ({}));
+    if (data?.conflict || response.status === 409) {
+      return {
+        ok: false,
+        conflict: true,
+        error: data.error || "会话已被其他设备更新",
+        chat: data.chat || null,
+        lease: data.lease || null,
+      };
+    }
+    if (!response.ok || data.ok === false) {
+      throw new Error(data.error || data.message || `session save HTTP ${response.status}`);
+    }
+    return data;
   }
 
   /** 旁观端实时同步：加入已有 Agent 运行的事件广播（断开不会 cancel 任务） */
@@ -374,6 +535,10 @@
   window.fetchKernelEnvironment = fetchKernelEnvironment;
   window.fetchKernelFigures = fetchKernelFigures;
   window.releaseChatKernel = releaseChatKernel;
+  window.deleteChatSession = deleteChatSession;
+  window.fetchRunReport = fetchRunReport;
+  window.clearRunReport = clearRunReport;
+  window.supervisorChatStream = supervisorChatStream;
   window.fetchChatSessions = fetchChatSessions;
   window.saveChatSession = saveChatSession;
   window.llmIsLocalServer = isPageOnProxyServer;

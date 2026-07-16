@@ -8,9 +8,22 @@ const composer = document.getElementById("composer");
 const sendBtn = document.getElementById("send-btn");
 const chatScroll = document.getElementById("chat-scroll");
 const threadInner = document.getElementById("chat-thread-inner");
+const agentLeftPanel = document.getElementById("agent-left-panel");
 const agentCodePanel = document.getElementById("agent-code-panel");
 const agentCodeInner = document.getElementById("agent-code-inner");
 const autoApproveToggle = document.getElementById("auto-approve-toggle");
+const supervisorOpenBtn = document.getElementById("supervisor-open-btn");
+const branchChatPanel = document.getElementById("branch-chat-panel");
+const supervisorThread = document.getElementById("supervisor-thread");
+const supervisorForm = document.getElementById("supervisor-form");
+const supervisorInput = document.getElementById("supervisor-input");
+const supervisorSendBtn = document.getElementById("supervisor-send-btn");
+const leftPanelModeSelect = document.getElementById("left-panel-mode");
+const reportPageBody = document.getElementById("report-page-body");
+const reportPageMeta = document.getElementById("report-page-meta");
+const reportPageSubtitle = document.getElementById("report-page-subtitle");
+const reportRefreshBtn = document.getElementById("report-refresh-btn");
+const reportClearBtn = document.getElementById("report-clear-btn");
 const breadcrumbCurrent = document.getElementById("breadcrumb-current");
 const agentSessions = document.getElementById("agent-sessions");
 const newChatBtn = document.getElementById("new-chat-btn");
@@ -34,6 +47,35 @@ function createId() {
     const v = c === "x" ? r : (r & 0x3) | 0x8;
     return v.toString(16);
   });
+}
+
+function getOrCreateDeviceId() {
+  try {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (id && id.length >= 8) return id;
+    id = createId();
+    localStorage.setItem(DEVICE_ID_KEY, id);
+    return id;
+  } catch {
+    return createId();
+  }
+}
+
+function getDeviceActiveChatId() {
+  try {
+    return localStorage.getItem(DEVICE_ACTIVE_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+function setDeviceActiveChatId(chatId) {
+  try {
+    if (chatId) localStorage.setItem(DEVICE_ACTIVE_KEY, chatId);
+    else localStorage.removeItem(DEVICE_ACTIVE_KEY);
+  } catch {
+    // ignore quota / private mode
+  }
 }
 
 let isComposing = false;
@@ -172,15 +214,29 @@ let activeChatId = null;
 let currentAnalysisCategory = "";
 
 const CHAT_STORE_KEY = "srnagent-chat-sessions";
+const DEVICE_ID_KEY = "srnagent-device-id";
+const DEVICE_ACTIVE_KEY = "srnagent-device-active-chat";
 const AUTO_APPROVE_KEY = "srnagent-auto-approve-code";
+const APPROVAL_MODE_KEY = "srnagent-approval-mode";
 const MAX_STORED_CHATS = 40;
 
-/** "server" = read/write sessions only via serve.py; "local" = offline localStorage fallback */
+/** "server" = catalog + per-chat RW via serve.py; "local" = offline localStorage fallback */
 let chatPersistenceMode = "pending";
+/** Only flush chats this device actually touched (never blanket rewrite all). */
+const pendingServerSaveIds = new Set();
 
 let chatStore = { activeChatId: null, chats: [] };
-let autoApproveCode = loadAutoApproveSetting();
+let approvalMode = loadApprovalModeSetting();
+let autoApproveCode = approvalMode === "auto";
 let serverSessionSaveTimer = null;
+/** @type {Array<{role:string, content:string}>} */
+let supervisorHistory = [];
+let supervisorBusy = false;
+/** @type {AbortController|null} */
+let supervisorAbortController = null;
+let supervisorImeEnterStroke = false;
+/** "code" | "branch" — left panel beside the chat. */
+let leftPanelMode = "code";
 
 const categoryLabels = {
   normalization: "Normalization",
@@ -283,17 +339,24 @@ function welcomeCardHtml() {
   `;
 }
 
-function loadAutoApproveSetting() {
+function loadApprovalModeSetting() {
   try {
-    return localStorage.getItem(AUTO_APPROVE_KEY) === "true";
+    const mode = String(localStorage.getItem(APPROVAL_MODE_KEY) || "").trim().toLowerCase();
+    if (mode === "manual" || mode === "smart" || mode === "auto") return mode;
+    // Migrate legacy boolean toggle.
+    if (localStorage.getItem(AUTO_APPROVE_KEY) === "true") return "auto";
   } catch (_error) {
-    return false;
+    // ignore
   }
+  return "manual";
 }
 
-function setAutoApproveCode(enabled) {
-  autoApproveCode = Boolean(enabled);
+function setApprovalMode(mode) {
+  const next = mode === "smart" || mode === "auto" ? mode : "manual";
+  approvalMode = next;
+  autoApproveCode = next === "auto";
   try {
+    localStorage.setItem(APPROVAL_MODE_KEY, approvalMode);
     localStorage.setItem(AUTO_APPROVE_KEY, autoApproveCode ? "true" : "false");
   } catch (_error) {
     // ignore storage failures
@@ -304,11 +367,34 @@ function setAutoApproveCode(enabled) {
   }
 }
 
+function setAutoApproveCode(enabled) {
+  setApprovalMode(enabled ? "auto" : "manual");
+}
+
+function cycleApprovalMode() {
+  if (approvalMode === "manual") setApprovalMode("smart");
+  else if (approvalMode === "smart") setApprovalMode("auto");
+  else setApprovalMode("manual");
+}
+
 function updateAutoApproveUi() {
   if (!autoApproveToggle) return;
-  autoApproveToggle.setAttribute("aria-pressed", autoApproveCode ? "true" : "false");
-  autoApproveToggle.textContent = autoApproveCode ? "自动批准：开" : "自动批准：关";
-  autoApproveToggle.classList.toggle("code__auto-approve-btn--active", autoApproveCode);
+  const labels = {
+    manual: "审批：手动",
+    smart: "审批：智能",
+    auto: "审批：全自动",
+  };
+  autoApproveToggle.setAttribute("aria-pressed", approvalMode !== "manual" ? "true" : "false");
+  autoApproveToggle.textContent = labels[approvalMode] || labels.manual;
+  autoApproveToggle.classList.toggle("code__auto-approve-btn--active", approvalMode === "auto");
+  autoApproveToggle.classList.toggle("code__auto-approve-btn--smart", approvalMode === "smart");
+  autoApproveToggle.title =
+    "点击切换：手动批准 / 智能审批（监管者）/ 全部自动\n当前："
+    + (approvalMode === "smart"
+      ? "监管者评估，高风险仍需人工"
+      : approvalMode === "auto"
+        ? "全部自动放行"
+        : "每次代码执行都需人工批准");
 }
 
 function normalizeMessage(item) {
@@ -340,7 +426,7 @@ function normalizeMessage(item) {
 }
 
 function normalizeChat(chat) {
-  return {
+  const normalized = {
     id: chat.id,
     title: chat.title || "New Chat",
     messages: Array.isArray(chat.messages) ? chat.messages.map(normalizeMessage) : [],
@@ -348,6 +434,19 @@ function normalizeChat(chat) {
     createdAt: chat.createdAt || Date.now(),
     updatedAt: chat.updatedAt || Date.now(),
   };
+  if (chat.revision != null) normalized.revision = Number(chat.revision) || 0;
+  if (chat.lastWriterDeviceId) normalized.lastWriterDeviceId = String(chat.lastWriterDeviceId);
+  if (chat.operatorLease && typeof chat.operatorLease === "object") {
+    normalized.operatorLease = {
+      deviceId: String(chat.operatorLease.deviceId || ""),
+      runId: String(chat.operatorLease.runId || ""),
+      expiresAt: Number(chat.operatorLease.expiresAt || 0) || 0,
+    };
+  }
+  if (chat._baseUpdatedAt != null) {
+    normalized._baseUpdatedAt = Number(chat._baseUpdatedAt) || undefined;
+  }
+  return normalized;
 }
 
 function loadChatStoreFromLocal() {
@@ -369,16 +468,22 @@ function loadChatStoreFromLocal() {
 }
 
 function saveChatStore() {
+  if (activeChatId) {
+    chatStore.activeChatId = activeChatId;
+    setDeviceActiveChatId(activeChatId);
+  }
   if (chatPersistenceMode === "local") {
     localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(chatStore));
   }
-  if (chatPersistenceMode === "server") {
-    scheduleServerSessionSave();
+  if (chatPersistenceMode === "server" && activeChatId) {
+    scheduleServerSessionSave(activeChatId);
   }
 }
 
-function scheduleServerSessionSave() {
+function scheduleServerSessionSave(chatId) {
   if (chatPersistenceMode !== "server" || !window.saveChatSession) return;
+  const targetId = chatId || activeChatId;
+  if (targetId) pendingServerSaveIds.add(targetId);
   if (serverSessionSaveTimer) {
     window.clearTimeout(serverSessionSaveTimer);
   }
@@ -390,22 +495,43 @@ function scheduleServerSessionSave() {
 
 async function flushServerSessionSave() {
   if (chatPersistenceMode !== "server" || !window.saveChatSession) return;
-  const chatsToSave = chatStore.chats.filter(
-    (chat) => Array.isArray(chat.messages) && chat.messages.length > 0,
-  );
-  if (!chatsToSave.length) return;
-  try {
-    await Promise.all(
-      chatsToSave.map((chat) =>
-        window.saveChatSession({
-          chatId: chat.id,
-          chat,
-          activeChatId: activeChatId || chatStore.activeChatId || chat.id,
-        }),
-      ),
-    );
-  } catch {
-    // best-effort server persistence
+  const ids = [...pendingServerSaveIds];
+  pendingServerSaveIds.clear();
+  if (!ids.length && activeChatId) ids.push(activeChatId);
+  const deviceId = getOrCreateDeviceId();
+  for (const chatId of ids) {
+    const chat = chatStore.chats.find((item) => item.id === chatId);
+    if (!chat || !Array.isArray(chat.messages) || chat.messages.length === 0) continue;
+    // Skip wiping someone else's leased chat when we are only following.
+    if (chatStreams.get(chatId)?.isFollower) continue;
+    const expectedUpdatedAt =
+      chat._baseUpdatedAt != null ? Number(chat._baseUpdatedAt) : undefined;
+    try {
+      const result = await window.saveChatSession({
+        chatId: chat.id,
+        chat,
+        deviceId,
+        expectedUpdatedAt,
+        updateGlobalActive: false,
+      });
+      if (result?.conflict && result.chat) {
+        // Keep our operator view; merge catalog entry without jumping active chat.
+        const serverChat = normalizeChat(result.chat);
+        serverChat._baseUpdatedAt = Number(serverChat.updatedAt || 0) || undefined;
+        const idx = chatStore.chats.findIndex((item) => item.id === chatId);
+        if (idx >= 0 && chatId !== activeChatId) {
+          chatStore.chats[idx] = serverChat;
+        }
+        continue;
+      }
+      if (result?.ok && result.chat) {
+        chat.updatedAt = Number(result.chat.updatedAt || chat.updatedAt) || chat.updatedAt;
+        chat.revision = result.chat.revision;
+        chat._baseUpdatedAt = Number(result.chat.updatedAt || chat.updatedAt) || undefined;
+      }
+    } catch {
+      // best-effort server persistence
+    }
   }
 }
 
@@ -492,6 +618,7 @@ function isPlaceholderAssistantContent(content) {
     text === "思考中…"
     || text.startsWith("正在")
     || text.startsWith("Agent ")
+    || text.startsWith("已连接")
     || text.startsWith("调用失败：")
     || text === "（已停止生成）"
     || text === "（流式连接已结束，未检测到后台任务）"
@@ -500,7 +627,53 @@ function isPlaceholderAssistantContent(content) {
     || text.includes("CODE 面板仍有任务执行中")
     || text.includes("任务仍在进行")
     || text.includes("任务已中断")
+    || text.includes("任务已结束")
+    || text.includes("长任务执行中")
+    || text.includes("可继续对话")
+    || text.includes("内核仍在执行")
+    || text.includes("请稍候")
+    || /^步骤\s*\d+\/\d+\s*完成/.test(text)
+    || /^全部\s*\d+\s*个步骤已完成/.test(text)
+    || text === "任务运行中…"
+    || text === "Jupyter 内核正在执行代码"
   );
+}
+
+function looksLikeStatusBanner(content) {
+  return isPlaceholderAssistantContent(content);
+}
+
+/** Prefer the best available assistant reply; never keep a status banner if a real answer exists. */
+function resolveFinalAssistantText({ current = "", reply = "", status = null } = {}) {
+  const candidates = [
+    stripExecutionMemoryBlock(reply),
+    extractPlanFinalResult(status),
+    stripExecutionMemoryBlock(current),
+  ].map((text) => String(text || "").trim()).filter(Boolean);
+
+  const real = candidates.find((text) => !looksLikeStatusBanner(text));
+  if (real) return real;
+
+  if (status?.planSummary) {
+    return `${status.planSummary}（任务已结束，可继续对话）`;
+  }
+  return candidates[0] || "";
+}
+
+function freezeAssistantFinalText(assistantEntry, text) {
+  if (!assistantEntry || !text) return;
+  assistantEntry.content = text;
+  assistantEntry._finalReplyLocked = true;
+}
+
+function canOverwriteAssistantContent(assistantEntry, nextText = "") {
+  if (!assistantEntry) return false;
+  if (assistantEntry._finalReplyLocked) return false;
+  const current = String(assistantEntry.content || "").trim();
+  if (!current || looksLikeStatusBanner(current)) return true;
+  // Never replace a real answer with a status / empty banner.
+  if (looksLikeStatusBanner(nextText) || !String(nextText || "").trim()) return false;
+  return true;
 }
 
 async function fetchRunStatus(chatId) {
@@ -527,8 +700,32 @@ function isTaskLikelyActive(status, chatId = activeChatId) {
   return false;
 }
 
+function isPlanSettled(status) {
+  const steps = status?.plan?.steps;
+  if (!Array.isArray(steps) || steps.length === 0) return false;
+  return steps.every((step) => {
+    const s = String(step?.status || "");
+    return s === "done" || s === "failed" || s === "skipped";
+  });
+}
+
+function extractPlanFinalResult(status) {
+  const steps = Array.isArray(status?.plan?.steps) ? status.plan.steps : [];
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    const step = steps[i];
+    if (String(step?.status || "") === "done" && String(step?.result || "").trim()) {
+      return String(step.result).trim();
+    }
+  }
+  return "";
+}
+
 function isStaleTaskState(status) {
   if (!status?.ok) return false;
+  // Plan finished normally — dangling CODE flags are cleanup, not an interruption.
+  if (isPlanSettled(status) && !status.hasActiveRun && !status.kernelBusy) {
+    return false;
+  }
   return Boolean(
     status.stalePlanStep
     || status.staleCodePanel
@@ -541,6 +738,16 @@ function buildInterruptedStatusMessage(status) {
   if (status?.planSummary) parts.push(status.planSummary);
   parts.push("（任务已中断，可继续对话或重新发送指令）");
   return parts.join(" · ");
+}
+
+/** Clear stuck CODE/plan UI without rewriting a good assistant reply. */
+function cleanupDanglingTaskUi(chatId) {
+  markRunningExecutionsStopped();
+  finishBackgroundExecutionCard();
+  stopBackgroundRunWatch(chatId);
+  if (chatId === activeChatId) {
+    renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: false });
+  }
 }
 
 function buildRunStatusMessage(status) {
@@ -561,13 +768,32 @@ function buildRunStatusMessage(status) {
 }
 
 function reconcileStaleTaskUi(chatId, status, options = {}) {
-  if (!isStaleTaskState(status)) return false;
-  const { pending = null, assistantEntry = null, persist = true } = options;
-  const message = buildInterruptedStatusMessage(status);
+  const { pending = null, assistantEntry = null, persist = true, forceMessage = false } = options;
 
-  markRunningExecutionsStopped();
-  finishBackgroundExecutionCard();
-  stopBackgroundRunWatch(chatId);
+  // Soft cleanup path: plan already settled or caller only wants to clear CODE flags.
+  if (!isStaleTaskState(status)) {
+    if (isPlanSettled(status) || status?.staleCodePanel || status?.codePanelRunning) {
+      cleanupDanglingTaskUi(chatId);
+      if (persist && chatId) persistChatMessages(chatId, chatHistory);
+      return false;
+    }
+    return false;
+  }
+
+  cleanupDanglingTaskUi(chatId);
+
+  // Never clobber a real final answer with a false "interrupted" banner.
+  const hasRealAnswer =
+    assistantEntry
+    && !isPlaceholderAssistantContent(assistantEntry.content)
+    && !forceMessage;
+  if (hasRealAnswer) {
+    if (persist && chatId) persistChatMessages(chatId, chatHistory);
+    return true;
+  }
+
+  const planResult = extractPlanFinalResult(status);
+  const message = planResult || buildInterruptedStatusMessage(status);
 
   if (assistantEntry) {
     assistantEntry.content = message;
@@ -684,13 +910,18 @@ function syncRunStatusToUI(chatId, status, options = {}) {
   const message = buildRunStatusMessage(status);
   const { pending = null, assistantEntry = null, persist = true } = options;
 
-  if (assistantEntry && message) {
+  // Status banners are for the loading line only — never clobber a final reply.
+  if (assistantEntry && message && canOverwriteAssistantContent(assistantEntry, message)) {
     assistantEntry.content = message;
   }
 
   if (chatId === activeChatId) {
     const target = resolvePendingGroup(pending) || getLastAssistantGroup();
-    if (target && message) {
+    if (
+      target
+      && message
+      && (!assistantEntry || canOverwriteAssistantContent(assistantEntry, message))
+    ) {
       const textEl = target.querySelector(".chat-text");
       if (textEl) {
         textEl.classList.add("chat-text--loading");
@@ -725,7 +956,7 @@ function syncRunStatusToUI(chatId, status, options = {}) {
     scrollThreadToBottom();
   }
 
-  if (persist && assistantEntry && chatId) {
+  if (persist && assistantEntry && chatId && canOverwriteAssistantContent(assistantEntry, message)) {
     const messages = options.messages || chatHistory;
     persistChatMessages(chatId, messages);
   }
@@ -757,12 +988,15 @@ async function pollBackgroundRunStatus(chatId) {
       finishBackgroundExecutionCard();
       markRunningExecutionsStopped();
       if (watch.assistantEntry) {
-        const finalText = status?.planSummary
-          ? `${status.planSummary}（任务已结束，可继续对话）`
-          : "（任务已结束，可继续对话）";
-        watch.assistantEntry.content = finalText;
-        updateMessageGroup(resolvePendingGroup(watch.pending), finalText);
-        persistChatMessages(chatId, chatHistory);
+        const finalText = resolveFinalAssistantText({
+          current: watch.assistantEntry.content,
+          status,
+        });
+        if (finalText) {
+          freezeAssistantFinalText(watch.assistantEntry, finalText);
+          updateMessageGroup(resolvePendingGroup(watch.pending), finalText);
+          persistChatMessages(chatId, chatHistory);
+        }
       }
     }
     return;
@@ -1112,6 +1346,10 @@ function removeEmptyChat(chatId) {
   const chat = chatStore.chats.find((item) => item.id === chatId);
   if (chat && chat.messages.length === 0) {
     chatStore.chats = chatStore.chats.filter((item) => item.id !== chatId);
+    // Drop any empty shell the kernel panel may have created on disk.
+    if (chatPersistenceMode === "server") {
+      void window.deleteChatSession?.(chatId);
+    }
   }
 }
 
@@ -1193,7 +1431,12 @@ function deleteChat(chatId, event) {
   if (!chatId) return;
   if (isChatStreaming(chatId)) return;
 
-  window.releaseChatKernel?.(chatId);
+  // Explicit server delete (kernel release alone no longer wipes session dirs).
+  if (chatPersistenceMode === "server") {
+    void window.deleteChatSession?.(chatId);
+  } else {
+    window.releaseChatKernel?.(chatId);
+  }
 
   const wasActive = chatId === activeChatId;
   chatStore.chats = chatStore.chats.filter((item) => item.id !== chatId);
@@ -1247,8 +1490,16 @@ function renderRecentChats() {
     const link = document.createElement("a");
     link.className = "sidebar-recent-session__link";
     link.href = "#";
-    link.textContent = chat.title || "New Chat";
-    link.title = chat.title || "New Chat";
+    const lease = chat.operatorLease;
+    const leasedByOther =
+      lease?.deviceId
+      && lease.deviceId !== getOrCreateDeviceId()
+      && Number(lease.expiresAt || 0) > Date.now() / 1000;
+    const baseTitle = chat.title || "New Chat";
+    link.textContent = leasedByOther ? `${baseTitle} · 他机操作中` : baseTitle;
+    link.title = leasedByOther
+      ? `${baseTitle}（正由其他设备写入，本机只读旁观）`
+      : baseTitle;
     link.addEventListener("click", (event) => {
       event.preventDefault();
       loadChat(chat.id);
@@ -1287,6 +1538,7 @@ function startNewChat() {
 
   activeChatId = createId();
   chatHistory = [];
+  supervisorHistory = [];
   chatStore.activeChatId = activeChatId;
   ensureChatRecord(activeChatId);
   saveChatStore();
@@ -1295,6 +1547,7 @@ function startNewChat() {
   resetComposer();
   syncComposerForActiveChat();
   setPage("agent");
+  void refreshReportPage();
   window.KernelPanel?.refresh?.({ force: true });
   window.KernelPanel?.startPolling?.(12000);
 }
@@ -1308,6 +1561,7 @@ function loadChat(chatId) {
 
   activeChatId = chat.id;
   chatStore.activeChatId = activeChatId;
+  supervisorHistory = [];
   chatHistory = chat.messages.map((item) => normalizeMessage(item));
   // 切回仍在跑的会话时，恢复该会话自己的代码执行卡片 ID
   activeCodeExecutionId = chatStreams.get(chatId)?.codeExecutionId || null;
@@ -1317,6 +1571,7 @@ function loadChat(chatId) {
   resetComposer();
   syncComposerForActiveChat();
   setPage("agent");
+  void refreshReportPage();
   void resumeBackgroundRunIfNeeded(chatId);
   if (isActiveChatSending()) {
     window.KernelPanel?.stopPolling?.();
@@ -1430,12 +1685,41 @@ function resolvePendingGroup(pending) {
 }
 
 function showCodePanel() {
+  if (leftPanelMode !== "code") return;
+  if (agentLeftPanel) agentLeftPanel.hidden = false;
   if (agentCodePanel) agentCodePanel.hidden = false;
+  if (branchChatPanel) branchChatPanel.hidden = true;
 }
 
 function syncCodePanelVisibility() {
-  if (!agentCodePanel || !agentCodeInner) return;
-  agentCodePanel.hidden = agentCodeInner.children.length === 0;
+  if (!agentLeftPanel || !agentCodePanel || !agentCodeInner) return;
+  if (leftPanelMode !== "code") {
+    agentCodePanel.hidden = true;
+    return;
+  }
+  const hasCode = agentCodeInner.children.length > 0;
+  agentLeftPanel.hidden = !hasCode;
+  agentCodePanel.hidden = !hasCode;
+  if (branchChatPanel) branchChatPanel.hidden = true;
+}
+
+function setLeftPanelMode(mode) {
+  leftPanelMode = mode === "branch" ? "branch" : "code";
+  if (leftPanelModeSelect && leftPanelModeSelect.value !== leftPanelMode) {
+    leftPanelModeSelect.value = leftPanelMode;
+  }
+  if (leftPanelMode === "branch") {
+    if (agentLeftPanel) agentLeftPanel.hidden = false;
+    if (agentCodePanel) agentCodePanel.hidden = true;
+    if (branchChatPanel) branchChatPanel.hidden = false;
+  } else {
+    if (branchChatPanel) branchChatPanel.hidden = true;
+    syncCodePanelVisibility();
+  }
+}
+
+function setSupervisorOpen(open) {
+  setLeftPanelMode(open ? "branch" : "code");
 }
 
 function getCodePanelInner() {
@@ -2097,7 +2381,10 @@ function showCodeApproval(_group, event, options = {}) {
 
   const shouldAuto = Boolean(options.autoApprove ?? autoApproveCode);
   const runId = options.runId || getChatStream(activeChatId)?.runId || "";
-  const desc = event.description || "即将在当前 conda / Jupyter 环境中执行以下 Python 代码。";
+  let desc = event.description || "即将在当前 conda / Jupyter 环境中执行以下 Python 代码。";
+  if (event.supervisor?.reason) {
+    desc = `监管者建议人工确认（${event.supervisor.level || "risk"}）：${event.supervisor.reason}\n\n${desc}`;
+  }
 
   let card = codeInner.querySelector(`[data-request-id="${event.requestId}"]`);
   if (card) {
@@ -2481,7 +2768,9 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
   if (!event?.type || !assistantEntry) return;
 
   if (event.type === "status" && event.message) {
-    assistantEntry.content = event.message;
+    if (canOverwriteAssistantContent(assistantEntry, event.message)) {
+      assistantEntry.content = event.message;
+    }
     return;
   }
   if (
@@ -2493,7 +2782,14 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     || event.type === "plan_complete"
   ) {
     const msg = event.message || "";
-    if (msg) assistantEntry.content = msg;
+    const isFinalPlanEvent = event.type === "plan_complete";
+    if (msg && (isFinalPlanEvent || canOverwriteAssistantContent(assistantEntry, msg))) {
+      if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
+        freezeAssistantFinalText(assistantEntry, msg);
+      } else {
+        assistantEntry.content = msg;
+      }
+    }
     if (event.plan?.steps?.length) {
       appendThinkingStepToEntry(assistantEntry, {
         kind: "plan",
@@ -2520,11 +2816,11 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     return;
   }
   if (event.type === "done" && event.text) {
-    assistantEntry.content = stripExecutionMemoryBlock(event.text);
+    freezeAssistantFinalText(assistantEntry, stripExecutionMemoryBlock(event.text));
     return;
   }
   if (event.type === "final" && event.content) {
-    assistantEntry.content = stripExecutionMemoryBlock(event.content);
+    freezeAssistantFinalText(assistantEntry, stripExecutionMemoryBlock(event.content));
     return;
   }
   if (event.type === "thinking" && String(event.content || "").trim()) {
@@ -2585,6 +2881,11 @@ function handleAgentStreamEvent(group, event) {
   if (event.type === "heartbeat") {
     const msg = event.message || "任务运行中…";
     const entry = getLastAssistantEntry();
+    // Heartbeats keep the connection alive after "done"; never wipe the final reply.
+    if (entry && !canOverwriteAssistantContent(entry, msg)) {
+      scrollThreadToBottom();
+      return;
+    }
     if (entry) entry.content = msg;
     const textEl = group.querySelector(".chat-text");
     if (textEl) {
@@ -2616,11 +2917,23 @@ function handleAgentStreamEvent(group, event) {
   ) {
     const entry = getLastAssistantEntry();
     const msg = event.message || "";
-    if (entry && msg) entry.content = msg;
+    const isFinalPlanEvent = event.type === "plan_complete";
+    if (entry && msg && (isFinalPlanEvent || canOverwriteAssistantContent(entry, msg))) {
+      if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
+        freezeAssistantFinalText(entry, msg);
+      } else {
+        entry.content = msg;
+      }
+    }
     const textEl = group.querySelector(".chat-text");
-    if (textEl && msg) {
-      textEl.classList.add("chat-text--loading");
-      textEl.textContent = msg;
+    if (textEl && msg && (isFinalPlanEvent || !entry || canOverwriteAssistantContent(entry, msg))) {
+      if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
+        textEl.classList.remove("chat-text--loading");
+        textEl.textContent = msg;
+      } else {
+        textEl.classList.add("chat-text--loading");
+        textEl.textContent = msg;
+      }
     }
     if (event.plan?.steps?.length) {
       const done = event.plan.steps.filter((s) => s.status === "done").length;
@@ -2647,7 +2960,7 @@ function handleAgentStreamEvent(group, event) {
   if (event.type === "done" && event.text) {
     const entry = getLastAssistantEntry();
     const text = stripExecutionMemoryBlock(event.text);
-    if (entry) entry.content = text;
+    if (entry) freezeAssistantFinalText(entry, text);
     updateMessageGroup(group, text);
     persistActiveChat();
     return;
@@ -2656,7 +2969,7 @@ function handleAgentStreamEvent(group, event) {
   if (event.type === "final" && event.content) {
     const entry = getLastAssistantEntry();
     const text = stripExecutionMemoryBlock(event.content);
-    if (entry) entry.content = text;
+    if (entry) freezeAssistantFinalText(entry, text);
     updateMessageGroup(group, text);
     persistActiveChat();
     return;
@@ -2822,6 +3135,7 @@ async function handleSend() {
   let historyRecorded = false;
   let assistantEntry = null;
   let streamComposerReleased = false;
+  let reply = "";
 
   const touchStreamActivity = () => {
     const stream = chatStreams.get(streamChatId);
@@ -2926,7 +3240,7 @@ async function handleSend() {
     startStreamStatusPoll();
 
     const fullConfig = window.loadLlmConfig?.() || llm?.config;
-    const { text: reply, meta } = await window.agentChatStream({
+    const streamResult = await window.agentChatStream({
       account,
       vendor,
       agent: fullConfig?.agent || agent,
@@ -2934,7 +3248,9 @@ async function handleSend() {
       executionContext: buildExecutionContextForApi(),
       runId,
       chatId: streamChatId,
-      autoApproveCode,
+      deviceId: getOrCreateDeviceId(),
+      autoApproveCode: approvalMode === "auto",
+      approvalMode,
       signal: abortController.signal,
       onEvent: (event) => {
         if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
@@ -2957,7 +3273,11 @@ async function handleSend() {
           touchStreamActivity();
           if (isVisible) {
             handleAgentStreamEvent(resolvePendingGroup(pending), event);
-          } else if (assistantEntry && event.message) {
+          } else if (
+            assistantEntry
+            && event.message
+            && canOverwriteAssistantContent(assistantEntry, event.message)
+          ) {
             assistantEntry.content = event.message;
           }
           return;
@@ -2967,8 +3287,30 @@ async function handleSend() {
           if (event.type === "code_approval_required") {
             showCodeApproval(target, event, {
               runId,
-              autoApprove: autoApproveCode,
+              autoApprove: approvalMode === "auto",
             });
+            return;
+          }
+          if (event.type === "supervisor_approval") {
+            const reason = event.reason || event.action || "监管者已评估";
+            appendThinkingStep(target, {
+              kind: "result",
+              title: `监管者审批：${event.action || "?"}`,
+              body: `${event.level || ""} · ${reason}`,
+            });
+            if (event.action === "allow" || event.action === "deny") {
+              // No UI card needed when supervisor resolves fully.
+            }
+            return;
+          }
+          if (event.type === "run_report_ready") {
+            const taskHint = event.taskLabel ? `${event.taskLabel}：` : "";
+            appendThinkingStep(target, {
+              kind: "result",
+              title: "运行报告已追加",
+              body: `${taskHint}${event.reportSummary || "可在左侧 Report 页查看"}`,
+            });
+            void refreshReportPage();
             return;
           }
           handleAgentStreamEvent(target, event);
@@ -2979,13 +3321,32 @@ async function handleSend() {
         if (event.type === "final" && event.content) {
           answered = true;
           if (!historyRecorded) {
-            if (assistantEntry) assistantEntry.content = stripExecutionMemoryBlock(event.content);
+            if (assistantEntry) {
+              freezeAssistantFinalText(
+                assistantEntry,
+                stripExecutionMemoryBlock(event.content),
+              );
+            }
             historyRecorded = true;
             persistChatMessages(streamChatId, streamMessages);
           }
         }
         if (event.type === "done") {
           answered = true;
+          if (event.text && assistantEntry) {
+            freezeAssistantFinalText(
+              assistantEntry,
+              stripExecutionMemoryBlock(event.text),
+            );
+            historyRecorded = true;
+            if (isVisible) {
+              updateMessageGroup(
+                resolvePendingGroup(pending),
+                stripExecutionMemoryBlock(event.text),
+              );
+            }
+            persistChatMessages(streamChatId, streamMessages);
+          }
         }
         if (event.type === "cancelled" || event.type === "error") {
           if (event.type === "error" && assistantEntry) {
@@ -3017,24 +3378,29 @@ async function handleSend() {
         }
       },
     });
+    reply = streamResult?.text || "";
+    const meta = streamResult?.meta;
     if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
     if (!historyRecorded) {
-      const finalText = stripExecutionMemoryBlock(reply);
-      if (assistantEntry) assistantEntry.content = finalText;
-      else streamMessages.push({ role: "assistant", content: finalText, thinkingSteps: [] });
+      const finalText = resolveFinalAssistantText({
+        current: assistantEntry?.content,
+        reply,
+      });
+      if (assistantEntry && finalText) freezeAssistantFinalText(assistantEntry, finalText);
+      else if (!assistantEntry) {
+        streamMessages.push({ role: "assistant", content: finalText || "", thinkingSteps: [] });
+      }
       if (streamChatId === activeChatId) {
-        const displayText = finalText || (
-          isPlaceholderAssistantContent(assistantEntry?.content)
-            ? "（流式连接已结束，任务可能仍在后台运行，请查看 CODE 面板或刷新页面）"
-            : assistantEntry?.content || "（无回复内容）"
-        );
-        if (!finalText && assistantEntry) {
-          assistantEntry.content = displayText;
-        }
+        const displayText = finalText || "（无回复内容）";
         updateMessageGroup(resolvePendingGroup(pending), displayText);
       }
     } else if (streamChatId === activeChatId) {
-      updateMessageGroup(resolvePendingGroup(pending), stripExecutionMemoryBlock(reply));
+      const displayText = resolveFinalAssistantText({
+        current: assistantEntry?.content,
+        reply,
+      });
+      if (assistantEntry && displayText) freezeAssistantFinalText(assistantEntry, displayText);
+      updateMessageGroup(resolvePendingGroup(pending), displayText || assistantEntry?.content || "");
     }
     if (meta) {
       updateAgentBackendStatus(meta);
@@ -3079,34 +3445,64 @@ async function handleSend() {
   } finally {
     clearStreamIdleTimer();
     clearStreamStatusPoll();
+    // Clear synthetic background CODE card BEFORE run-status stale detection,
+    // otherwise a leftover "Agent 运行中" card looks like an interrupted task
+    // and overwrites the real assistant reply (e.g. completed plan result).
+    if (streamChatId === activeChatId) {
+      finishBackgroundExecutionCard();
+    }
     const status = await fetchRunStatus(streamChatId);
+    const resolved = resolveFinalAssistantText({
+      current: assistantEntry?.content,
+      reply,
+      status,
+    });
+    if (assistantEntry && resolved && !assistantEntry._finalReplyLocked) {
+      freezeAssistantFinalText(assistantEntry, resolved);
+      if (streamChatId === activeChatId) {
+        updateMessageGroup(resolvePendingGroup(pending), resolved);
+      }
+      persistChatMessages(streamChatId, streamMessages);
+    } else if (assistantEntry?._finalReplyLocked && streamChatId === activeChatId) {
+      // Heartbeats may have overwritten the visible bubble while the reply stayed locked.
+      updateMessageGroup(resolvePendingGroup(pending), assistantEntry.content);
+    }
+
     if (isStaleTaskState(status)) {
       reconcileStaleTaskUi(streamChatId, status, {
         pending,
         assistantEntry,
         persist: true,
+        forceMessage: false,
       });
       finishChatStream(streamChatId);
       return;
     }
+
+    if (isPlanSettled(status) || status?.codePanelRunning || status?.staleCodePanel) {
+      cleanupDanglingTaskUi(streamChatId);
+    }
+
     const stillRunning = isTaskLikelyActive(status, streamChatId);
     if (stillRunning) {
+      // Keep watching kernel drain, but do not rewrite a locked final reply.
       syncRunStatusToUI(streamChatId, status, {
         pending,
         assistantEntry,
         messages: streamMessages,
+        persist: false,
       });
       startBackgroundRunWatch(streamChatId, { pending, assistantEntry });
       finishChatStream(streamChatId, { keepBackgroundWatch: true });
       return;
     }
-    // 流式已结束且任务不在跑：必须收尾背景监控卡片（轮询期间可能已创建「Agent 运行中」）
-    if (streamChatId === activeChatId) {
-      finishBackgroundExecutionCard();
-    }
-    if (assistantEntry && isPlaceholderAssistantContent(assistantEntry.content)) {
-      const fallback = "（流式连接已结束，未检测到后台任务）";
-      assistantEntry.content = fallback;
+
+    if (assistantEntry && looksLikeStatusBanner(assistantEntry.content)) {
+      const fallback = resolveFinalAssistantText({
+        current: assistantEntry.content,
+        status,
+      }) || "（流式连接已结束，未检测到后台任务）";
+      freezeAssistantFinalText(assistantEntry, fallback);
       if (streamChatId === activeChatId) {
         updateMessageGroup(resolvePendingGroup(pending), fallback);
       }
@@ -3190,6 +3586,7 @@ function setPage(page) {
 
   const isAgent = page === "agent";
   const isAnalysis = page === "analysis";
+  const isReport = page === "report";
 
   if (agentSessions) agentSessions.hidden = !isAgent;
 
@@ -3197,6 +3594,69 @@ function setPage(page) {
 
   if (isAgent) scrollThreadToBottom();
   if (isAgent) updateComposerStatus();
+  if (isReport) void refreshReportPage();
+}
+
+async function refreshReportPage() {
+  if (!reportPageBody) return;
+  const chat = getActiveChatRecord();
+  const title = chat?.title || "New Chat";
+  const chatLabel = activeChatId
+    ? `${title} · ${String(activeChatId).slice(0, 8)}…`
+    : "未选择会话";
+  if (reportPageMeta) reportPageMeta.textContent = chatLabel;
+  if (reportPageSubtitle) {
+    reportPageSubtitle.textContent = activeChatId
+      ? "绑定当前会话；每次任务结束后追加一份报告，清空后从下一次任务重新记录。"
+      : "当前会话的任务报告会持续追加；清空后从下一次任务重新开始记录。";
+  }
+  if (reportClearBtn) reportClearBtn.disabled = !activeChatId;
+  if (!activeChatId) {
+    reportPageBody.textContent = "请先在 Agent 页打开或新建一个对话。";
+    return;
+  }
+  reportPageBody.textContent = "加载中…";
+  try {
+    const data = await window.fetchRunReport?.(activeChatId);
+    if (!data?.ok) {
+      reportPageBody.textContent =
+        data?.error || "尚无运行报告。完成一次主任务后会自动追加到这里。";
+      return;
+    }
+    reportPageBody.textContent = data.markdown || JSON.stringify(data.report, null, 2);
+    const taskCount = Number(data.taskCount || data.report?.tasks?.length || 0);
+    if (reportPageMeta && data.report?.updatedAt) {
+      reportPageMeta.textContent = `${chatLabel} · ${taskCount} 份任务报告 · 更新于 ${data.report.updatedAt}`;
+    }
+  } catch (error) {
+    reportPageBody.textContent = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function clearReportPage() {
+  if (!activeChatId) return;
+  const confirmed = window.confirm("清空当前会话的全部 Report 内容？清空后不可恢复，下一次任务会重新开始记录。");
+  if (!confirmed) return;
+  if (reportClearBtn) reportClearBtn.disabled = true;
+  try {
+    const data = await window.clearRunReport?.(activeChatId);
+    if (!data?.ok) {
+      window.alert(data?.error || "清空失败");
+      return;
+    }
+    if (reportPageBody) {
+      reportPageBody.textContent = "报告已清空。下一次任务结束后会重新写入。";
+    }
+    if (reportPageMeta) {
+      const chat = getActiveChatRecord();
+      const title = chat?.title || "New Chat";
+      reportPageMeta.textContent = `${title} · ${String(activeChatId).slice(0, 8)}… · 已清空`;
+    }
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : String(error));
+  } finally {
+    if (reportClearBtn) reportClearBtn.disabled = false;
+  }
 }
 
 function appendAnalysisLog(message) {
@@ -3362,6 +3822,7 @@ bindUploadCard("drop-zone-preview", "file-input-preview", "Preview Mode");
 initTheme();
 void initChatSessions();
 updateAutoApproveUi();
+setLeftPanelMode("code");
 setPage("agent");
 setComposerMode("send");
 scrollThreadToBottom();
@@ -3373,7 +3834,154 @@ window.isAgentSending = () => isActiveChatSending();
 window.KernelPanel?.refresh?.();
 
 autoApproveToggle?.addEventListener("click", () => {
-  setAutoApproveCode(!autoApproveCode);
+  cycleApprovalMode();
+});
+
+function appendSupervisorMessage(role, text) {
+  if (!supervisorThread) return;
+  const el = document.createElement("div");
+  el.className = `supervisor-msg supervisor-msg--${role === "user" ? "user" : "assistant"}`;
+  el.textContent = text;
+  supervisorThread.appendChild(el);
+  supervisorThread.scrollTop = supervisorThread.scrollHeight;
+}
+
+function setSupervisorComposerMode(mode) {
+  if (!supervisorSendBtn) return;
+  supervisorSendBtn.dataset.mode = mode;
+  const isStop = mode === "stop";
+  supervisorSendBtn.setAttribute("aria-label", isStop ? "停止" : "发送");
+  supervisorSendBtn.classList.toggle("chat-send-btn--stop", isStop);
+  supervisorSendBtn.type = isStop ? "button" : "submit";
+}
+
+function resizeSupervisorInput() {
+  if (!supervisorInput) return;
+  supervisorInput.style.height = "auto";
+  supervisorInput.style.height = `${Math.min(supervisorInput.scrollHeight, 120)}px`;
+}
+
+function handleSupervisorStop() {
+  if (!supervisorBusy) return;
+  supervisorAbortController?.abort();
+  supervisorAbortController = null;
+}
+
+async function handleSupervisorSend(event) {
+  event?.preventDefault?.();
+  if (supervisorBusy) {
+    handleSupervisorStop();
+    return;
+  }
+  const question = String(supervisorInput?.value || "").trim();
+  if (!question) return;
+  if (!activeChatId) {
+    appendSupervisorMessage("assistant", "请先打开一个主会话。");
+    return;
+  }
+  const llm = window.getLlmConfig?.();
+  if (llm?.account?.authMode === "api_key" && !llm?.account?.apiKey) {
+    appendSupervisorMessage("assistant", "请先在 Config 页面配置 API Key 并保存。");
+    return;
+  }
+  if (!llm?.account) {
+    appendSupervisorMessage("assistant", "请先在 Config 配置 API Key。");
+    return;
+  }
+  const serverOk = await window.probeProxyServer?.(true);
+  if (!serverOk) {
+    appendSupervisorMessage(
+      "assistant",
+      `无法连接 UI 后端（${window.llmProxyBase || "serve.py"}）。请确认 serve.py 已启动并硬刷新页面。`,
+    );
+    return;
+  }
+
+  supervisorBusy = true;
+  setSupervisorComposerMode("stop");
+  if (supervisorInput) supervisorInput.value = "";
+  resizeSupervisorInput();
+  appendSupervisorMessage("user", question);
+  supervisorHistory.push({ role: "user", content: question });
+  appendSupervisorMessage("assistant", "监管者查阅中…");
+  const pending = supervisorThread?.lastElementChild;
+  supervisorAbortController = new AbortController();
+  try {
+    const { text } = await window.supervisorChatStream({
+      account: llm.account,
+      vendor: llm.vendor,
+      agent: llm.config?.agent,
+      chatId: activeChatId,
+      parentChatId: activeChatId,
+      messages: supervisorHistory,
+      signal: supervisorAbortController.signal,
+      onEvent: (evt) => {
+        if (evt.type === "status" && pending) pending.textContent = evt.message || "查阅中…";
+      },
+    });
+    const answer = text || "（无回复）";
+    if (pending) pending.textContent = answer;
+    supervisorHistory.push({ role: "assistant", content: answer });
+  } catch (error) {
+    const aborted =
+      (error instanceof DOMException && error.name === "AbortError") ||
+      (error instanceof Error && /abort/i.test(error.message));
+    if (pending) {
+      pending.textContent = aborted
+        ? "已停止。"
+        : `调用失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (aborted) {
+      supervisorHistory.push({ role: "assistant", content: "已停止。" });
+    }
+  } finally {
+    supervisorBusy = false;
+    supervisorAbortController = null;
+    setSupervisorComposerMode("send");
+  }
+}
+
+async function openRunReport() {
+  setPage("report");
+  await refreshReportPage();
+}
+
+supervisorOpenBtn?.addEventListener("click", () => setLeftPanelMode("branch"));
+leftPanelModeSelect?.addEventListener("change", () => {
+  setLeftPanelMode(leftPanelModeSelect.value);
+});
+supervisorInput?.addEventListener("input", () => {
+  supervisorImeEnterStroke = false;
+  resizeSupervisorInput();
+});
+supervisorInput?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey) return;
+  if (event.isComposing || event.keyCode === 229) {
+    supervisorImeEnterStroke = true;
+    return;
+  }
+  if (supervisorImeEnterStroke) return;
+  event.preventDefault();
+  void handleSupervisorSend(event);
+});
+supervisorInput?.addEventListener("keyup", (event) => {
+  if (event.key === "Enter") supervisorImeEnterStroke = false;
+});
+supervisorForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (event.isComposing || supervisorImeEnterStroke) return;
+  void handleSupervisorSend(event);
+});
+supervisorSendBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  void handleSupervisorSend(event);
+});
+setSupervisorComposerMode("send");
+reportRefreshBtn?.addEventListener("click", () => {
+  void refreshReportPage();
+});
+reportClearBtn?.addEventListener("click", () => {
+  void clearReportPage();
 });
 
 window.addEventListener("llm-config-updated", () => {
@@ -3392,7 +4000,13 @@ window.addEventListener("proxy-server-probed", () => {
       // ignore storage failures
     }
     void syncChatStoreFromServer().then((synced) => {
-      if (synced) applyActiveChatFromStore();
+      if (!synced) return;
+      // Refresh catalog only — never jump onto another device's shared active chat.
+      if (!activeChatId && !getDeviceActiveChatId()) {
+        applyActiveChatFromStore({ preferNewChat: true });
+      } else {
+        renderRecentChats();
+      }
     });
   }
 });

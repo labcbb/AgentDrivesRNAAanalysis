@@ -286,6 +286,39 @@ def forward_kernel_release(body: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": f"kernel release error: {exc}"}
 
 
+def forward_session_delete(body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from agent_bridge import delete_session_api
+
+        return delete_session_api(body)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"session delete error: {exc}"}
+
+
+def forward_run_report(chat_id: str) -> dict[str, Any]:
+    try:
+        from agent_bridge import get_run_report
+
+        return get_run_report(chat_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"run report error: {exc}"}
+
+
+def forward_clear_run_report(body: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from agent_bridge import clear_run_report_api
+
+        return clear_run_report_api(body)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"clear report error: {exc}"}
+
+
+def iter_supervisor_chat_stream(body: dict[str, Any]):
+    from agent_bridge import stream_supervisor_chat
+
+    yield from stream_supervisor_chat(body)
+
+
 def forward_work_space_files(query: dict[str, list[str]]) -> dict[str, Any]:
     try:
         from agent_bridge import work_space_files
@@ -464,6 +497,13 @@ class Handler(SimpleHTTPRequestHandler):
                 return
             self._write_json(forward_session_replay(replay_id))
             return
+        if path == "/api/supervisor/report":
+            report_id = str((query.get("chatId") or [""])[0]).strip()
+            if not report_id:
+                self._write_json({"ok": False, "error": "chatId 不能为空"}, err_status=400)
+                return
+            self._write_json(forward_run_report(report_id))
+            return
         super().do_GET()
 
     def do_POST(self) -> None:  # noqa: N802
@@ -476,6 +516,9 @@ class Handler(SimpleHTTPRequestHandler):
             "/api/agent/approve",
             "/api/kernel/release",
             "/api/sessions/save",
+            "/api/sessions/delete",
+            "/api/supervisor/chat/stream",
+            "/api/supervisor/report/clear",
         ):
             self.send_error(404, "Not Found")
             return
@@ -492,6 +535,14 @@ class Handler(SimpleHTTPRequestHandler):
             self._write_sse_stream(iter_agent_chat_stream(body))
             return
 
+        if path == "/api/supervisor/chat/stream":
+            self._write_sse_stream(iter_supervisor_chat_stream(body), cancel_on_disconnect=False)
+            return
+
+        if path == "/api/supervisor/report/clear":
+            self._write_json(forward_clear_run_report(body))
+            return
+
         if path == "/api/agent/cancel":
             self._write_json(forward_agent_cancel(body))
             return
@@ -505,7 +556,15 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/sessions/save":
-            self._write_json(forward_session_save(body))
+            result = forward_session_save(body)
+            if result.get("conflict"):
+                self._write_json(result, ok_status=409, err_status=409)
+            else:
+                self._write_json(result)
+            return
+
+        if path == "/api/sessions/delete":
+            self._write_json(forward_session_delete(body))
             return
 
         if path == "/api/agent/chat":
@@ -570,7 +629,7 @@ def main() -> None:
         print(f"OpenClaw UI → http://127.0.0.1:{port}/index.html")
     print(f"Work space  → {workspace}")
     print("LLM proxy   → POST /api/llm/chat")
-    print("sRNAgent    → POST /api/agent/chat  /api/agent/chat/stream  /api/agent/cancel  /api/agent/approve  GET /api/agent/status  GET /api/agent/run-status?chatId=  GET /api/agent/events/stream?chatId=  GET /api/kernel/environment?chatId=  GET /api/kernel/figures?chatId=  GET /api/work_space/files?path=  GET /api/sessions  GET /api/sessions/detail?chatId=  POST /api/sessions/save  POST /api/kernel/release")
+    print("sRNAgent    → POST /api/agent/chat  /api/agent/chat/stream  /api/agent/cancel  /api/agent/approve  GET /api/agent/status  GET /api/agent/run-status?chatId=  GET /api/agent/events/stream?chatId=  GET /api/kernel/environment?chatId=  GET /api/kernel/figures?chatId=  GET /api/work_space/files?path=  GET /api/sessions  GET /api/sessions/detail?chatId=  POST /api/sessions/save  POST /api/sessions/delete  POST /api/kernel/release")
     print("Press Ctrl+C to stop")
     try:
         server.serve_forever()

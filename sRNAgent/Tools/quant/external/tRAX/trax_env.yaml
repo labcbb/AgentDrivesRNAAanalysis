@@ -1,0 +1,16 @@
+name: trax_env
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+
+
+  - python>=3.10
+  - packaging>=16.8
+  - tbb>=2020.2
+  - bowtie2>=2.5
+  - infernal>=1.1.4
+  - pysam>=0.19.1 
+  - samtools>=1.15.1
+  - sra-tools>=2.11.0
+  - zsh

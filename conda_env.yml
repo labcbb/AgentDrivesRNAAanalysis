@@ -14,7 +14,8 @@ dependencies:
   - mirdeep2
   - subread
   - pysam
-  - scanpy 
+  - scanpy
+  - bowtie2>=2.5
   - pip:
       - anndata
       - fastq-dl

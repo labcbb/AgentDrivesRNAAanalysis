@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>sRNA Agent</title>
     <!-- 不加载 Google Fonts：国内/部分网络会阻塞导致白屏；styles.css 已含系统字体 fallback -->
-    <link rel="stylesheet" href="./styles.css?v=28" />
+    <link rel="stylesheet" href="./styles.css?v=32" />
   </head>
   <body>
     <div class="shell shell--chat" id="shell">
@@ -84,12 +84,14 @@
                   </svg>
                   <span class="nav-item__text">Config</span>
                 </a>
-                <a class="nav-item" data-page="cron" href="#">
+                <a class="nav-item" data-page="report" href="#">
                   <svg class="nav-item__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <circle cx="12" cy="12" r="9"></circle>
-                    <path d="M12 7v5l3 2"></path>
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                    <path d="M14 2v6h6"></path>
+                    <path d="M8 13h8"></path>
+                    <path d="M8 17h6"></path>
                   </svg>
-                  <span class="nav-item__text">Cron</span>
+                  <span class="nav-item__text">Report</span>
                 </a>
               </nav>
 
@@ -102,6 +104,11 @@
                   <div class="sidebar-recent-sessions__head">Recent</div>
                   <div id="chat-recent-list"></div>
                 </div>
+                <div class="sidebar-supervisor">
+                  <button class="sidebar-supervisor__btn" type="button" id="supervisor-open-btn" title="切换到监管者 branch chat">
+                    监管者分支
+                  </button>
+                </div>
               </section>
             </div>
           </div>
@@ -112,20 +119,41 @@
         <!-- Agent 聊天页 -->
         <section class="page-view page-view--active" data-view="agent">
           <div class="agent-workspace">
-            <aside class="code" id="agent-code-panel" hidden aria-label="代码执行">
-              <div class="code__header">
-                <span class="code__header-title">Code</span>
-                <button
-                  class="code__auto-approve-btn"
-                  type="button"
-                  id="auto-approve-toggle"
-                  aria-pressed="false"
-                  title="开启后自动批准所有代码运行请求"
-                >
-                  自动批准：关
-                </button>
+            <aside class="code" id="agent-left-panel" hidden aria-label="左侧面板">
+              <div class="left-panel-mode" id="agent-code-panel" data-mode="code">
+                <div class="code__header">
+                  <span class="code__header-title">Code</span>
+                  <button
+                    class="code__auto-approve-btn"
+                    type="button"
+                    id="auto-approve-toggle"
+                    aria-pressed="false"
+                    title="点击切换：手动批准 / 智能审批（监管者）/ 全部自动"
+                  >
+                    审批：手动
+                  </button>
+                </div>
+                <div class="code__inner" id="agent-code-inner"></div>
               </div>
-              <div class="code__inner" id="agent-code-inner"></div>
+              <div class="left-panel-mode branch-chat-panel" id="branch-chat-panel" data-mode="branch" hidden>
+                <div class="code__header">
+                  <span class="code__header-title">Branch chat</span>
+                </div>
+                <div class="branch-chat-panel__hint">监管者只读旁路：可问进度、产物与报错，不抢主会话。</div>
+                <div class="code__inner branch-chat-panel__thread" id="supervisor-thread"></div>
+                <form class="branch-chat-panel__form" id="supervisor-form">
+                  <textarea id="supervisor-input" rows="1"></textarea>
+                  <button class="chat-send-btn" type="submit" id="supervisor-send-btn" aria-label="发送" data-mode="send">
+                    <svg class="chat-send-btn__icon chat-send-btn__icon--send" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                      <path d="m22 2-11 11"></path>
+                      <path d="M22 2 15 22l-4-9-9-4z"></path>
+                    </svg>
+                    <svg class="chat-send-btn__icon chat-send-btn__icon--stop" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                      <rect x="7" y="7" width="10" height="10" rx="1.5"></rect>
+                    </svg>
+                  </button>
+                </form>
+              </div>
             </aside>
             <div class="card chat">
             <div class="chat-layout">
@@ -162,13 +190,22 @@
                         <span class="sidebar-status__dot"></span>
                         检测后端连接…
                       </span>
-                      <span>Enter 发送 · Shift+Enter 换行</span>
+                      <div class="composer-footer-right">
+                        <label class="composer-panel-select-wrap" for="left-panel-mode">
+                          <select id="left-panel-mode" class="composer-panel-select" aria-label="左侧面板">
+                            <option value="code" selected>code</option>
+                            <option value="branch">branch chat</option>
+                          </select>
+                        </label>
+                        <span>Enter 发送 · Shift+Enter 换行</span>
+                      </div>
                     </div>
                   </form>
                 </div>
               </div>
             </div>
             </div>
+
             <aside class="agent-workspace__rail" id="agent-side-rail" aria-label="内核环境">
               <section class="kernel-panel kernel-panel--env" aria-label="Environment">
                 <div class="kernel-panel__header">
@@ -454,10 +491,20 @@
           </div>
         </section>
 
-        <section class="page-view" data-view="cron">
-          <div class="placeholder-page">
-            <h2>Cron</h2>
-            <p>静态占位页，后续可接入定时任务。</p>
+        <section class="page-view" data-view="report">
+          <div class="report-page">
+            <header class="report-page__header">
+              <div>
+                <h2 class="report-page__title">Report</h2>
+                <p class="report-page__subtitle" id="report-page-subtitle">当前会话的任务报告会持续追加；清空后从下一次任务重新开始记录。</p>
+              </div>
+              <div class="report-page__actions">
+                <button class="report-page__refresh" type="button" id="report-refresh-btn" title="刷新报告">刷新</button>
+                <button class="report-page__clear" type="button" id="report-clear-btn" title="清空当前会话报告">清空</button>
+              </div>
+            </header>
+            <div class="report-page__meta" id="report-page-meta">未选择会话</div>
+            <pre class="report-page__body" id="report-page-body">切换到某个对话并完成一次任务后，这里会追加显示该任务的运行报告。</pre>
           </div>
         </section>
       </main>
@@ -465,8 +512,8 @@
 
     <script src="./config-providers.js?v=11"></script>
     <script src="./config.js?v=16"></script>
-    <script src="./llm-client.js?v=33"></script>
+    <script src="./llm-client.js?v=37"></script>
     <script src="./kernel-panel.js?v=6"></script>
-    <script src="./app.js?v=93"></script>
+    <script src="./app.js?v=103"></script>
   </body>
 </html>
