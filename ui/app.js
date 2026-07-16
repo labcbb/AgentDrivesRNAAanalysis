@@ -273,6 +273,10 @@ function scrollCodePanelToBottom() {
   const inner = getCodePanelInner();
   if (!inner) return;
   requestAnimationFrame(() => {
+    if (inner.scrollHeight <= inner.clientHeight + 1) {
+      inner.scrollTop = 0;
+      return;
+    }
     inner.scrollTop = inner.scrollHeight;
   });
 }
@@ -1697,9 +1701,8 @@ function syncCodePanelVisibility() {
     agentCodePanel.hidden = true;
     return;
   }
-  const hasCode = agentCodeInner.children.length > 0;
-  agentLeftPanel.hidden = !hasCode;
-  agentCodePanel.hidden = !hasCode;
+  agentLeftPanel.hidden = false;
+  agentCodePanel.hidden = false;
   if (branchChatPanel) branchChatPanel.hidden = true;
 }
 

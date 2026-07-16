@@ -13,6 +13,7 @@ from session_memory import load_session_memory
 from session_plan import load_plan, plan_progress_summary
 from session_store import _read_json, _write_json, ensure_session_dir, load_kernel_state, sanitize_chat_id
 from run_ledger import load_run_ledger, summarize_ledger_for_prompt
+from supervisor_skills import build_skill_gate_prompt, summarize_chat_for_confirmation
 
 logger = logging.getLogger(__name__)
 
@@ -42,15 +43,15 @@ _FORCE_DENY_PATTERNS = (
 )
 
 _SYSTEM_RISK = """你是 sRNAgent 的监管者（Supervisor）。只做代码风险审查，不要执行代码。
-根据将要在 Jupyter 中执行的代码，输出严格 JSON（不要 markdown 围栏）：
+根据将要在 Jupyter 中执行的代码，以及附带的 Skill 用户确认门槛与最近对话，输出严格 JSON（不要 markdown 围栏）：
 {
   "level": "low|medium|high|critical",
   "action": "allow|escalate|deny",
   "reason": "一句话中文理由"
 }
 规则：
-- allow：普通分析（读文件、pandas、绘图、既有 sRNAgent API、写工作区内结果）
-- escalate：可能删改重要数据、外网下载、安装包、改权限、大范围写盘 → 交给人工
+- allow：普通分析（读文件、pandas、绘图、既有 sRNAgent API、写工作区内结果），且已满足相关 Skill 的用户确认门槛
+- escalate：可能删改重要数据、外网下载、安装包、改权限、大范围写盘；或代码触发 Skill 门槛但对话中未见用户确认（adapter、建库方案、分组、novel miRNA、QC 后继续等）→ 交给人工
 - deny：明显破坏性命令（如 rm -rf /、fork bomb）
 宁严勿松。仅输出 JSON。"""
 
@@ -287,6 +288,14 @@ def assess_code_risk(
         if plan:
             context_bits.append(f"计划进度：{plan_progress_summary(plan)}")
         context_bits.append(summarize_ledger_for_prompt(chat_id, max_events=12))
+        chat_summary = summarize_chat_for_confirmation(chat_id)
+        if chat_summary:
+            context_bits.append(chat_summary)
+
+    skill_gates = build_skill_gate_prompt(code)
+    system_prompt = _SYSTEM_RISK
+    if skill_gates:
+        system_prompt += "\n\n" + skill_gates
 
     user_prompt = (
         "\n".join(context_bits)
@@ -303,7 +312,7 @@ def assess_code_risk(
             client = _build_client(llm_body)
             completion = client.complete(
                 [
-                    {"role": "system", "content": _SYSTEM_RISK},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
                 tools=None,
