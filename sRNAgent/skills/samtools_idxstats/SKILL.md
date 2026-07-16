@@ -127,7 +127,7 @@ adata = sa.quant.idxstats(
 | 3 | Reads mapped to that reference | `adata.X`, `adata.layers["idxstats"]` |
 | 4 | Unmapped reads for that reference | ignored |
 
-Returned `AnnData` fields:
+If the input has no existing variables, returned `AnnData` fields are:
 
 ```python
 adata.X
@@ -139,6 +139,16 @@ adata.obs["idxstats_file"]
 adata.uns["idxstats_result"]
 ```
 
+If the input already has an expression matrix, for example miRNA counts in `adata.X`, the existing matrix is preserved:
+
+```python
+adata.obsm["idxstats"]      # idxstats mapped-read matrix
+adata.uns["idxstats_var"]   # reference metadata for columns in obsm["idxstats"]
+adata.uns["idxstats_result"]
+```
+
+Use `replace_x=True` only when you explicitly want idxstats counts to replace the current `adata.X` and `adata.var`.
+
 ## Correct Usage
 
 **CORRECT - tRNA FASTA reference:**
@@ -147,6 +157,15 @@ adata.uns["idxstats_result"]
 sa.alignment.bowtie_build("ref/mature_tRNAs.fa", "ref/mature_tRNAs")
 adata = sa.alignment.bowtie(adata, index_basename="ref/mature_tRNAs")
 adata = sa.quant.idxstats(adata)
+```
+
+**CORRECT - preserve existing expression and add idxstats separately:**
+
+```python
+# Existing adata.X contains miRNA or other counts
+adata = sa.quant.idxstats(adata)
+print(adata.X.shape)                # unchanged
+print(adata.obsm["idxstats"].shape) # new small-RNA reference count matrix
 ```
 
 **CORRECT - piRBase FASTA reference:**

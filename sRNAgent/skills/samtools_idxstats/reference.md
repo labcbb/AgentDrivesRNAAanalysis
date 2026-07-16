@@ -10,6 +10,7 @@ adata = sa.quant.idxstats(
     create_index=True,
     drop_unmapped_reference=True,
     jobs=None,
+    replace_x=None,
 )
 ```
 
@@ -23,6 +24,7 @@ adata = sa.quant.idxstats(
 | `create_index` | Run `samtools index` when `.bai` is missing |
 | `drop_unmapped_reference` | Drop the special `*` row from idxstats output |
 | `jobs` | Number of BAM files to process concurrently |
+| `replace_x` | `None` replaces X only for empty-var AnnData; `False` stores counts in `obsm`; `True` replaces X/var |
 
 ## Input
 
@@ -50,7 +52,7 @@ samtools idxstats sample.bam
 
 Rows are reference sequences from the BAM header. In the intended workflow, each reference sequence is one small-RNA feature from the FASTA used to build the Bowtie index.
 
-AnnData output:
+AnnData output when the input has no existing variables:
 
 ```python
 adata.X                    # mapped read counts
@@ -59,6 +61,14 @@ adata.var["reference_name"]
 adata.var["reference_length"]
 adata.obs["idxstats_bam"]
 adata.obs["idxstats_file"]
+adata.uns["idxstats_result"]
+```
+
+If the input already has an expression matrix:
+
+```python
+adata.obsm["idxstats"]
+adata.uns["idxstats_var"]
 adata.uns["idxstats_result"]
 ```
 

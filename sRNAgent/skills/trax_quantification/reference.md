@@ -21,6 +21,7 @@ adata = sa.quant.tRAX(
     skipfqcheck=False,
     path_col=None,
     replicate_col=None,
+    replace_x=None,
 )
 ```
 
@@ -45,6 +46,7 @@ adata = sa.quant.tRAX(
 | `skipfqcheck` | Skip FASTQ-vs-BAM read group consistency checks |
 | `path_col` | Force a specific `adata.obs` column as FASTQ input |
 | `replicate_col` | Optional `adata.obs` column for tRAX replicate/group labels |
+| `replace_x` | `None` replaces X only for empty-var AnnData; `False` stores counts in `obsm`; `True` replaces X/var |
 
 ## FASTQ Resolution
 
@@ -110,7 +112,7 @@ trax_out/trax_quant/trax_quant-mapstats.txt
 
 ## AnnData Output
 
-After a full run:
+After a full run on an AnnData object with no existing variables:
 
 ```python
 adata.X
@@ -127,6 +129,17 @@ adata.uns["trax_count_matrix"]
 ```
 
 `adata.X` and `adata.layers["tRAXcount"]` contain the same raw count matrix.
+
+If the input already has an expression matrix, tRAX results are stored without replacing it:
+
+```python
+adata.obsm["tRAXcount"]
+adata.uns["tRAX_var"]
+adata.uns["trax_result"]
+adata.uns["trax_count_matrix"]
+```
+
+Use `replace_x=True` to force tRAX counts into `adata.X`.
 
 ## Parsed Feature IDs
 

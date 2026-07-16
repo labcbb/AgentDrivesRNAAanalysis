@@ -153,12 +153,21 @@ adata = sa.quant.tRAX(
 
 ## Outputs
 
-`sa.quant.tRAX` returns an `AnnData` object whose main matrix is tRNA fragment counts:
+`sa.quant.tRAX` returns an `AnnData` object. If the input has no existing variables, tRNA fragment counts become the main matrix:
 
 ```python
 adata.X                    # raw counts, samples x tRNA fragment features
 adata.layers["tRAXcount"]  # same raw count matrix
 ```
+
+If the input already contains an expression matrix, for example miRNA counts in `adata.X`, the existing matrix is preserved and tRAX counts are stored separately:
+
+```python
+adata.obsm["tRAXcount"]    # raw tRNA fragment counts
+adata.uns["tRAX_var"]      # feature metadata for columns in obsm["tRAXcount"]
+```
+
+Use `replace_x=True` only when you explicitly want tRAX counts to replace the current `adata.X` and `adata.var`.
 
 Feature annotations:
 
@@ -197,6 +206,28 @@ The parsed count file is:
 ```python
 adata = sa.fastq.cutadapt(adata, adapter_3="TGGAATTCTCGGGTGCCAAGG")
 adata = sa.quant.tRAX(adata, databasename="ref/tRNAdb/hg38")
+```
+
+**CORRECT - preserve existing miRNA matrix and add tRAX counts separately:**
+
+```python
+# Existing adata.X contains miRNA counts
+adata = sa.quant.tRAX(
+    adata,
+    databasename="ref/tRNAdb/hg38",
+)
+print(adata.X.shape)                 # unchanged miRNA matrix
+print(adata.obsm["tRAXcount"].shape) # tRNA fragment matrix
+```
+
+**CORRECT - explicitly replace X with tRAX counts:**
+
+```python
+adata = sa.quant.tRAX(
+    adata,
+    databasename="ref/tRNAdb/hg38",
+    replace_x=True,
+)
 ```
 
 **CORRECT - use `fastq_dir` to match only locally available samples:**
