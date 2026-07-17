@@ -834,12 +834,6 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
         decision: Optional[Dict[str, Any]] = None
         if approval_mode == "smart":
-            on_progress(
-                {
-                    "type": "status",
-                    "message": "监管者正在评估代码风险…",
-                }
-            )
             decision = assess_code_risk(
                 code,
                 description=description,

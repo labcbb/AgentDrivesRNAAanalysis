@@ -147,6 +147,15 @@ def summarize_ledger_for_prompt(chat_id: str, *, max_events: int = 40) -> str:
         msg = item.get("message") or item.get("summary") or item.get("name") or ""
         extra = item.get("detailPreview") or item.get("codePreview") or ""
         line = f"- [{item.get('at')}] {kind}: {msg}".rstrip()
+        statuses = item.get("planStepStatuses")
+        if isinstance(statuses, list) and statuses:
+            bits = []
+            for s in statuses:
+                if not isinstance(s, dict):
+                    continue
+                bits.append(f"{s.get('title') or s.get('id')}={s.get('status')}")
+            if bits:
+                line += " | plan=[" + ", ".join(bits) + "]"
         if extra:
             line += f" | {str(extra)[:180]}"
         lines.append(line)

@@ -11,52 +11,37 @@ from typing import Any, Dict, Iterator, List, Optional
 from session_errors import load_session_errors
 from session_memory import load_session_memory
 from session_plan import load_plan, plan_progress_summary
-from session_store import _read_json, _write_json, ensure_session_dir, load_kernel_state, sanitize_chat_id
+from session_store import (
+    _read_json,
+    _write_json,
+    ensure_session_dir,
+    load_chat_record,
+    load_kernel_state,
+    sanitize_chat_id,
+)
 from run_ledger import load_run_ledger, summarize_ledger_for_prompt
-from supervisor_skills import build_skill_gate_prompt, summarize_chat_for_confirmation
+from supervisor_skills import assess_skill_confirmation_gates
+from work_space import get_work_space
 
 logger = logging.getLogger(__name__)
 
 _REPORT_FILE = "run_report.json"
 _SUPERVISOR_META = "supervisor_meta.json"
-_ASSESS_TIMEOUT_HINT_SEC = 25
-_FORCE_ESCALATE_PATTERNS = (
-    re.compile(r"\brm\s+-rf\b", re.I),
-    re.compile(r"\bshutil\.rmtree\b", re.I),
-    re.compile(r"\bos\.remove\b", re.I),
-    re.compile(r"\bos\.unlink\b", re.I),
-    re.compile(r"\bpathlib\.Path\([^)]*\)\.unlink\b", re.I),
-    re.compile(r"\bDROP\s+(TABLE|DATABASE)\b", re.I),
-    re.compile(r"\bDELETE\s+FROM\b", re.I),
-    re.compile(r"/etc/|/usr/bin|/boot\b", re.I),
-    re.compile(r"\bsubprocess\.(?:call|run|Popen)\b[^\n]*shell\s*=\s*True", re.I),
-    re.compile(r"\beval\s*\(", re.I),
-    re.compile(r"\bexec\s*\(", re.I),
-    re.compile(r"\b__import__\s*\(\s*['\"]os['\"]", re.I),
-    re.compile(r"curl\s+[^\n]*\|\s*(?:ba)?sh", re.I),
-    re.compile(r"wget\s+[^\n]*\|\s*(?:ba)?sh", re.I),
-)
 _FORCE_DENY_PATTERNS = (
     re.compile(r"rm\s+-rf\s+/\s*$", re.I | re.M),
     re.compile(r"rm\s+-rf\s+/(\s|$)", re.I),
     re.compile(r":\(\)\s*\{\s*:\|:&\s*\}\s*;?", re.I),  # fork bomb
 )
 
-_SYSTEM_RISK = """你是 sRNAgent 的监管者（Supervisor）。只做代码风险审查，不要执行代码。
-根据将要在 Jupyter 中执行的代码，以及附带的 Skill 用户确认门槛与最近对话，输出严格 JSON（不要 markdown 围栏）：
-{
-  "level": "low|medium|high|critical",
-  "action": "allow|escalate|deny",
-  "reason": "一句话中文理由"
-}
-规则：
-- allow：普通分析（读文件、pandas、绘图、既有 sRNAgent API、写工作区内结果），且已满足相关 Skill 的用户确认门槛
-- escalate：可能删改重要数据、外网下载、安装包、改权限、大范围写盘；或代码触发 Skill 门槛但对话中未见用户确认（adapter、建库方案、分组、novel miRNA、QC 后继续等）→ 交给人工
-- deny：明显破坏性命令（如 rm -rf /、fork bomb）
-宁严勿松。仅输出 JSON。"""
+_SYSTEM_CHAT = """你是 sRNAgent 监管者（旁路只读 Agent）。你综合下列只读证据回答用户关于主任务进度与产物的问题：
+主会话对话、Thinking 步骤、执行计划状态、运行账本、会话产物/错误、内核变量摘要、工作区文件快照（含相对上次是否新增/增大）。
 
-_SYSTEM_CHAT = """你是 sRNAgent 监管者。你只读运行账本/计划/内存/错误/内核变量摘要，回答用户关于当前任务进度与产物的问题。
-禁止声称你执行了代码或修改了环境。用简洁中文回答，必要时列出步骤与路径。"""
+硬性规则：
+- 禁止声称你执行了代码、修改了环境或与主 Agent 抢写内核。
+- 回答进度时，以「计划步骤 status」和最近运行账本为准；若对话/thinking 与计划冲突，说明冲突并优先采信更新时间更近的计划/账本。
+- 提到文件时给出相对工作区路径；若证据不足就直说不确定，不要编造。
+- 用简洁中文回答。"""
+
 
 _SYSTEM_REPORT = """你是 sRNAgent 监管者。根据提供的运行证据生成结构化运行报告 JSON（不要 markdown 围栏）：
 {
@@ -202,6 +187,7 @@ def save_supervisor_meta(chat_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def hard_rule_assess(code: str) -> Optional[Dict[str, Any]]:
+    """Only hard-deny catastrophic patterns. No LLM / risk scoring."""
     text = str(code or "")
     if not text.strip():
         return {"level": "low", "action": "allow", "reason": "空代码", "source": "rule"}
@@ -211,14 +197,6 @@ def hard_rule_assess(code: str) -> Optional[Dict[str, Any]]:
                 "level": "critical",
                 "action": "deny",
                 "reason": f"命中强制拒绝规则：{pattern.pattern}",
-                "source": "rule",
-            }
-    for pattern in _FORCE_ESCALATE_PATTERNS:
-        if pattern.search(text):
-            return {
-                "level": "high",
-                "action": "escalate",
-                "reason": f"命中强制人工规则：{pattern.pattern}",
                 "source": "rule",
             }
     return None
@@ -267,102 +245,24 @@ def assess_code_risk(
     llm_body: Optional[Dict[str, Any]] = None,
     chat_id: str = "",
 ) -> Dict[str, Any]:
-    """Return {level, action, reason, source}."""
+    """Fast approval gate: hard-deny + Skill confirmation only (no LLM risk review).
+
+    Returns {level, action, reason, source}.
+    """
+    _ = description, llm_body, chat_id  # kept for call-site compatibility
     ruled = hard_rule_assess(code)
     if ruled is not None:
         return ruled
 
-    if not llm_body:
-        return {
-            "level": "medium",
-            "action": "escalate",
-            "reason": "无 LLM 配置，降级为人工审批",
-            "source": "fallback",
-        }
+    gated = assess_skill_confirmation_gates(code)
+    if gated is not None:
+        return gated
 
-    context_bits = []
-    if description:
-        context_bits.append(f"描述：{description}")
-    if chat_id:
-        plan = load_plan(chat_id)
-        if plan:
-            context_bits.append(f"计划进度：{plan_progress_summary(plan)}")
-        context_bits.append(summarize_ledger_for_prompt(chat_id, max_events=12))
-        chat_summary = summarize_chat_for_confirmation(chat_id)
-        if chat_summary:
-            context_bits.append(chat_summary)
-
-    skill_gates = build_skill_gate_prompt(code)
-    system_prompt = _SYSTEM_RISK
-    if skill_gates:
-        system_prompt += "\n\n" + skill_gates
-
-    user_prompt = (
-        "\n".join(context_bits)
-        + "\n\n即将执行的代码：\n```python\n"
-        + str(code)[:4000]
-        + "\n```"
-    )
-
-    result_box: Dict[str, Any] = {}
-    error_box: Dict[str, str] = {}
-
-    def _worker() -> None:
-        try:
-            client = _build_client(llm_body)
-            completion = client.complete(
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                tools=None,
-                enable_thinking=False,
-            )
-            parsed = _parse_json_object(completion.content)
-            if not parsed:
-                error_box["error"] = "监管者返回非 JSON"
-                return
-            action = str(parsed.get("action") or "escalate").strip().lower()
-            if action not in {"allow", "escalate", "deny"}:
-                action = "escalate"
-            level = str(parsed.get("level") or "medium").strip().lower()
-            if level not in {"low", "medium", "high", "critical"}:
-                level = "medium"
-            result_box.update(
-                {
-                    "level": level,
-                    "action": action,
-                    "reason": str(parsed.get("reason") or "监管者评估完成"),
-                    "source": "supervisor",
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            error_box["error"] = str(exc)
-
-    thread = threading.Thread(target=_worker, daemon=True)
-    thread.start()
-    thread.join(timeout=_ASSESS_TIMEOUT_HINT_SEC)
-    if thread.is_alive():
-        return {
-            "level": "medium",
-            "action": "escalate",
-            "reason": "监管者评估超时，降级为人工审批",
-            "source": "timeout",
-        }
-    if error_box:
-        return {
-            "level": "medium",
-            "action": "escalate",
-            "reason": f"监管者评估失败：{error_box['error']}",
-            "source": "error",
-        }
-    if result_box:
-        return result_box
     return {
-        "level": "medium",
-        "action": "escalate",
-        "reason": "监管者无结果，降级为人工审批",
-        "source": "fallback",
+        "level": "low",
+        "action": "allow",
+        "reason": "未触发 Skill 强制确认门槛，自动放行",
+        "source": "skill_gate",
     }
 
 
@@ -372,22 +272,42 @@ def build_supervisor_context(chat_id: str) -> str:
     memory = load_session_memory(chat_id)
     errors = load_session_errors(chat_id)
     kernel = load_kernel_state(chat_id) or {}
-    ledger = summarize_ledger_for_prompt(chat_id, max_events=50)
+    meta = load_supervisor_meta(chat_id)
+    prev_ws = meta.get("workspaceSnapshot") if isinstance(meta.get("workspaceSnapshot"), dict) else {}
+    ledger = summarize_ledger_for_prompt(chat_id, max_events=60)
     parts = [
         f"chatId: {chat_id}",
         f"计划：{plan_progress_summary(plan) if plan else '无'}",
         ledger,
     ]
     if plan and isinstance(plan.get("steps"), list):
-        parts.append("计划步骤：")
-        for step in plan["steps"]:
-            parts.append(
-                f"- [{step.get('status')}] {step.get('title') or step.get('id')}: "
-                f"{str(step.get('result') or '')[:200]}"
-            )
+        parts.append("## 计划步骤（以 status 为准判断当前阶段）")
+        running = []
+        for idx, step in enumerate(plan["steps"], start=1):
+            if not isinstance(step, dict):
+                continue
+            status = str(step.get("status") or "pending")
+            title = step.get("title") or step.get("id") or f"step-{idx}"
+            result = str(step.get("result") or "")[:240]
+            line = f"- 步骤{idx} [{status}] {title}"
+            if result:
+                line += f"：{result}"
+            parts.append(line)
+            if status == "running":
+                running.append(f"步骤{idx}:{title}")
+        if running:
+            parts.append("当前正在进行：" + "；".join(running))
+        elif plan["steps"]:
+            done_n = sum(1 for s in plan["steps"] if isinstance(s, dict) and s.get("status") == "done")
+            parts.append(f"当前没有 running 步骤；已完成 {done_n}/{len(plan['steps'])}。")
+
+    chat_block = _summarize_main_chat(chat_id)
+    if chat_block:
+        parts.append(chat_block)
+
     arts = memory.get("artifacts") or []
     if arts:
-        parts.append("产物：\n- " + "\n- ".join(str(a) for a in arts[:40]))
+        parts.append("会话登记产物：\n- " + "\n- ".join(str(a) for a in arts[:40]))
     err_events = errors.get("events") if isinstance(errors, dict) else None
     if isinstance(err_events, list) and err_events:
         parts.append("错误记录：")
@@ -395,11 +315,147 @@ def build_supervisor_context(chat_id: str) -> str:
             parts.append(f"- {item.get('kind')}: {item.get('summary')}")
     variables = kernel.get("variables") if isinstance(kernel.get("variables"), list) else []
     if variables:
-        parts.append("内核变量摘要：")
+        parts.append("内核变量摘要（只读）：")
         for item in variables[:30]:
             if isinstance(item, dict):
-                parts.append(f"- {item.get('name')}: {item.get('type')} · {str(item.get('preview') or '')[:80]}")
+                parts.append(
+                    f"- {item.get('name')}: {item.get('type')} · {str(item.get('preview') or '')[:80]}"
+                )
+
+    ws_text, ws_snapshot = _summarize_workspace(prev_snapshot=prev_ws)
+    if ws_text:
+        parts.append(ws_text)
+    # Persist snapshot for next branch question (growth detection). Keep other meta.
+    try:
+        save_supervisor_meta(
+            chat_id,
+            {
+                **{k: v for k, v in meta.items() if k not in {"chatId", "role", "updatedAt"}},
+                "workspaceSnapshot": ws_snapshot,
+                "parentChatId": chat_id,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("workspace snapshot save skipped: %s", exc)
+
     return "\n".join(parts)
+
+
+def _summarize_main_chat(chat_id: str, *, max_messages: int = 18, max_thinking: int = 10) -> str:
+    """Main dialog + thinking stream from persisted chat.json (readonly)."""
+    try:
+        chat = load_chat_record(chat_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("main chat unavailable for %s: %s", chat_id, exc)
+        return ""
+    if not chat:
+        return ""
+    messages = chat.get("messages") if isinstance(chat.get("messages"), list) else []
+    if not messages:
+        return ""
+
+    lines = ["## 主会话对话与 Thinking（只读；进度冲突时让位于计划/账本）"]
+    for item in messages[-max_messages:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        content = str(item.get("content") or "").strip()
+        if role not in {"user", "assistant"}:
+            continue
+        label = "用户" if role == "user" else "助手"
+        if content:
+            lines.append(f"- {label}: {content[:700]}")
+        steps = item.get("thinkingSteps") if isinstance(item.get("thinkingSteps"), list) else []
+        if role == "assistant" and steps:
+            lines.append("  Thinking:")
+            for step in steps[-max_thinking:]:
+                if isinstance(step, str):
+                    lines.append(f"  · {step[:240]}")
+                    continue
+                if not isinstance(step, dict):
+                    continue
+                title = str(step.get("title") or step.get("kind") or "step").strip()
+                body = str(step.get("body") or step.get("content") or step.get("text") or "").strip()
+                bit = f"  · [{title}] {body}".rstrip()
+                lines.append(bit[:320])
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _summarize_workspace(
+    *,
+    prev_snapshot: Optional[Dict[str, Any]] = None,
+    max_files: int = 45,
+) -> tuple[str, Dict[str, Any]]:
+    """List recent work_space files (exclude sessions/) and diff vs previous snapshot."""
+    root = get_work_space()
+    prev = prev_snapshot if isinstance(prev_snapshot, dict) else {}
+    files: List[Dict[str, Any]] = []
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                rel = path.relative_to(root)
+            except ValueError:
+                continue
+            parts = rel.parts
+            if not parts or parts[0] in {"sessions", ".git", "__pycache__", ".ipynb_checkpoints"}:
+                continue
+            if any(p.startswith(".") and p not in {".claude"} for p in parts[:-1]):
+                # skip hidden dirs but allow files under .claude/skills etc. only if needed
+                if parts[0].startswith(".") and parts[0] != ".claude":
+                    continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            files.append(
+                {
+                    "path": str(rel).replace("\\", "/"),
+                    "size": int(st.st_size),
+                    "mtime": float(st.st_mtime),
+                    "mtimeIso": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(
+                        timespec="seconds"
+                    ),
+                }
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("workspace scan failed: %s", exc)
+        return "", {}
+
+    files.sort(key=lambda x: x["mtime"], reverse=True)
+    snapshot = {
+        item["path"]: {"size": item["size"], "mtime": item["mtime"]} for item in files[:200]
+    }
+
+    new_files: List[str] = []
+    grew_files: List[str] = []
+    for item in files[:max_files]:
+        old = prev.get(item["path"]) if isinstance(prev.get(item["path"]), dict) else None
+        if old is None and prev:
+            new_files.append(f"{item['path']} ({item['size']} B)")
+        elif isinstance(old, dict) and int(old.get("size") or 0) < item["size"]:
+            grew_files.append(
+                f"{item['path']} {int(old.get('size') or 0)}→{item['size']} B"
+            )
+
+    lines = ["## 工作区文件快照（只读，已排除 sessions/）"]
+    lines.append(f"工作区根目录：{root}")
+    lines.append(f"扫描到文件数：{len(files)}（下列为按修改时间最近的 {min(len(files), max_files)} 个）")
+    if prev:
+        if new_files:
+            lines.append("相对上次监管者查看：新增 " + "；".join(new_files[:15]))
+        if grew_files:
+            lines.append("相对上次监管者查看：增大 " + "；".join(grew_files[:15]))
+        if not new_files and not grew_files:
+            lines.append("相对上次监管者查看：未见明显新增/增大（在最近文件窗口内）")
+    else:
+        lines.append("（首次快照，尚无增量对比）")
+
+    for item in files[:max_files]:
+        lines.append(f"- {item['path']}  {item['size']} B  mtime={item['mtimeIso']}")
+
+    return "\n".join(lines), snapshot
 
 
 def answer_supervisor_question(
@@ -455,12 +511,14 @@ def stream_supervisor_chat(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         yield {"type": "error", "message": str(exc)}
         return
 
-    yield {"type": "status", "message": "监管者正在查阅运行账本…"}
+    yield {"type": "status", "message": "监管者正在查阅主会话 / Thinking / 计划 / 工作区…"}
     try:
         text = answer_supervisor_question(chat_id, question, llm_body=body, history=history)
+        prev_meta = load_supervisor_meta(chat_id)
         save_supervisor_meta(
             chat_id,
             {
+                **{k: v for k, v in prev_meta.items() if k not in {"chatId", "role", "updatedAt"}},
                 "parentChatId": chat_id,
                 "lastQuestion": question[:500],
                 "lastAnswerPreview": text[:500],
