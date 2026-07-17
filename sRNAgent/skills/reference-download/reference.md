@@ -58,6 +58,27 @@ result = sa.reference.download_ncrna(
 print(f"ncRNA: {result['ncrna']}")
 ```
 
+## Download human miRBase data
+
+```python
+import sRNAgent as sa
+
+# Download all-species FASTA + extract human
+result = sa.reference.download_mirbase("hsa", output_dir="ref", jobs=4)
+# Files kept: ref/hairpin.fa.gz, ref/mature.fa.gz
+# Extracted: ref/hairpin_hsa.fa, ref/mature_hsa.fa, ref/hsa.gff3
+```
+
+## Extract mouse from existing all-species files (no re-download)
+
+```python
+import sRNAgent as sa
+
+# Directly extract from ref/hairpin.fa.gz / ref/mature.fa.gz
+result = sa.reference.download_mirbase("mmu", output_dir="ref", extract_only=True)
+# Only creates: ref/hairpin_mmu.fa, ref/mature_mmu.fa
+```
+
 ## Download mouse (GRCm39) genome + GTF + ncRNA
 
 ```python
@@ -76,13 +97,17 @@ import sRNAgent as sa
 sa.reference.download_genome("danio_rerio", output_dir="ref", jobs=8)
 ```
 
-## Complete: download all human reference data
+## Download human genome + ncRNA (GTF on-demand)
 
 ```python
 import sRNAgent as sa
 
 # ── Download all in one batch ──
 sa.reference.download_genome("homo_sapiens", output_dir="ref", jobs=8)
+sa.reference.download_ncrna("homo_sapiens", output_dir="ref", jobs=4)
+# GTF only if needed:
+# sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
+```
 sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
 sa.reference.download_ncrna("homo_sapiens", output_dir="ref", jobs=4)
 

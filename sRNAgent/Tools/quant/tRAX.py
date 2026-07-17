@@ -12,6 +12,7 @@ from anndata import AnnData
 
 from ..._registry import register_function
 from ..._utils import run_cli_cmd
+from ._matrix import store_count_matrix
 
 
 FASTQ_SUFFIXES = (".fastq.gz", ".fq.gz", ".fastq", ".fq")
@@ -216,36 +217,9 @@ def _read_trax_counts(counts_path: str | Path) -> pd.DataFrame:
     return pd.DataFrame(values, index=rows, columns=header, dtype=np.float64)
 
 
-def _adata_with_trax_counts(adata: AnnData, counts_path: str | Path) -> AnnData:
-    counts = _read_trax_counts(counts_path)
-    missing = [sample for sample in adata.obs_names if sample not in counts.columns]
-    if missing:
-        raise ValueError(
-            "tRAX count matrix is missing samples from adata.obs_names: "
-            + ", ".join(missing)
-        )
-
-    counts = counts.loc[:, list(adata.obs_names)]
-    matrix = counts.T.to_numpy(dtype=np.float64)
-
-    parsed = [_split_trax_feature(feature) for feature in counts.index]
-    var = pd.DataFrame(index=counts.index)
-    var["trax_feature_id"] = counts.index
-    var["trna_id"] = [item[0] for item in parsed]
-    var["fragment_type"] = [item[1] for item in parsed]
-
-    quantified = AnnData(X=matrix, obs=adata.obs.copy(), var=var)
-    quantified.layers["tRAXcount"] = matrix.copy()
-    quantified.uns.update(adata.uns)
-    quantified.uns["trax_count_matrix"] = str(Path(counts_path).resolve())
-    return quantified
-
-
 def _store_trax_counts(
     adata: AnnData,
     counts_path: str | Path,
-    *,
-    replace_x: Optional[bool],
 ) -> AnnData:
     counts = _read_trax_counts(counts_path)
     missing = [sample for sample in adata.obs_names if sample not in counts.columns]
@@ -258,20 +232,14 @@ def _store_trax_counts(
     counts = counts.loc[:, list(adata.obs_names)]
     matrix = counts.T.to_numpy(dtype=np.float64)
     parsed = [_split_trax_feature(feature) for feature in counts.index]
-    trax_var = {
-        "trax_feature_id": list(counts.index),
-        "trna_id": [item[0] for item in parsed],
-        "fragment_type": [item[1] for item in parsed],
-    }
+    trax_var = pd.DataFrame(index=counts.index)
+    trax_var["trax_feature_id"] = list(counts.index)
+    trax_var["trna_id"] = [item[0] for item in parsed]
+    trax_var["fragment_type"] = [item[1] for item in parsed]
 
-    should_replace = adata.n_vars == 0 if replace_x is None else replace_x
-    if should_replace:
-        return _adata_with_trax_counts(adata, counts_path)
-
-    adata.obsm["tRAXcount"] = matrix
-    adata.uns["tRAX_var"] = trax_var
-    adata.uns["trax_count_matrix"] = str(Path(counts_path).resolve())
-    return adata
+    stored = store_count_matrix(adata, matrix, trax_var, rna_type="tRNA")
+    stored.uns["trax_count_matrix"] = str(Path(counts_path).resolve())
+    return stored
 
 
 @register_function(
@@ -288,8 +256,8 @@ def _store_trax_counts(
         "bundled tRAX processesamples.py workflow. Input FASTQs are copied to "
         "adata.obs['trax_fq'] from adata.obs['clean_fastq_path'] first, then "
         "adata.obs['fastq_path'], and finally by matching fastq_dir basenames "
-        "to adata.obs_names. If AnnData already contains an expression matrix, "
-        "counts are stored in adata.obsm['tRAXcount'] unless replace_x=True."
+        "to adata.obs_names. Counts are merged into the shared "
+        "adata.layers['counts'] expression matrix."
     ),
     examples=[
         (
@@ -323,7 +291,6 @@ def trax_quant(
     skipfqcheck: bool = False,
     path_col: Optional[str] = None,
     replicate_col: Optional[str] = None,
-    replace_x: Optional[bool] = None,
 ) -> AnnData:
     """Run tRAX tRNA fragment quantification from an AnnData object.
 
@@ -331,9 +298,9 @@ def trax_quant(
     when files are named ``hg38-trnatable.txt`` etc. The selected FASTQ paths
     are stored in ``adata.obs["trax_fq"]``; existing FASTQ columns are not
     overwritten. Samples without a usable tRAX FASTQ path are dropped from the
-    returned AnnData object. If ``replace_x`` is None, ``adata.X`` is replaced
-    only when ``adata`` has no variables; otherwise tRAX counts are added to
-    ``adata.obsm["tRAXcount"]`` with metadata in ``adata.uns["tRAX_var"]``.
+    returned AnnData object. tRAX counts are merged into the shared
+    ``adata.layers["counts"]`` matrix and annotated with
+    ``adata.var["rna_type"]``.
     """
     if not isinstance(adata, AnnData):
         raise TypeError("adata must be an AnnData object")
@@ -424,7 +391,7 @@ def trax_quant(
     if maponly:
         return adata
 
-    quantified = _store_trax_counts(adata, trna_counts, replace_x=replace_x)
+    quantified = _store_trax_counts(adata, trna_counts)
     quantified.uns["trax_result"] = result
     return quantified
 

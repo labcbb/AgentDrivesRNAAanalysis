@@ -18,7 +18,7 @@ It is **not** the right method for BAM files aligned to a whole reference genome
 |------|------|----------|---------|
 | 1 | Bowtie | `sa.alignment.bowtie` | Align sRNA reads to a small-RNA FASTA index |
 | 2 | samtools idxstats | `sa.quant.idxstats` | Count reads mapped to each reference sequence |
-| 3 | AnnData writer | `sa.quant.idxstats` | Write counts to `adata.X` and `adata.layers["idxstats"]` |
+| 3 | AnnData writer | `sa.quant.idxstats` | Write counts to the shared `adata.layers["counts"]` |
 
 Typical workflow:
 
@@ -32,7 +32,7 @@ bowtie-build
 FASTQ -> bowtie -> BAM
     |
     v
-samtools idxstats -> adata.X
+samtools idxstats -> adata.layers["counts"]
 ```
 
 ## Requirements
@@ -124,30 +124,23 @@ adata = sa.quant.idxstats(
 |-----------------|---------|---------------------|
 | 1 | Reference sequence name, e.g. a specific tRNA ID | `adata.var["reference_name"]` and `adata.var_names` |
 | 2 | Reference sequence nucleotide length | `adata.var["reference_length"]` |
-| 3 | Reads mapped to that reference | `adata.X`, `adata.layers["idxstats"]` |
+| 3 | Reads mapped to that reference | `adata.X`, `adata.layers["counts"]` |
 | 4 | Unmapped reads for that reference | ignored |
 
-If the input has no existing variables, returned `AnnData` fields are:
+Returned `AnnData` fields:
 
 ```python
 adata.X
-adata.layers["idxstats"]
+adata.layers["counts"]
 adata.var["reference_name"]
 adata.var["reference_length"]
+adata.var["rna_type"]
 adata.obs["idxstats_bam"]
 adata.obs["idxstats_file"]
 adata.uns["idxstats_result"]
 ```
 
-If the input already has an expression matrix, for example miRNA counts in `adata.X`, the existing matrix is preserved:
-
-```python
-adata.obsm["idxstats"]      # idxstats mapped-read matrix
-adata.uns["idxstats_var"]   # reference metadata for columns in obsm["idxstats"]
-adata.uns["idxstats_result"]
-```
-
-Use `replace_x=True` only when you explicitly want idxstats counts to replace the current `adata.X` and `adata.var`.
+If `adata.layers["counts"]` already contains the same `rna_type`, that block is replaced. If it contains a different RNA type, the new features are appended.
 
 ## Correct Usage
 
@@ -156,16 +149,16 @@ Use `replace_x=True` only when you explicitly want idxstats counts to replace th
 ```python
 sa.alignment.bowtie_build("ref/mature_tRNAs.fa", "ref/mature_tRNAs")
 adata = sa.alignment.bowtie(adata, index_basename="ref/mature_tRNAs")
-adata = sa.quant.idxstats(adata)
+adata = sa.quant.idxstats(adata, rna_type="tRNA")
 ```
 
 **CORRECT - preserve existing expression and add idxstats separately:**
 
 ```python
-# Existing adata.X contains miRNA or other counts
-adata = sa.quant.idxstats(adata)
-print(adata.X.shape)                # unchanged
-print(adata.obsm["idxstats"].shape) # new small-RNA reference count matrix
+# Existing adata.X/layers["counts"] contains miRNA or other counts
+adata = sa.quant.idxstats(adata, rna_type="piRNA")
+print(adata.layers["counts"].shape) # merged expression matrix
+print(adata.var["rna_type"].value_counts())
 ```
 
 **CORRECT - piRBase FASTA reference:**

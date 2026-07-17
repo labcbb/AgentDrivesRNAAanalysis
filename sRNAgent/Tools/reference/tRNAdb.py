@@ -17,7 +17,7 @@ from typing import Dict, Iterable, Optional
 
 from ..._registry import register_function
 from ..._utils import run_cli_cmd
-from . import genome
+from .util import resumable_download
 
 
 TRAX_GTF_FEATURE_TERMS = (
@@ -282,7 +282,7 @@ def download_trax_human_gtf(
     filename = genome._find_ensembl_gtf_file(species, assembly)
     url = f"{genome.GTF_BASE}/{genome._species_dirname(species)}/{filename}"
     source_gtf = Path(
-        genome.resumable_download(url, out_dir / filename, jobs=jobs, force=force)
+        resumable_download(url, out_dir / filename, jobs=jobs, force=force)
     )
 
     filtered_gtf = out_dir / output_name
@@ -347,7 +347,7 @@ def download_trnascan_hg38(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     archive = Path(
-        genome.resumable_download(
+        resumable_download(
             TRNASCAN_HG38_URL,
             out_dir / "hg38-tRNAs.tar.gz",
             jobs=jobs,

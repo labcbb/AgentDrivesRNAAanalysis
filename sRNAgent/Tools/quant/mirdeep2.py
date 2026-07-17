@@ -26,6 +26,7 @@ from anndata import AnnData
 
 from ..._registry import register_function
 from ..._utils import run_cli_cmd, run_threads
+from ._matrix import store_count_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +394,9 @@ def _build_sample_list(adata: AnnData) -> List[Tuple[str, str]]:
         "to preprocess and map reads, then ``quantifier.pl`` to quantify "
         "known miRNAs against miRBase. Writes results into the AnnData "
         "object: ``adata.obs`` (collapsed_path, arf_path, counts_csv), "
-        "``adata.X`` (count matrix, samples x miRNAs), "
-        "``adata.var['mirna_id']``, and ``adata.uns`` (reference paths)."
+        "``adata.X`` and ``adata.layers['counts']`` (count matrix, samples x "
+        "miRNA features), ``adata.var['mirna_id']``, and ``adata.uns`` "
+        "(reference paths)."
     ),
     examples=[
         "sa.quant.quantify_mirna(adata, genome_index='grch38', "
@@ -475,7 +477,7 @@ def quantify_mirna(
     -------
     AnnData
         The input ``adata`` with results written to ``.obs``, ``.X``,
-        ``.layers["counts"]`` (raw counts backup),
+        ``.layers["counts"]`` (shared raw counts),
         ``.layers["logcpm"]`` (log2(CPM+1)), ``.var``, and ``.uns``.
     """
     sample_list = _build_sample_list(adata)
@@ -531,14 +533,19 @@ def quantify_mirna(
         if "counts_csv" in r:
             adata.obs.loc[sample_name, "counts_csv"] = r["counts_csv"]
 
-    # Assign count matrix and feature data
-    adata.X = count_matrix
-    adata.layers["counts"] = np.asarray(count_matrix, dtype=np.float64)
-    adata.var = pd.DataFrame(index=[f"mirna_{i}" for i in range(n_mirnas)])
-    adata.var["mirna_id"] = all_mirnas
+    # Assign count matrix and feature data. Same RNA type overwrites existing
+    # miRNA features; different RNA types are appended in the shared counts layer.
+    mirna_var = pd.DataFrame(index=all_mirnas)
+    mirna_var["mirna_id"] = all_mirnas
+    adata = store_count_matrix(
+        adata,
+        np.asarray(count_matrix, dtype=np.float64),
+        mirna_var,
+        rna_type="miRNA",
+    )
 
     # CPM normalization and log2(CPM+1) layer
-    adata.layers["logcpm"] = _compute_log_cpm(adata.X)
+    adata.layers["logcpm"] = _compute_log_cpm(adata.layers["counts"])
 
     # Store reference paths in uns
     adata.uns["genome_index"] = genome_index

@@ -21,7 +21,6 @@ adata = sa.quant.tRAX(
     skipfqcheck=False,
     path_col=None,
     replicate_col=None,
-    replace_x=None,
 )
 ```
 
@@ -38,7 +37,7 @@ adata = sa.quant.tRAX(
 | `bedfiles` | Optional extra BED feature files |
 | `cores` | tRAX internal parallelism |
 | `lazyremap` | Reuse existing BAMs when present |
-| `maponly` | Run mapping only; does not parse counts into `adata.X` |
+| `maponly` | Run mapping only; does not parse counts into the expression matrix |
 | `nofrag` | Omit fragment determination |
 | `maxmismatches` | Maximum allowed mismatches for counting |
 | `minnontrnasize` | Minimum read length for non-tRNA reads |
@@ -46,7 +45,6 @@ adata = sa.quant.tRAX(
 | `skipfqcheck` | Skip FASTQ-vs-BAM read group consistency checks |
 | `path_col` | Force a specific `adata.obs` column as FASTQ input |
 | `replicate_col` | Optional `adata.obs` column for tRAX replicate/group labels |
-| `replace_x` | `None` replaces X only for empty-var AnnData; `False` stores counts in `obsm`; `True` replaces X/var |
 
 ## FASTQ Resolution
 
@@ -112,14 +110,15 @@ trax_out/trax_quant/trax_quant-mapstats.txt
 
 ## AnnData Output
 
-After a full run on an AnnData object with no existing variables:
+After a full run:
 
 ```python
 adata.X
-adata.layers["tRAXcount"]
+adata.layers["counts"]
 adata.var["trax_feature_id"]
 adata.var["trna_id"]
 adata.var["fragment_type"]
+adata.var["rna_type"]
 adata.obs["trax_fq"]
 adata.obs["trax_bam"]
 adata.obs["trax_sample"]
@@ -128,18 +127,7 @@ adata.uns["trax_result"]
 adata.uns["trax_count_matrix"]
 ```
 
-`adata.X` and `adata.layers["tRAXcount"]` contain the same raw count matrix.
-
-If the input already has an expression matrix, tRAX results are stored without replacing it:
-
-```python
-adata.obsm["tRAXcount"]
-adata.uns["tRAX_var"]
-adata.uns["trax_result"]
-adata.uns["trax_count_matrix"]
-```
-
-Use `replace_x=True` to force tRAX counts into `adata.X`.
+`adata.X` and `adata.layers["counts"]` contain the same merged raw count matrix. `adata.var["rna_type"]` records whether each feature is `miRNA`, `tRNA`, or another small-RNA type. Re-running tRAX replaces the existing `tRNA` block and keeps other RNA types.
 
 ## Parsed Feature IDs
 

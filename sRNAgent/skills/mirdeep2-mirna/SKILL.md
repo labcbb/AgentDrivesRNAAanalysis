@@ -51,6 +51,13 @@ Before running miRDeep2, you need:
 - **Reference genome FASTA** — from `sa.reference.download_genome`
 - **miRBase data** — from `sa.reference.download_mirbase`
 
+Do not swap the miRBase FASTA arguments:
+
+- `mature_fa` must point to mature miRNA sequences, e.g. `ref/mature_hsa.fa`. These IDs usually look like `hsa-miR-1-3p` or `hsa-let-7a-5p`.
+- `hairpin_fa` must point to precursor / hairpin sequences, e.g. `ref/hairpin_hsa.fa`. These IDs usually look like `hsa-MIR1-1` or `hsa-MIR100`.
+
+If differential-expression features appear as precursor names such as `hsa-MIR100` when mature miRNA quantification was intended, first check whether `mature_fa` and `hairpin_fa` were passed in the wrong order.
+
 ### 数据准备示例
 
 ```python
@@ -68,7 +75,7 @@ sa.alignment.bowtie_build("ref/GRCh38.primary_assembly.genome.fa", "ref/grch38",
 
 ## Instructions
 
-> 💡 **推荐流程：优先使用 `quantify_mirna` 定量已知 miRNA。** 它对已知 miRNA 做表达定量，输出表达矩阵到 `adata.X`，速度快、结果可靠。
+> 💡 **推荐流程：优先使用 `quantify_mirna` 定量已知 miRNA。** 它对已知 miRNA 做表达定量，输出表达矩阵到 `adata.X` 和共享的 `adata.layers["counts"]`，速度快、结果可靠。
 >
 > `predict_mirna`（预测 novel miRNA）计算量大且结果需要人工验证，仅在有发现新 miRNA 需求时使用。**除非用户明确要求发现新 miRNA，否则默认走已知 miRNA 定量流程。**
 
@@ -389,10 +396,11 @@ print(f"Novel miRNA report: {adata.obs['prediction_html'].iloc[0]}")
 #   "arf_path"         : mirdeep2/S1_vs_genome.arf
 #   "counts_csv"       : mirdeep2/S1/miRNA_counts.csv
 
-# adata.X : count 矩阵 (n_samples × n_mirnas)
-# adata.layers["counts"] : 原始 count 备份 (与 adata.X 相同的数值)
+# adata.X : merged count 矩阵 (n_samples × all small-RNA features)
+# adata.layers["counts"] : 原始 count 矩阵
 # adata.layers["logcpm"] : log2(CPM+1) 标准化表达量 (CPM = counts per million)
 # adata.var["mirna_id"] : miRNA 名称, 如 hsa-let-7a-5p
+# adata.var["rna_type"] : miRNA
 
 # adata.uns["genome_index"] : "ref/grch38"
 # adata.uns["mature_fa"]    : "ref/mature_hsa.fa"
@@ -408,6 +416,7 @@ print(f"Novel miRNA report: {adata.obs['prediction_html'].iloc[0]}")
 - **mapper.pl 报 "Can't locate ..."**: miRDeep2 使用 Perl。确认 miRDeep2 已正确安装，且 Perl 模块路径已设置（`perl -e 'use Bio::Perl'`）。
 - **mapper.pl 找不到 Bowtie 索引**: `genome_index` 是 bowtie-build 输出的前缀路径（含路径），如 `ref/grch38`。确认 `.ebwt` 文件存在。
 - **quantifier.pl 报序列 ID 不匹配**: 从 miRBase 下载的 mature.fa 和 hairpin.fa 必须来自同一个 miRBase 版本。用 `download_mirbase` 自动获取即可保证一致。
+- **结果里是 `hsa-MIR*` 而不是 `hsa-miR-*`**: 很可能把 precursor/hairpin FASTA 传给了 `mature_fa`，或者用了旧的错误定量结果。`mature_fa` 应该是 `mature_hsa.fa`，`hairpin_fa` 才是 `hairpin_hsa.fa`。
 - **"No reads mapped"**: 检查 adapter 序列是否正确，以及 min_length 是否设得太高。sRNA-seq reads 通常 18-30 nt。
 - **miRDeep2.pl 输出为空**: 降低 `score_cutoff`，或提供 `related_mature_fa` 提高灵敏度。
 - **FASTQ.gz 处理**: `quantify_mirna` 和 `predict_mirna` 自动解压 .gz 文件到临时目录，运行后自动清理。

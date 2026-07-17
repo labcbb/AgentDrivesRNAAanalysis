@@ -16,8 +16,8 @@ This skill covers downloading genome reference data — **GENCODE** for human/mo
 |------|----------|---------|--------|
 | 1 | `sa.reference.list_species` | List available species in current Ensembl release | Ensembl |
 | 2 | `sa.reference.download_genome` | Download primary assembly FASTA + auto-generate ``.dict`` | **GENCODE** (human/mouse), Ensembl (others) |
-| 3 | `sa.reference.download_gtf` | Download GTF gene annotation file | **GENCODE** (human/mouse), Ensembl (others) |
-| 4 | `sa.reference.download_ncrna` | Download non-coding RNA FASTA | Ensembl (all species) |
+| 3 | `sa.reference.download_ncrna` | (按需) Download non-coding RNA FASTA | Ensembl (all species) |
+| — | `sa.reference.download_gtf` | (按需) Download GTF gene annotation | **GENCODE** (human/mouse), Ensembl (others) |
 
 **miRBase** tools (`sa.reference.*`):
 
@@ -128,9 +128,9 @@ sa.alignment.bowtie_build(
 sa.reference.download_genome("homo_sapiens", ...)
 ```
 
-### 3. 下载 GTF 注释文件（人类来自 GENCODE）
+### 3. 按需下载 GTF 注释文件
 
-人类基因组注释从 **GENCODE** 下载，命名为 `gencode.v{version}.primary_assembly.annotation.gtf.gz`（版本号自动发现）：
+仅当需要基因注释信息时才下载。人类基因组注释从 **GENCODE** 下载，命名为 `gencode.v{version}.primary_assembly.annotation.gtf.gz`（版本号自动发现）：
 
 ```python
 result = sa.reference.download_gtf(
@@ -234,6 +234,27 @@ result = sa.reference.download_mirbase(
     species="mmu",              # 小鼠
     output_dir="ref",
     extract_only=True,          # 只提取，不下
+)
+```
+
+**CORRECT — 优先策略：一次性下载全物种文件，后续只提取（推荐）：**
+
+```python
+# 第一次：下载 hairpin.fa.gz + mature.fa.gz（全物种），同时提取 human
+result = sa.reference.download_mirbase(
+    species="hsa", output_dir="ref", jobs=4,
+)
+# 下载后的文件:
+#   ref/hairpin.fa.gz   ← 全物种，保留不删
+#   ref/mature.fa.gz    ← 全物种，保留不删
+#   ref/hairpin_hsa.fa  ← 提取的人 hairpin
+#   ref/mature_hsa.fa   ← 提取的人 mature
+#   ref/hsa.gff3        ← 人 GFF3
+
+# 后续提取小鼠：直接利用已有全物种文件，无需重新下载
+result = sa.reference.download_mirbase(
+    species="mmu", output_dir="ref",
+    extract_only=True,          # 直接从已有 hairpin.fa.gz / mature.fa.gz 提取
 )
 ```
 
@@ -347,14 +368,18 @@ for code, name in list(species.items())[:10]:
 
 ### 10. 下载 piRNA FASTA
 
+默认下载完整 piRNA fasta 文件。**除非用户明确要求 gold standard，否则不要使用 `gold=True`。**
+
+**CORRECT — 默认下载完整 piRNA 集（所有 43 个物种都支持）：**
+
 ```python
-# 下载人类 piRNA 完整集
+# 下载人类 piRNA 完整集（默认行为）
 result = sa.reference.download_pirna("hsa", output_dir="ref", jobs=4)
 print(f"piRNA FASTA: {result['fasta']}")
 # piRNA FASTA: ref/hsa.piRNA.fa.gz
 ```
 
-**CORRECT — 下载 gold standard piRNA 集（仅部分物种可用）：**
+**仅当用户指定时 — 下载 gold standard piRNA 集（仅部分物种）：**
 
 ```python
 # Gold standard 仅适用于: hsa, mmu, dme, bta, rno, mfa
@@ -468,8 +493,8 @@ genome = sa.reference.download_genome(
     generate_dict=True,
 )
 
-# ── 下载 GTF 注释 ──
-gtf = sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
+# ── 按需下载 GTF 注释（仅当需要基因注释时）──
+# gtf = sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
 
 # ── 下载 ncRNA 序列 ──
 ncrna = sa.reference.download_ncrna("homo_sapiens", output_dir="ref", jobs=4)

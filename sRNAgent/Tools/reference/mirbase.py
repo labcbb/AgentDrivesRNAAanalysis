@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..._registry import register_function
-from ._utils import resumable_download
+from .util import resumable_download
 
 
 # ---------------------------------------------------------------------------

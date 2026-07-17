@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..._registry import register_function
-from ._utils import resumable_download
+from .util import resumable_download
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +136,10 @@ def _find_gencode_gtf(species: str) -> str:
         raise FileNotFoundError(
             f"No GENCODE primary assembly GTF found for '{species}' at {url}"
         )
+    # Prefer primary_assembly over chr_patch_hapl_scaff (which is alphabetically first)
+    primary = [f for f in candidates if "primary_assembly" in f]
+    if primary:
+        return primary[0]
     return candidates[0]
 
 

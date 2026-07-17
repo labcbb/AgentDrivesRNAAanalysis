@@ -138,3 +138,14 @@ sa.diff.de_analysis(
     control_group=None,       # first group alphabetically if None
 )
 ```
+
+## Output columns in `adata.uns["de_results"]`
+
+| Column | Description |
+|--------|-------------|
+| `log_fc` | log2 fold change (CPM-based, treatment vs control) |
+| `ave_expr` | average log2-CPM expression |
+| `t` | t-statistic |
+| `p_value` | nominal P-value |
+| `adj_p_value` | FDR (BH) adjusted P-value |
+| `b` | log-odds that gene is DE |

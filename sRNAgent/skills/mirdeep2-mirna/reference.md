@@ -12,6 +12,17 @@ sa.alignment.bowtie_build("ref/GRCh38.primary_assembly.genome.fa",
                           "ref/grch38", threads=8)
 ```
 
+## miRBase FASTA arguments
+
+Do not swap these two files:
+
+```python
+mature_fa="ref/mature_hsa.fa"   # mature miRNA IDs, e.g. hsa-miR-1-3p
+hairpin_fa="ref/hairpin_hsa.fa" # precursor IDs, e.g. hsa-MIR1-1
+```
+
+`quantify_mirna` passes `mature_fa` to miRDeep2 quantifier as mature miRNAs and `hairpin_fa` as precursors. If the output feature names are precursor-style `hsa-MIR*` IDs, check that `mature_fa` was not accidentally set to `hairpin_hsa.fa`.
+
 ## Init AnnData
 
 ```python

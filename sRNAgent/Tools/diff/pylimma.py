@@ -152,8 +152,8 @@ def de_analysis(
     AnnData
         The input ``adata`` with:
         - ``adata.uns["de_results"]`` — DataFrame with DE results for
-          all features (columns: ``log_fc``, ``ave_expr``, ``t``,
-          ``p_value``, ``adj_p_value``, ``b``).
+          all features (columns: ``log_fc`` (log2 fold change, CPM-based),
+          ``ave_expr``, ``t``, ``p_value``, ``adj_p_value``, ``b``).
         - ``adata.uns["de_params"]`` — dict with comparison metadata.
         - ``adata.layers["voom_E"]``, ``adata.layers["voom_weights"]``
           (from ``voom``).
@@ -246,7 +246,12 @@ def de_analysis(
 
     # ── 6. limma-voom pipeline ──
     pylimma.voom(adata, design=design.values)
-    pylimma.lm_fit(adata, design=design.values)
+    pylimma.lm_fit(
+        adata,
+        design=design.values,
+        layer="voom_E",
+        weights_layer="voom_weights",
+    )
     pylimma.contrasts_fit(adata, contrasts=contrast_matrix.values)
     pylimma.e_bayes(adata)
 

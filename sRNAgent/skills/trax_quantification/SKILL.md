@@ -15,7 +15,7 @@ Detailed API notes and output file examples are in `reference.md`.
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|
 | 1 | tRAX `processsamples.py` | `sa.quant.tRAX` | Map reads to a tRNAdb reference and count tRNA fragments |
-| 2 | tRAX `*-trnacounts.txt` parser | `sa.quant.tRAX` | Convert fragment counts into `adata.X`, `adata.var`, and `adata.layers["tRAXcount"]` |
+| 2 | tRAX `*-trnacounts.txt` parser | `sa.quant.tRAX` | Convert fragment counts into the shared `adata.layers["counts"]` matrix |
 
 Typical workflow:
 
@@ -153,21 +153,14 @@ adata = sa.quant.tRAX(
 
 ## Outputs
 
-`sa.quant.tRAX` returns an `AnnData` object. If the input has no existing variables, tRNA fragment counts become the main matrix:
+`sa.quant.tRAX` returns an `AnnData` object. tRNA fragment counts are stored in the shared expression matrix:
 
 ```python
-adata.X                    # raw counts, samples x tRNA fragment features
-adata.layers["tRAXcount"]  # same raw count matrix
+adata.X                    # raw counts, samples x all shared small-RNA features
+adata.layers["counts"]     # same raw count matrix
 ```
 
-If the input already contains an expression matrix, for example miRNA counts in `adata.X`, the existing matrix is preserved and tRAX counts are stored separately:
-
-```python
-adata.obsm["tRAXcount"]    # raw tRNA fragment counts
-adata.uns["tRAX_var"]      # feature metadata for columns in obsm["tRAXcount"]
-```
-
-Use `replace_x=True` only when you explicitly want tRAX counts to replace the current `adata.X` and `adata.var`.
+If `adata.layers["counts"]` already contains another RNA type, such as miRNA, tRNA features are appended. If it already contains tRNA features, the old tRNA block is replaced.
 
 Feature annotations:
 
@@ -175,6 +168,7 @@ Feature annotations:
 adata.var["trax_feature_id"]  # original row name from *-trnacounts.txt
 adata.var["trna_id"]          # parent tRNA ID
 adata.var["fragment_type"]    # wholecounts, fiveprime, threeprime, other
+adata.var["rna_type"]         # tRNA
 ```
 
 Per-sample paths:
@@ -208,26 +202,15 @@ adata = sa.fastq.cutadapt(adata, adapter_3="TGGAATTCTCGGGTGCCAAGG")
 adata = sa.quant.tRAX(adata, databasename="ref/tRNAdb/hg38")
 ```
 
-**CORRECT - preserve existing miRNA matrix and add tRAX counts separately:**
-
-```python
-# Existing adata.X contains miRNA counts
-adata = sa.quant.tRAX(
-    adata,
-    databasename="ref/tRNAdb/hg38",
-)
-print(adata.X.shape)                 # unchanged miRNA matrix
-print(adata.obsm["tRAXcount"].shape) # tRNA fragment matrix
-```
-
-**CORRECT - explicitly replace X with tRAX counts:**
+**CORRECT - preserve existing miRNA matrix and append tRAX counts in the shared layer:**
 
 ```python
 adata = sa.quant.tRAX(
     adata,
     databasename="ref/tRNAdb/hg38",
-    replace_x=True,
 )
+print(adata.layers["counts"].shape)  # merged expression matrix
+print(adata.var["rna_type"].value_counts())
 ```
 
 **CORRECT - use `fastq_dir` to match only locally available samples:**
@@ -250,7 +233,7 @@ adata = sa.quant.tRAX(
 )
 ```
 
-In `maponly=True` mode, `adata.X` is not replaced by tRNA fragment counts because no `*-trnacounts.txt` is parsed.
+In `maponly=True` mode, no tRNA fragment counts are written because no `*-trnacounts.txt` is parsed.
 
 ## Common Problems
 
