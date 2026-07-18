@@ -135,7 +135,10 @@ def _run_quantifier(
     """Quantify known miRNAs via quantifier.pl.
 
     quantifier.pl creates ``expression_analyses/expression_analyses_<ts>/``
-    in the directory where it is run. We run it inside ``output_dir/<sample>/``
+    in the directory where it is run, and also writes
+    ``miRNAs_expressed_all_samples_<ts>.csv`` (which some versions place in
+    the parent of the input FASTA instead of the CWD). We run it inside
+    ``output_dir/<sample>/`` and relocate the all-samples CSV on completion,
     so outputs stay organised per-sample.
     """
     out_dir = Path(output_dir)
@@ -165,6 +168,10 @@ def _run_quantifier(
         cmd.append("-U")
 
     run_cli_cmd(cmd, cwd=str(sample_dir))
+
+    # Relocate miRNAs_expressed_all_samples_*.csv into sample_dir
+    # (quantifier.pl may write it to output_dir/ instead of the CWD)
+    _relocate_all_samples_csv(out_dir, sample_dir)
 
     # Find the freshly created CSV
     raw_csv = _find_latest_quantifier_csv(sample_dir)
@@ -208,6 +215,33 @@ def _aggregate_mirna_counts(csv_path: Path) -> Dict[str, int]:
                 count = 0
             counts[mirna] += count
     return dict(counts)
+
+
+def _relocate_all_samples_csv(out_dir: Path, sample_dir: Path) -> None:
+    """Move ``miRNAs_expressed_all_samples_*.csv`` into ``sample_dir``.
+
+    Some versions of ``quantifier.pl`` write this file to the directory
+    containing the input collapsed FASTA (i.e. ``out_dir``) rather than
+    the CWD (``sample_dir``). This function finds the file wherever it
+    ended up and moves it into ``sample_dir``.
+    """
+    candidates = list(Path.cwd().glob("miRNAs_expressed_all_samples_*.csv"))
+    candidates.extend(out_dir.glob("miRNAs_expressed_all_samples_*.csv"))
+    candidates.extend(sample_dir.glob("miRNAs_expressed_all_samples_*.csv"))
+
+    seen: set[Path] = set()
+    for src in candidates:
+        resolved = src.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+
+        dest = sample_dir / src.name
+        if resolved == dest.resolve():
+            continue  # already in place
+
+        print(f"[quantifier.pl] Moving {src.name} -> {dest}", flush=True)
+        shutil.move(str(src), str(dest))
 
 
 def _build_quantifier_result(
