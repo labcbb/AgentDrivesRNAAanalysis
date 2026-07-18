@@ -20,8 +20,17 @@ from .util import resumable_download
 # ---------------------------------------------------------------------------
 
 MIRBASE_BASE = "https://www.mirbase.org/download"
-HAIRPIN_URL = f"{MIRBASE_BASE}/hairpin.fa"
-MATURE_URL = f"{MIRBASE_BASE}/mature.fa"
+
+# miRBase's download host is occasionally unreachable from compute nodes.  The
+# BioBricks DVC objects below are content-addressed mirrors of miRBase 22.1.
+HAIRPIN_URLS = (
+    "https://ins-dvc.s3.amazonaws.com/insdvc/files/md5/af/ade358ab4bd799414a0ae1948defbd",
+    f"{MIRBASE_BASE}/hairpin.fa",
+)
+MATURE_URLS = (
+    "https://ins-dvc.s3.amazonaws.com/insdvc/files/md5/c0/fbc0ae2aa8241afeae4b89fea9ed0f",
+    f"{MIRBASE_BASE}/mature.fa",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +98,28 @@ def _scan_species_codes(fasta_path: Path) -> List[str]:
                     codes.add(code)
 
     return sorted(codes)
+
+
+def _download_from_sources(
+    urls: tuple[str, ...],
+    destination: Path,
+    *,
+    jobs: int,
+    force: bool,
+) -> None:
+    """Download from the first working source, preserving the last error."""
+    last_error: Exception | None = None
+    for url in urls:
+        try:
+            resumable_download(url, destination, jobs=jobs, force=force)
+            return
+        except Exception as exc:
+            last_error = exc
+
+    assert last_error is not None
+    raise RuntimeError(
+        f"Failed to download miRBase data from {len(urls)} sources"
+    ) from last_error
 
 
 # ---------------------------------------------------------------------------
@@ -202,12 +233,16 @@ def download_mirbase(
     # ── Download all-species FASTA files ──
     if not extract_only and download_fasta:
         hairpin_local = out_dir / "hairpin.fa.gz"
-        resumable_download(HAIRPIN_URL, hairpin_local, jobs=jobs, force=force)
+        _download_from_sources(
+            HAIRPIN_URLS, hairpin_local, jobs=jobs, force=force
+        )
         result["hairpin_all"] = str(hairpin_local)
         all_fasta = hairpin_local
 
         mature_local = out_dir / "mature.fa.gz"
-        resumable_download(MATURE_URL, mature_local, jobs=jobs, force=force)
+        _download_from_sources(
+            MATURE_URLS, mature_local, jobs=jobs, force=force
+        )
         result["mature_all"] = str(mature_local)
         mature_fasta = mature_local
 
