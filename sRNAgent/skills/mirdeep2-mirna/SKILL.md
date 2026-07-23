@@ -337,7 +337,7 @@ adata = sa.quant.quantify_mirna(adata, genome_index="ref/grch38",
 
 ## Critical API Reference
 
-### 完整端到端流程
+### 完整端到端流程（默认：只定量已知 miRNA）
 
 ```python
 import sRNAgent as sa
@@ -374,8 +374,13 @@ adata = sa.quant.quantify_mirna(
 
 print(f"Count matrix: {adata.X.shape}")
 print(f"miRNA IDs:    {adata.var['mirna_id'].tolist()[:5]}")
+```
 
-# ── Predict novel miRNAs ──
+### 仅当用户明确要求时 — 预测 novel miRNA
+
+```python
+# ⚠️ 只有在用户明确要求鉴定 novel miRNA 时才运行此步骤
+# 计算量大，结果需人工验证。默认不执行。
 adata = sa.quant.predict_mirna(
     adata,
     genome_index="ref/grch38",

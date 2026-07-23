@@ -21,6 +21,7 @@ from anndata import AnnData
 
 from ..._registry import register_function
 from ..._utils import run_cli_cmd
+from .tRAX import store_count_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +174,8 @@ def _parse_summary(summary_path: Path) -> Dict[str, Dict[str, int]]:
     produces={
         "obs": ["fc_counts_csv", "fc_summary_csv"],
         "uns": ["fc_annotation"],
+        "var": ["feature_id", "rna_type"],
+        "layers": ["counts"],
     },
 )
 def feature_count(
@@ -180,6 +183,7 @@ def feature_count(
     annotation: str,
     output_dir: str = "fc_out",
     *,
+    rna_type: str = "miRNA",
     feature_type: str = "miRNA",
     attr_type: str = "Name",
     strand: int = 1,
@@ -198,6 +202,13 @@ def feature_count(
         Path to GTF or GFF3 annotation file.
     output_dir
         Output directory for featureCounts results.
+    rna_type
+        RNA type label stored in ``adata.var["rna_type"]`` for the
+        resulting features. Default ``"miRNA"``. Use ``"piRNA"``,
+        ``"snoRNA"``, etc. to tag features from other annotations.
+        Features with the same ``rna_type`` in existing ``adata.X``
+        are replaced; features with a different ``rna_type`` are
+        appended alongside existing ones.
     feature_type
         Feature type to count (``-t`` in featureCounts).
         Matches the third column in GTF/GFF3. Default ``"miRNA"``.
@@ -221,8 +232,11 @@ def feature_count(
         The input ``adata`` with:
         - ``adata.obs['fc_counts_csv']`` — path to the raw count matrix
         - ``adata.obs['fc_summary_csv']`` — path to the summary stats
-        - ``adata.X`` — count matrix (samples × features)
-        - ``adata.var`` — feature annotations
+        - ``adata.X`` / ``adata.layers["counts"]`` — merged count matrix
+          (samples × features, appended by rna_type)
+        - ``adata.var["feature_id"]`` — feature IDs
+        - ``adata.var["rna_type"]`` — RNA type annotation
+        - ``adata.uns["fc_annotation"]`` — annotation file path
     """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -311,15 +325,17 @@ def feature_count(
         if i is not None:
             matrix[i][j] = float(counts_df.iloc[j])
 
-    # Store results
+    # Build var DataFrame
+    var = pd.DataFrame(index=counts_df.index)
+    var["feature_id"] = counts_df.index.tolist()
+
+    # Merge into adata (same rna_type replaces, different types append)
+    adata = store_count_matrix(adata, matrix, var, rna_type=rna_type)
+
+    # Store output paths
     adata.obs["fc_counts_csv"] = str(counts_path)
     if summary_path.exists():
         adata.obs["fc_summary_csv"] = str(summary_path)
-
-    # Assign count matrix and feature metadata
-    adata.X = matrix
-    adata.var = pd.DataFrame(index=counts_df.index)
-    adata.var["feature_id"] = counts_df.index.tolist()
     adata.uns["fc_annotation"] = annotation
 
     return adata

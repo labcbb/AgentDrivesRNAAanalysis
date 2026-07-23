@@ -215,7 +215,7 @@ adata = sa.quant.quantify_mirna(
 )
 ```
 
-## Full pipeline: init -> cutadapt -> quantify -> predict
+## Full pipeline: init -> cutadapt -> quantify (default, known miRNAs only)
 
 ```python
 import sRNAgent as sa
@@ -246,8 +246,13 @@ adata = sa.quant.quantify_mirna(adata,
                                 output_dir="mirdeep2")
 print(f"Counts:  {adata.X.shape}")
 print(f"miRNAs:  {adata.var['mirna_id'].tolist()[:5]}")
+```
 
-# ── Predict novel miRNAs ──
+## Predict novel miRNAs (only when the user explicitly asks)
+
+```python
+# ⚠️ Only run predict_mirna when the user explicitly requests
+#    novel miRNA discovery. Heavy computation, requires manual validation.
 adata = sa.quant.predict_mirna(adata,
                                genome_index="ref/grch38",
                                genome_fasta="ref/GRCh38.primary_assembly.genome.fa",

@@ -12,7 +12,7 @@ After aligning sRNA-seq reads to the reference genome (`sa.alignment.bowtie`), t
 
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|
-| 1 | featureCounts | `sa.quant.feature_count` | Count aligned BAM reads against GTF/GFF3 features, output expression matrix |
+| 1 | featureCounts | `sa.quant.feature_count` | Count aligned BAM reads against GTF/GFF3 features, output expression matrix merged into `adata.X` |
 
 Typical sRNA-seq quantification workflow:
 
@@ -24,7 +24,8 @@ featureCounts ─── -t miRNA -g Name -s 1
                ─── BAM vs annotation chromosome validation
     │
     ▼
-Count matrix (samples × features) in adata.X
+Count matrix (samples × features) → adata.X / adata.layers["counts"]
+(merged by rna_type — miRNA, piRNA, etc. coexist in one matrix)
 ```
 
 > ⚡ **批量样本时务必使用 `threads=N` 并行处理**
@@ -124,17 +125,22 @@ print(adata.X.shape)
 
 > BAM 文件列表自动从 `adata.obs["bam_path"]` 读取，featureCounts 一次调用即可处理所有样本。
 
-**CORRECT — 定量 piRNA（调整 feature_type 和 attr_type）：**
+**CORRECT — 定量 piRNA（调整 feature_type 和 attr_type，指定 rna_type 以便合并）：**
 
 ```python
+# 如果 adata.X 已有 miRNA 数据，piRNA 结果会追加到同一矩阵中
 adata = sa.quant.feature_count(
     adata,
     annotation="ref/piRBank_hsa.gff3",
     feature_type="piRNA",
     attr_type="ID",
+    rna_type="piRNA",
     strand=0,            # piRNA 通常是非链特异性
 )
 ```
+
+> 不同 `rna_type` 的特征会共存于 `adata.X` / `adata.layers["counts"]` 中。
+> 同一 `rna_type` 重复运行会替换旧特征，不影响其他 RNA 类型。
 
 ### 2. 查看定量结果
 
@@ -151,12 +157,29 @@ print(adata.var.head())
 # adata.obs["fc_counts_csv"]       — featureCounts 原始输出路径 (.txt)
 # adata.obs["fc_summary_csv"]      — 统计摘要路径 (.txt.summary)
 
-# featureCounts 写入 adata.X 和 adata.var
-# adata.X                          — 表达矩阵 (samples × features)
+# featureCounts 写入 adata.X / adata.layers["counts"]
+# adata.X                          — 合并的表达矩阵 (samples × features)
+# adata.layers["counts"]           — 与 adata.X 相同的原始计数矩阵
 # adata.var["feature_id"]          — 特征 ID 列表
+# adata.var["rna_type"]            — RNA 类型（miRNA、piRNA 等）
 
 # featureCounts 写入 adata.uns
 # adata.uns["fc_annotation"]       — 使用的注释文件路径
+```
+
+不同 `rna_type` 的定量结果会合并到同一个 `adata.X` 中。例如先定量 miRNA 再定量 piRNA：
+
+```python
+# 第一步：定量 miRNA（rna_type="miRNA"）
+adata = sa.quant.feature_count(adata, annotation="mirna.gff3", ...)
+# adata.var["rna_type"] → ["miRNA", "miRNA", ...]
+
+# 第二步：定量 piRNA（结果追加到同一矩阵）
+adata = sa.quant.feature_count(adata, annotation="pirna.gff3",
+                               feature_type="piRNA", attr_type="ID",
+                               rna_type="piRNA", ...)
+# adata.X → (samples × miRNA+piRNA features)
+# adata.var["rna_type"] → ["miRNA", ..., "piRNA", ...]
 ```
 
 ## Troubleshooting

@@ -27,14 +27,16 @@ print(adata.X.shape)
 print(adata.var["feature_id"].tolist()[:10])
 ```
 
-## Quantify piRNA (unstranded)
+## Quantify piRNA (unstranded, appends to existing adata.X)
 
 ```python
+# If adata.X already has miRNA counts, piRNA results merge alongside them
 adata = sa.quant.feature_count(
     adata,
     annotation="ref/piRNA.gff3",
     feature_type="piRNA",
     attr_type="ID",
+    rna_type="piRNA",
     strand=0,
     threads=4,
     output_dir="fc_out",
@@ -77,6 +79,7 @@ sa.quant.feature_count(
     adata,                         # AnnData; reads from adata.obs["bam_path"]
     annotation,                    # GTF or GFF3 file path
     output_dir="fc_out",           # output directory
+    rna_type="miRNA",              # RNA type label in adata.var["rna_type"]
     feature_type="miRNA",          # -t: feature type in GTF/GFF3
     attr_type="Name",              # -g: attribute for feature ID
     strand=1,                      # -s: 0=unstranded, 1=stranded, 2=reverse
