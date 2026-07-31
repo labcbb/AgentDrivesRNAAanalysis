@@ -118,12 +118,13 @@ def _download_one_url(
     return dest
 
 
-def _find_run_info_tsv(out_dir: Path) -> Optional[Path]:
+def _find_run_info_tsvs(out_dir: Path) -> List[Path]:
     candidates = sorted(out_dir.glob("*run-info*.tsv"))
-    if candidates:
-        return candidates[0]
-    legacy = out_dir / "fastq-run-info.tsv"
-    return legacy if legacy.exists() else None
+    if not candidates:
+        legacy = out_dir / "fastq-run-info.tsv"
+        if legacy.exists():
+            return [legacy]
+    return candidates
 
 
 def _ftp_urls_for_run(row: Dict[str, str], protocol: str) -> List[str]:
@@ -150,14 +151,20 @@ def download_ena_from_run_info(
     overwrite: bool = False,
 ) -> Tuple[int, int]:
     """Download all FASTQs listed in fastq-dl metadata TSV with tqdm progress."""
-    tsv_path = _find_run_info_tsv(out_dir)
-    if tsv_path is None:
+    tsv_paths = _find_run_info_tsvs(out_dir)
+    if not tsv_paths:
         raise FileNotFoundError(
             f"No run-info TSV found under {out_dir}. "
             "Run fastq-dl with --only-download-metadata first."
         )
 
-    rows = list(csv.DictReader(tsv_path.open(encoding="utf-8"), delimiter="\t"))
+    rows_by_run: Dict[str, Dict[str, str]] = {}
+    for tsv_path in tsv_paths:
+        for row in csv.DictReader(tsv_path.open(encoding="utf-8"), delimiter="\t"):
+            run_id = str(row.get("run_accession") or "").strip()
+            if run_id:
+                rows_by_run.setdefault(run_id, row)
+    rows = list(rows_by_run.values())
     if not rows:
         return 0, 0
 

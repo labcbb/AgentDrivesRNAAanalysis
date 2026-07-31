@@ -120,18 +120,24 @@ def _discover_all_fastqs(
 
 def _discover_metadata_file(out_dir: Path, accession: str, prefix: Optional[str]) -> str:
     """Find the metadata TSV emitted by fastq-dl for *accession*."""
+    base = prefix or "fastq"
     candidates = [
-        out_dir / f"{prefix or 'fastq'}-{accession}-metadata.tsv",
+        # fastq-dl >= 1.x: {prefix}-run-info.tsv; the wrapper uses a
+        # per-accession prefix so each run writes its own file.
+        out_dir / f"{base}-{accession}-run-info.tsv",
+        # legacy names
+        out_dir / f"{base}-{accession}-metadata.tsv",
         out_dir / f"{accession}-metadata.tsv",
     ]
-    # fastq-dl >= 1.x emits fastq-run-info.tsv (no accession in filename)
-    run_info = out_dir / "fastq-run-info.tsv"
-    if run_info.exists():
-        return str(run_info)
+    candidates.extend(sorted(out_dir.glob(f"*{accession}*run-info*.tsv")))
     candidates.extend(sorted(out_dir.glob(f"*{accession}*metadata*.tsv")))
     for path in candidates:
         if path.exists() and path.is_file():
             return str(path)
+    # fallback: shared file (fastq-dl < 1.x)
+    run_info = out_dir / "fastq-run-info.tsv"
+    if run_info.exists():
+        return str(run_info)
     return ""
 
 
@@ -281,7 +287,8 @@ def fastq_dl(
     ignore_md5
         Skip MD5 validation (ENA) or relax integrity checks (SRA).
     prefix
-        Prefix for log file naming.
+        Base name for log/metadata files; the accession is appended so
+        concurrent runs never share a ``{prefix}-run-info.tsv`` file.
     silent
         Suppress non-critical output.
     sleep
@@ -350,8 +357,9 @@ def fastq_dl(
             cmd.append("--silent")
         if sra_lite:
             cmd.append("--sra-lite")
-        if prefix:
-            cmd.extend(["--prefix", prefix])
+        # Per-accession prefix: fastq-dl 1.x writes {prefix}-run-info.tsv in
+        # overwrite mode, so concurrent runs must never share a filename.
+        cmd.extend(["--prefix", f"{prefix or 'fastq'}-{acc}"])
         if gzip_level != 1:
             cmd.extend(["--gzip-level", str(gzip_level)])
 
