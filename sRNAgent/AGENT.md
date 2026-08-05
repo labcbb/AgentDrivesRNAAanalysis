@@ -110,3 +110,20 @@ UI 左侧的 **Branch Chat（监管者）** 是**旁路只读 Agent**，与当�
 - 主任务运行中打开 Branch Chat 提问是安全的，不会打断主任务（服务端断连已不会自动取消任务）。
 - 同一个 chat 同时只允许一个主任务 run；新发主消息会先停掉旧的，属正常设计。
 - 回答 Branch Chat 问题时，同样遵守"查询纪律 + 输出纪律"：优先引用已落盘的 `uns` / 结果文件，不重跑分析，不 print 大对象。
+
+## 样本级并行：批量样本必须并行，禁止串行
+
+处理**多个样本**的批量任务（下载 / 修剪 / QC / 比对 / 定量 / 计数）时，**必须用并行参数**，禁止逐样本串行跑：
+
+| 工具 | 并行参数 | 说明 |
+|------|---------|------|
+| `sa.fastq.fastq_dl` / `cutadapt` / `fastqc` | `jobs=N` | N 个样本同时处理 |
+| `sa.alignment.bowtie` | `jobs=N`（+ `threads` 为 bowtie 内部线程） | 每个样本一个 bowtie 进程 |
+| `sa.quant.quantify_mirna` / `predict_mirna` | `jobs=N` | 每个样本独立 mapper+quantifier/miRDeep2 |
+| `sa.quant.idxstats` | `jobs=N` | 多 BAM 并行 |
+| `sa.quant.feature_count` | `threads=N`（一次传全部 BAM） | featureCounts 单进程多文件 + 内部线程 |
+| `sa.quant.trax_quant` | `cores=N` | tRAX 内部并行 |
+
+- 样本数 > 3 时推荐 `jobs=4`（或按机器 CPU 核数 `os.cpu_count()` 取合理值）；内存吃紧时降低到 `jobs=2`。
+- 各 skill 已给出对应的 `jobs` / `cores` / `threads` 示例，调用前先查 skill。
+- 如果用户没指定并行数，**agent 应根据样本量主动选择一个合理的 `jobs` 值**，不要默认串行。

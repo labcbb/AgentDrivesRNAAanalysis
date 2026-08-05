@@ -116,6 +116,8 @@ adata = sa.quant.idxstats(
 )
 ```
 
+> ⚡ **批量样本时务必使用 `jobs=N` 并行**：`sa.quant.idxstats` 支持 `jobs` 参数控制同时处理的 BAM 数（多线程池，每个 BAM 一个 `samtools idxstats` 进程）。样本多时（比如 >3 个），设置 `jobs=4` 可显著缩短总耗时；内存吃紧时降低到 `jobs=2`。如果用户没指定并行数，**根据样本量主动选一个合理的 `jobs` 值**。
+
 ## Outputs
 
 `samtools idxstats` returns four columns:

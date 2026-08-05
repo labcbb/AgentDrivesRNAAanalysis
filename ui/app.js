@@ -90,6 +90,8 @@ const STREAM_IDLE_MS = 3600000;
 const STREAM_STATUS_POLL_MS = 4000;
 /** @type {Map<string, { abortController: AbortController, runId: string, codeExecutionId: string|null, lastSeq: number }>} */
 const liveFollows = new Map();
+/** @type {Map<string, string[]>} 主任务运行期间用户发的新消息先排队，当前任务结束后自动发送 */
+const pendingSends = new Map();
 const BACKGROUND_WATCH_POLL_MS = 3000;
 const BACKGROUND_EXECUTION_ID = "background-kernel-run";
 /** @type {Map<string, { timer: number, startedAt: number, pending: Element|null, assistantEntry: any|null }>} */
@@ -3068,6 +3070,8 @@ async function handleStop() {
     await window.cancelAgentRun(runId || null, activeChatId);
   }
   detachLiveEventStream(activeChatId);
+  // 用户手动停止 = 放弃当前任务与排队消息（排队语义是"等当前任务自然结束"）
+  pendingSends.delete(activeChatId);
   if (stream?.isFollower) {
     chatStreams.delete(activeChatId);
   }
@@ -3099,7 +3103,17 @@ function resetComposer() {
 async function handleSend() {
   if (!composer) return;
   if (isActiveChatSending()) {
-    await handleStop();
+    // 主任务运行中：不打断，把消息加入队列，当前任务结束后自动发送
+    const queued = composer.value.trim();
+    if (!queued) return;
+    const q = pendingSends.get(activeChatId) || [];
+    q.push(queued);
+    pendingSends.set(activeChatId, q);
+    resetComposer();
+    appendMessage(
+      "assistant",
+      `⏳ 当前任务运行中，消息已加入队列（待发送 ${q.length} 条）。当前任务结束后自动发送，无需重复操作。`,
+    );
     return;
   }
 
@@ -3512,7 +3526,27 @@ async function handleSend() {
       persistChatMessages(streamChatId, streamMessages);
     }
     finishChatStream(streamChatId);
+    // 主任务结束后，自动发送排队中的消息（不打断语义）
+    void drainPendingSends(streamChatId);
   }
+}
+
+/** 主任务结束后消费待发送队列，自动发送下一条消息（递归直至队列清空）。 */
+async function drainPendingSends(chatId) {
+  if (!chatId || chatId !== activeChatId) return;
+  const q = pendingSends.get(chatId);
+  if (!q || q.length === 0) return;
+  const next = q.shift();
+  if (q.length === 0) pendingSends.delete(chatId);
+  if (!next) return;
+  if (isActiveChatSending()) {
+    // 意外又进入发送状态（如其它设备触发），放回队列稍后再试
+    q.unshift(next);
+    pendingSends.set(chatId, q);
+    return;
+  }
+  if (composer) composer.value = next;
+  await handleSend();
 }
 
 function escapeStatusHtml(value) {
