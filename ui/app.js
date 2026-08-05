@@ -2104,9 +2104,23 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
       hasPct = true;
     }
   }
+  // 批量任务进度（stage 含"已完成 12/30 样本"）：用百分比驱动进度条
+  let batchProgressDone = 0;
+  let batchProgressTotal = 0;
+  const stageText = artifact.stage || "";
+  const batchMatch = stageText.match(/已完成\s*(\d+)\s*\/\s*(\d+)/);
+  if (batchMatch) {
+    batchProgressDone = Number(batchMatch[1]);
+    batchProgressTotal = Number(batchMatch[2]);
+    if (batchProgressTotal > 0 && !hasPct && filePct == null) {
+      overallPct = (batchProgressDone / batchProgressTotal) * 100;
+      hasPct = true;
+    }
+  }
   const hasBytes = Number(artifact.progressBytes) > 0;
   const hasProgress =
-    isActiveDownload && isDownloadProgressArtifact(artifact) && (hasPct || hasBytes);
+    (isActiveDownload && isDownloadProgressArtifact(artifact) && (hasPct || hasBytes))
+    || batchProgressTotal > 0;
   const hideOutput = isActiveDownload && hasProgress;
 
   if (highlights.length && !hideOutput) {
@@ -2134,6 +2148,10 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
 
   const runLabel = artifact.progressRun || "";
   let displayLabel = artifact.progressLabel || artifact.stage || "下载中…";
+  // 批量任务进度：进度条标签直接显示"已完成 X/Y（Z%）"
+  if (batchProgressTotal > 0 && overallPct > 0) {
+    displayLabel = `已完成 ${batchProgressDone}/${batchProgressTotal}（${overallPct.toFixed(1)}%）`;
+  }
   if (runLabel && fileIndex && fileTotal && hasPct && filePct != null) {
     displayLabel = `${runLabel} · 本文件 ${filePct.toFixed(1)}% · 整体 ${Number(barPct).toFixed(1)}% (${fileIndex}/${fileTotal})`;
   } else if (runLabel && hasPct && filePct != null) {

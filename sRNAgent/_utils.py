@@ -123,6 +123,8 @@ def run_threads(items: List[T], worker: Callable[[T], R], jobs: int) -> List[R]:
     Prints ``progress: N/M`` after each item finishes so the agent execution
     layer can surface cumulative sample progress (parsed by
     ``_parse_progress_output`` into "已完成 N/M 样本").
+    Also prints ``inflight: <names...>`` with the items still running, so the
+    UI can show "进行中: SRR1, SRR2, …" alongside the cumulative count.
     """
     n = len(items)
     if n == 0:
@@ -137,12 +139,33 @@ def run_threads(items: List[T], worker: Callable[[T], R], jobs: int) -> List[R]:
     max_workers = max(1, min(jobs, n))
     results: List[Optional[R]] = [None] * n
     done = 0
-    lock = threading.Lock()
+    count_lock = threading.Lock()
+    inflight: List[str] = []
+    inflight_lock = threading.Lock()
+
+    def _emit_status() -> None:
+        with count_lock:
+            d = done
+        with inflight_lock:
+            names = list(inflight)
+        print(f"progress: {d}/{n}", flush=True)
+        print(f"inflight: {','.join(names)}", flush=True)
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(worker, item): i for i, item in enumerate(items)}
+        futures = {}
+        for i, item in enumerate(items):
+            name = str(item)
+            with inflight_lock:
+                inflight.append(name)
+            futures[pool.submit(worker, item)] = (i, name)
+        _emit_status()
         for fut in as_completed(futures):
-            results[futures[fut]] = fut.result()
-            with lock:
+            idx, name = futures[fut]
+            with inflight_lock:
+                if name in inflight:
+                    inflight.remove(name)
+            results[idx] = fut.result()
+            with count_lock:
                 done += 1
-            print(f"progress: {done}/{n}", flush=True)
+            _emit_status()
     return [r for r in results if r is not None]

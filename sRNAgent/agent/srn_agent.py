@@ -760,6 +760,14 @@ def _parse_progress_output(text: str, *, workspace: Optional[Path] = None, code:
     if progress_match:
         done_n, total_n = int(progress_match.group(1)), int(progress_match.group(2))
         stage = f"已完成 {done_n}/{total_n} 样本"
+    # run_threads 的 inflight: SRR1,SRR2,... → 把"正在并发"的样本名拼到 stage
+    # 让 UI 显示"已完成 N/M · 进行中: SRR1, SRR2, ..."（这就是当前并行跑的样本）
+    inflight_match = re.search(r"inflight:\s*(.+)", cleaned)
+    if inflight_match:
+        names = [s.strip() for s in inflight_match.group(1).split(",") if s.strip()]
+        if names:
+            joined = ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
+            stage = f"{stage} · 进行中: {joined}"
     base = {
         "stage": stage,
         "highlights": highlights,
