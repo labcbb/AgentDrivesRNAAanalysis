@@ -252,3 +252,33 @@ Pass `fastq_dir`. The wrapper writes resolved paths to `trax_fq` and leaves the 
 **Unexpected sample dropping**
 
 Samples are dropped only when no usable FASTQ path can be resolved from `clean_fastq_path`, `fastq_path`, or `fastq_dir`.
+
+## 结果持久化与查询纪律
+
+### 保存结果（必须，保证跨会话可查）
+
+tRAX 定量结果写入 adata 的 `X`（counts 矩阵）、`var`（`trax_feature_id` / `trna_id` / `fragment_type`）、`uns["trax_result"]`、`obs`（`trax_fq` / `trax_bam` 等路径），**必须保存 h5ad**，否则新会话无法查询：
+
+```python
+import anndata as ad
+
+# 定量完成后立即保存
+adata.write("quantified_trf.h5ad")
+
+# 保存后 reload 验证
+reload = ad.read_h5ad("quantified_trf.h5ad")
+print(reload.shape, list(reload.var.columns))
+```
+
+### 查询已有结果（只读查询，禁止重跑）
+
+用户问"tRF 定量结果/表达量"时，**先查已有数据，绝不重跑 tRAX**（全流程含比对 + 计数，耗时很长）：
+
+```python
+# 1) 加载已保存的 h5ad，直接查
+adata = ad.read_h5ad("quantified_trf.h5ad")
+print(adata.var_names[:5])          # 如 tRNA-Glu-CTC-1_fiveprime
+
+# 2) 工具自带防重跑：lazyremap=True 时已有 BAM 会被复用，不会重新比对
+# 3) 都没有 → 告知用户"现有结果不存在"，询问是否重新分析；不要偷偷重跑
+```

@@ -268,6 +268,40 @@ print(adata.obs[["bam_path", "bowtie_alignment_rate"]])
 - **"trimmed_path" 未设置**: 如果直接使用 bowtie（跳过 cutadapt），确保 `adata.obs["trimmed_path"]` 或 `adata.obs["fastq_path"]` 已设置。
 - **reads 比对上但无法区分 miRNA 簇**: 对 miRNA 家族的重复区域，用 `-k` 报告多个比对位置，然后根据 miRNA 注释进行分配。
 
+## 结果持久化与查询纪律
+
+### 保存结果（必须，保证跨会话可查）
+
+比对结果写入 adata 的 `obs["sam_path"]` / `obs["bam_path"]`（及 `bowtie_log` 等列），产物 SAM/BAM 文件本身在磁盘上持久化，但**路径索引必须随 h5ad 保存**，否则新会话不知道比对文件在哪：
+
+```python
+import anndata as ad
+
+# 比对完成后立即保存（obs 里的 bam_path 等路径全部落盘）
+adata.write("aligned.h5ad")
+
+# 保存后 reload 验证
+reload = ad.read_h5ad("aligned.h5ad")
+print(reload.obs["bam_path"].head())
+```
+
+### 查询已有结果（只读查询，禁止重跑）
+
+用户问"XX 样本比对了没有 / 比对结果"时，**先查已有数据，绝不重跑 bowtie**（30 样本比对可能耗时数十分钟）：
+
+```python
+import os
+import anndata as ad
+
+# 1) 检查 obs 痕迹 + 文件是否存在
+adata = ad.read_h5ad("aligned.h5ad")
+missing = adata.obs["bam_path"][~adata.obs["bam_path"].map(os.path.exists)]
+print(f"缺失 BAM: {len(missing)}")
+
+# 2) 工具自带防重跑：bam 文件已存在时重跑会自动跳过（overwrite=False）
+# 3) 都没有 → 告知用户"现有结果不存在"，询问是否重新比对；不要偷偷重跑
+```
+
 ## References
 
 - Copy-paste-ready code templates: [`reference.md`](reference.md)

@@ -476,6 +476,40 @@ print(f"Final report: {adata.uns['multiqc_html']}")
 - **HTML 报告无法打开**: 检查 `filename` 参数是否以 `.html` 结尾。
 - **批量处理顺序**: 确保样本标签在 cutadapt 和下游分析中保持一致，方便追溯。
 
+## 结果持久化与查询纪律
+
+### 保存结果（必须，保证跨会话可查）
+
+QC/修剪结果写入 adata 的 `obs["trimmed_path"]` / `obs["fastqc_html"]` / `obs["fastqc_zip"]` 和 `uns["multiqc_html"]`，产物文件本身在磁盘上持久化，但**路径索引必须随 h5ad 保存**，否则新会话不知道文件在哪：
+
+```python
+import anndata as ad
+
+# QC 完成后立即保存
+adata.write("qc_done.h5ad")
+
+# 保存后 reload 验证
+reload = ad.read_h5ad("qc_done.h5ad")
+print(reload.obs["trimmed_path"].head())
+```
+
+### 查询已有结果（只读查询，禁止重跑）
+
+用户问"XX 样本修剪/QC 了没有"时，**先查已有数据，绝不重跑 cutadapt/FastQC**（修剪 30 样本可能耗时数十分钟）：
+
+```python
+import os
+import anndata as ad
+
+# 1) 检查 obs 路径 + 文件是否存在
+adata = ad.read_h5ad("qc_done.h5ad")
+missing = adata.obs["trimmed_path"][~adata.obs["trimmed_path"].map(os.path.exists)]
+print(f"缺失修剪产物: {len(missing)}")
+
+# 2) 工具自带防重跑：输出文件已存在时重跑会自动跳过（overwrite=False）
+# 3) 都没有 → 告知用户，询问是否重新处理；不要偷偷重跑
+```
+
 ## References
 
 - Copy-paste-ready code templates: [`reference.md`](reference.md)

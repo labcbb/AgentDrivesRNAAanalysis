@@ -438,6 +438,40 @@ print(adata.obs[["fastq_path"]])
 - "Download from SRP464891, then feed the R1 paths into cutadapt for 3' adapter trimming."
 - "Provide 10 SRRs and BioSample IDs, download them, and have results stored in adata.obs['fastq_path']."
 
+## 结果持久化与查询纪律
+
+### 保存结果（必须，保证跨会话可查）
+
+下载结果写入 adata 的 `obs["fastq_path"]` 和 `uns["output_dir"]`，FASTQ 文件本身在磁盘上持久化，但**路径索引必须随 h5ad 保存**，否则新会话不知道文件在哪：
+
+```python
+import anndata as ad
+
+# 下载完成后立即保存
+adata.write("downloaded.h5ad")
+
+# 保存后 reload 验证
+reload = ad.read_h5ad("downloaded.h5ad")
+print(reload.obs["fastq_path"].head())
+```
+
+### 查询已有结果（只读查询，禁止重跑）
+
+用户问"XX 样本下载了没有"时，**先查已有数据，绝不重新下载**（FASTQ 可达数 GB/样本）：
+
+```python
+import os
+import anndata as ad
+
+# 1) 检查 obs 路径 + 文件是否存在
+adata = ad.read_h5ad("downloaded.h5ad")
+missing = adata.obs["fastq_path"][~adata.obs["fastq_path"].map(os.path.exists)]
+print(f"缺失 FASTQ: {len(missing)}")
+
+# 2) 工具自带防重跑：overwrite=False 时已下载的 Run 自动跳过（增量下载）
+# 3) 都没有 → 告知用户，询问是否重新下载；不要偷偷下载
+```
+
 ## References
 
 - Quick copy/paste code templates: [`reference.md`](reference.md)

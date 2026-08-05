@@ -428,6 +428,39 @@ print(f"Novel miRNA report: {adata.obs['prediction_html'].iloc[0]}")
 - **并行处理卡顿**: 减少 `jobs` 数量。mapper.pl 本身已使用多线程（Bowtie 比对），过多的并行可能超出内存。
 - **miRDeep2 运行缓慢**: novel miRNA 预测的计算量远大于定量。对大批量样本，先用 `quantify_mirna` 定量，再选少量样本做 `predict_mirna`。
 
+## 结果持久化与查询纪律
+
+### 保存结果（必须，保证跨会话可查）
+
+miRDeep2 定量结果写入 adata 的 `X`（counts 矩阵）、`layers["logcpm"]`、`var`（miRNA 名称）、`obs`（各样本产物路径），**必须保存 h5ad**，否则新会话无法查询：
+
+```python
+import anndata as ad
+
+# 定量完成后立即保存
+adata.write("quantified_mirna.h5ad")
+
+# 保存后 reload 验证
+reload = ad.read_h5ad("quantified_mirna.h5ad")
+print(reload.shape, list(reload.var.columns), list(reload.layers.keys()))
+```
+
+### 查询已有结果（只读查询，禁止重跑）
+
+用户问"XX miRNA 的定量结果/表达量"时，**先查已有数据，绝不重跑 miRDeep2**（30 样本定量可能耗时数十分钟到数小时）：
+
+```python
+# 1) 加载已保存的 h5ad，直接查表达量
+adata = ad.read_h5ad("quantified_mirna.h5ad")
+if "hsa-miR-21-5p" in adata.var_names:
+    print(adata[:, "hsa-miR-21-5p"].X)          # 各样本 count
+    print(adata[:, "hsa-miR-21-5p"].layers["logcpm"])
+
+# 2) 工具自带防重跑：output_dir 下已有 collapsed.fa / arf / result 文件时，
+#    重跑会自动跳过已完成样本（overwrite=False）
+# 3) 都没有 → 告知用户"现有结果不存在"，询问是否重新分析；不要偷偷重跑
+```
+
 ## References
 
 - Copy-paste-ready code templates: [`reference.md`](reference.md)

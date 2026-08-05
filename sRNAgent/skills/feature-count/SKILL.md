@@ -191,6 +191,36 @@ adata = sa.quant.feature_count(adata, annotation="pirna.gff3",
 - **太多 reads 被 multi-mapping 丢弃**: 用 `-O` 参数允许 reads 在多 feature 上计数。默认不开启。
 - **featureCounts 未安装**: 确保 `featureCounts` 可执行文件在 PATH 中。它是 Subread 包的一部分，可用 `conda install subread` 安装。
 
+## 结果持久化与查询纪律
+
+### 保存结果（必须，保证跨会话可查）
+
+featureCount 定量结果写入 adata 的 `X`（counts 矩阵）、`var["feature_id"]`、`uns["fc_annotation"]`，**必须保存 h5ad**，否则新会话无法查询：
+
+```python
+import anndata as ad
+
+# 定量完成后立即保存
+adata.write("feature_counts.h5ad")
+
+# 保存后 reload 验证
+reload = ad.read_h5ad("feature_counts.h5ad")
+print(reload.shape, list(reload.var.columns))
+```
+
+### 查询已有结果（只读查询，禁止重跑）
+
+用户问"XX feature 的定量结果"时，**先查已有数据，绝不重跑 featureCounts**：
+
+```python
+# 1) 加载已保存的 h5ad，直接查
+adata = ad.read_h5ad("feature_counts.h5ad")
+print(adata.var_names[:5])
+
+# 2) output_dir 下已有 counts 文件时重跑会被跳过（overwrite=False）
+# 3) 都没有 → 告知用户"现有结果不存在"，询问是否重新分析；不要偷偷重跑
+```
+
 ## References
 
 - Copy-paste-ready code templates: [`reference.md`](reference.md)

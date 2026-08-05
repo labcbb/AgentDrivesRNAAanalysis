@@ -208,3 +208,33 @@ Run `sa.alignment.bowtie` first. If only `sam_path` exists, the wrapper will loo
 **Unexpected feature names**
 
 Feature names come from the FASTA headers used to build the Bowtie index. Clean FASTA headers before building the index if you need stable IDs.
+
+## 结果持久化与查询纪律
+
+### 保存结果（必须，保证跨会话可查）
+
+idxstats 定量结果写入 adata 的 `X`（counts 矩阵）、`var`（feature 名称）、`uns["output_dir"]`，**必须保存 h5ad**，否则新会话无法查询：
+
+```python
+import anndata as ad
+
+# 定量完成后立即保存
+adata.write("idxstats_counts.h5ad")
+
+# 保存后 reload 验证
+reload = ad.read_h5ad("idxstats_counts.h5ad")
+print(reload.shape, list(reload.var.columns))
+```
+
+### 查询已有结果（只读查询，禁止重跑）
+
+用户问"XX piRNA/feature 的定量结果"时，**先查已有数据，绝不重跑 idxstats**：
+
+```python
+# 1) 加载已保存的 h5ad，直接查
+adata = ad.read_h5ad("idxstats_counts.h5ad")
+print(adata.var_names[:5])
+
+# 2) output_dir 下已有 *.idxstats.tsv 时重跑会被跳过（overwrite=False）
+# 3) 都没有 → 告知用户"现有结果不存在"，询问是否重新分析；不要偷偷重跑
+```
