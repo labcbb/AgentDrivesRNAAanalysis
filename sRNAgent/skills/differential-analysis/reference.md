@@ -46,10 +46,28 @@ adata = ad.read_h5ad("quantified.h5ad")
 
 adata.layers["counts"] = adata.X.copy()
 sa.diff.filter_low_expression(adata, min_mean=1.0)
-sa.diff.de_analysis(adata, control_group="Ctrl")
+sa.diff.de_analysis(adata, control_group="Ctrl", output_dir="de_results")
 
 print(adata.uns["de_results"].head())
-adata.write("de_results.h5ad")
+adata.write("de_results.h5ad")   # 必须保存：uns 含 de_results 才能跨会话查询
+```
+
+## Query existing DE results (read-only — never re-run DE)
+
+```python
+import anndata as ad
+import pandas as pd
+
+# 1) uns 里有结果 → 直接查
+adata = ad.read_h5ad("de_results.h5ad")
+if "de_results" in adata.uns:
+    de = adata.uns["de_results"]
+    print(de.loc[["hsa-miR-21-5p", "hsa-miR-21-3p"]])
+# 2) 工作区落盘了 CSV → 直接查（更快，不用读 h5ad）
+elif __import__("os").path.exists("de_results/de_results.csv"):
+    de = pd.read_csv("de_results/de_results.csv", index_col=0)
+    print(de.loc[["hsa-miR-21-5p", "hsa-miR-21-3p"]])
+# 3) 都没有 → 告知用户"现有结果不存在"，询问是否重新分析；不要偷偷重跑
 ```
 
 ## Filter + DE with explicit group column
@@ -136,6 +154,8 @@ sa.diff.de_analysis(
     adata,                    # AnnData with raw counts in X
     group_col=None,           # auto-detected if None
     control_group=None,       # first group alphabetically if None
+    output_dir=None,          # optional: write de_results.csv + manifest.json here
+    force=False,              # True to recompute even if uns already has matching results
 )
 ```
 

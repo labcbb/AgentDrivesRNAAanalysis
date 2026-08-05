@@ -69,3 +69,21 @@ if "trimmed_path" not in adata.obs_keys():
 ## Reference Tools
 
 `sa.reference.*` 是 stateless 的，不接受 adata，返回 dict。
+
+## 结果持久化：分析结果必须落盘，能跨会话查询
+
+分析完成（尤其是差异分析 DE、定量、比对）后，**结果必须持久化**，否则新会话/新提问无法直接查询，被迫重算（历史上因此出现过单个查询跑 103 轮的案例）：
+
+1. **保存带结果的 adata**：把包含 `uns['de_results']` / `uns['de_params']` 等结果的 adata 用 `write_h5ad` 覆盖保存回原 h5ad（或显式命名的新文件），保存后 `read_h5ad` 验证结果仍在。
+2. **登记结果位置**：在工作区记录结果文件路径（例如 `de_analysis(output_dir=...)` 生成的 `de_results.csv` / `de_results_manifest.json`），让后续会话能通过文件快速查到结果，无需加载整个 adata。
+3. **DE 推荐带 `output_dir`**：`sa.diff.de_analysis(adata, output_dir="de_results")` 会自动把全表写到 `de_results/de_results.csv` 并登记 `de_results_manifest.json`（含 group_col / treatment / control / n_features）。
+
+## 查询纪律：只读查询先查已有结果，禁止重跑
+
+回答"某某结果是什么样的 / 有没有跑过 X"这类**只读查询**时，按此顺序查找，找到即止：
+
+1. `adata.uns` / `adata.obs` / `adata.layers`（加载 h5ad 后直接看，不重算）
+2. 工作区已登记的结果文件（`de_results_manifest.json`、`de_results.csv`、`de_locations_manifest.json` 等）
+3. 旧 session 目录（`sessions/*/run_report.json`、`chat.json`）里的已完成记录
+
+**只有全部找不到、且用户明确要求重新分析时，才允许重跑**；重跑前先向用户说明"已有结果不存在，需要重算"。禁止为了回答一个查询问题而重跑昂贵的 limma-voom / 定量 / 比对流程。

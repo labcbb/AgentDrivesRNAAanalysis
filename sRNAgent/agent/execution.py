@@ -5,10 +5,11 @@ import contextlib
 import io
 import logging
 import sys
+import threading
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .agent_config import ExecutionConfig, SandboxExecutionError, SandboxFallbackPolicy
 from .env import RuntimeEnvironment, detect_runtime_environment, validate_expected_environment
@@ -24,6 +25,11 @@ class ExecutionBackend:
     warnings: List[str] = field(default_factory=list)
     fallback_policy: SandboxFallbackPolicy = SandboxFallbackPolicy.WARN_AND_FALLBACK
     last_notebook_error: Optional[str] = None
+    # Shared namespace for in-process fallback execution, so variables
+    # (adata, pd, ...) defined in one execute_code call survive the next one,
+    # mirroring a persistent notebook kernel.  None = not yet initialized.
+    in_process_ns: Optional[Dict[str, Any]] = None
+    _ns_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def to_dict(self) -> dict:
         return {
@@ -117,18 +123,29 @@ def initialize_execution_backend(
         )
 
 
-def _execute_in_process(code: str, project_root: Path) -> str:
+def _ensure_base_namespace(namespace: Dict[str, Any]) -> None:
+    """Inject ``sa`` into *namespace* so agent code always has it, even if a
+    previous execute_code call overwrote or deleted it."""
+    import sRNAgent as sa  # noqa: WPS433
+
+    namespace.setdefault("__name__", "__srnagent_exec__")
+    namespace["sa"] = sa
+    namespace["sRNAgent"] = sa
+
+
+def _execute_in_process(
+    code: str,
+    project_root: Path,
+    namespace: Optional[Dict[str, Any]] = None,
+) -> str:
     project_root_str = str(project_root.resolve())
     if project_root_str not in sys.path:
         sys.path.insert(0, project_root_str)
 
-    import sRNAgent as sa  # noqa: WPS433
+    if namespace is None:
+        namespace = {"__name__": "__srnagent_exec__"}
+    _ensure_base_namespace(namespace)
 
-    namespace = {
-        "__name__": "__srnagent_exec__",
-        "sa": sa,
-        "sRNAgent": sa,
-    }
     stdout = io.StringIO()
     try:
         with contextlib.redirect_stdout(stdout):
@@ -139,6 +156,22 @@ def _execute_in_process(code: str, project_root: Path) -> str:
         err = traceback.format_exc()
         partial = stdout.getvalue().strip()
         return f"{partial}\n\n{err}" if partial else err
+
+
+def _run_in_process(
+    backend: ExecutionBackend,
+    code: str,
+    project_root: Path,
+) -> str:
+    """Execute *code* against the backend's shared in-process namespace.
+
+    The namespace persists across calls (like a notebook kernel), so state
+    defined by earlier agent steps is available in later ones.
+    """
+    if backend.in_process_ns is None:
+        backend.in_process_ns = {}
+    with backend._ns_lock:
+        return _execute_in_process(code, project_root, backend.in_process_ns)
 
 
 def _format_notebook_result(result: dict) -> str:
@@ -177,7 +210,7 @@ def _handle_notebook_failure(
     else:
         prefix = ""
 
-    return prefix + _execute_in_process(code, project_root)
+    return prefix + _run_in_process(backend, code, project_root)
 
 
 def execute_agent_code(
@@ -202,7 +235,7 @@ def execute_agent_code(
                         "⚠️  Notebook execution returned an error.\n"
                         "   Falling back to in-process execution...\n\n"
                     )
-                    return prefix + _execute_in_process(code, project_root)
+                    return prefix + _run_in_process(backend, code, project_root)
                 return _format_notebook_result(result)
             return _format_notebook_result(result)
         except SandboxExecutionError:
@@ -210,4 +243,4 @@ def execute_agent_code(
         except Exception as exc:
             return _handle_notebook_failure(backend, exc, code, project_root)
 
-    return _execute_in_process(code, project_root)
+    return _run_in_process(backend, code, project_root)

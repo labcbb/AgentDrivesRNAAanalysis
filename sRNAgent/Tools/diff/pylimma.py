@@ -10,6 +10,9 @@ and comparison metadata in ``adata.uns["de_params"]``.
 
 from __future__ import annotations
 
+import json
+import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -88,6 +91,64 @@ def _resolve_design_column(
     )
 
 
+def _cached_de_matches(
+    adata: AnnData,
+    col: str,
+    group_control: str,
+    group_treatment: str,
+) -> bool:
+    """True if ``adata.uns`` already holds DE results for this exact contrast.
+
+    Used for idempotency: re-running ``de_analysis`` with the same group
+    column and same treatment/control groups should reuse the stored result
+    instead of recomputing the whole limma-voom pipeline.
+    """
+    if "de_results" not in adata.uns or "de_params" not in adata.uns:
+        return False
+    de_params = adata.uns.get("de_params")
+    if not isinstance(de_params, dict):
+        return False
+    return (
+        de_params.get("group_col") == col
+        and de_params.get("control") == group_control
+        and de_params.get("treatment") == group_treatment
+        and de_params.get("n_features") == adata.n_vars
+    )
+
+
+def _persist_de_results(
+    de_results: pd.DataFrame,
+    de_params: dict,
+    output_dir: Optional[str],
+) -> None:
+    """Write the DE table to disk so results survive even if the adata is not
+    re-saved (the failure mode that previously forced full recomputes)."""
+    if not output_dir:
+        return
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    csv_path = out / "de_results.csv"
+    de_results.to_csv(csv_path)
+
+    manifest_path = out / "de_results_manifest.json"
+    manifest = dict(de_params)
+    manifest.update(
+        {
+            "results_file": str(csv_path),
+            "n_features": int(len(de_results)),
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+    with manifest_path.open("w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, ensure_ascii=False)
+
+    print(
+        f"[de_analysis] Persisted results to {csv_path} "
+        f"(manifest: {manifest_path})",
+        flush=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -111,6 +172,13 @@ def _resolve_design_column(
         "(alphabetically) is treated as the control.\n\n"
         "**Multi-group** — when more than 2 groups exist, only the "
         "first two (alphabetically) are compared (a warning is printed).\n\n"
+        "**Idempotent** — if ``adata.uns`` already holds ``de_results`` for "
+        "the same group column and treatment/control pair, the cached result "
+        "is returned without recomputing (pass ``force=True`` to override).\n\n"
+        "**Persistence** — pass ``output_dir`` to also write the DE table to "
+        "``<output_dir>/de_results.csv`` plus a "
+        "``de_results_manifest.json``, so results survive even if the adata "
+        "is not re-saved to disk.\n\n"
         "Results for **all** features are stored in "
         "``adata.uns['de_results']``, with comparison metadata in "
         "``adata.uns['de_params']``."
@@ -119,6 +187,7 @@ def _resolve_design_column(
         'adata = sa.diff.de_analysis(adata)',
         'adata = sa.diff.de_analysis(adata, group_col="condition")',
         'adata = sa.diff.de_analysis(adata, control_group="Ctrl")',
+        'adata = sa.diff.de_analysis(adata, output_dir="de_results")',
     ],
     related=[
         "diff.filter_low_expression", "quant.normalize_cpm",
@@ -132,6 +201,8 @@ def de_analysis(
     adata: AnnData,
     group_col: Optional[str] = None,
     control_group: Optional[str] = None,
+    output_dir: Optional[str] = None,
+    force: bool = False,
 ) -> AnnData:
     """Differential expression analysis using limma-voom (pylimma).
 
@@ -146,6 +217,11 @@ def de_analysis(
     control_group
         Group label to use as the baseline (control) in the contrast.
         If not given, the first group alphabetically is used.
+    output_dir
+        Optional directory to persist the DE table to as
+        ``de_results.csv`` + ``de_results_manifest.json``.
+    force
+        Recompute even if ``adata.uns`` already holds matching DE results.
 
     Returns
     -------
@@ -224,7 +300,20 @@ def de_analysis(
         flush=True,
     )
 
-    # ── 4. Design matrix ──
+    # ── 4. Idempotency: reuse cached results when the contrast matches ──
+    if not force and _cached_de_matches(adata, col, group_control, group_treatment):
+        cached = adata.uns["de_params"]
+        print(
+            f"[de_analysis] Cached results found in adata.uns['de_results'] "
+            f"({cached.get('n_features')} features, "
+            f"{group_treatment} vs {group_control}) — skipping recompute. "
+            f"Pass force=True to recompute.",
+            flush=True,
+        )
+        _persist_de_results(adata.uns["de_results"], cached, output_dir)
+        return adata
+
+    # ── 5. Design matrix ──
     design_raw = pylimma.model_matrix(f"~0+{col}", adata.obs)
 
     # Wrap in DataFrame with explicit column names
@@ -235,7 +324,7 @@ def de_analysis(
     design_cols = list(design.columns)
     print(f"[de_analysis] Design columns: {design_cols}", flush=True)
 
-    # ── 5. Resolve design column names for treatment and control ──
+    # ── 6. Resolve design column names for treatment and control ──
     col_treat = _resolve_design_column(design_cols, group_treatment)
     col_ctrl = _resolve_design_column(design_cols, group_control)
 
@@ -244,7 +333,7 @@ def de_analysis(
 
     contrast_matrix = pylimma.make_contrasts(contrast_formula, levels=design)
 
-    # ── 6. limma-voom pipeline ──
+    # ── 7. limma-voom pipeline ──
     pylimma.voom(adata, design=design.values)
     pylimma.lm_fit(
         adata,
@@ -255,14 +344,14 @@ def de_analysis(
     pylimma.contrasts_fit(adata, contrasts=contrast_matrix.values)
     pylimma.e_bayes(adata)
 
-    # ── 7. Extract results for ALL features ──
+    # ── 8. Extract results for ALL features ──
     de_results = pylimma.top_table(
         adata, coef=0, number=n_features, sort_by="p_value",
     )
 
-    # ── 8. Store results ──
+    # ── 9. Store results ──
     adata.uns["de_results"] = de_results
-    adata.uns["de_params"] = {
+    de_params = {
         "group_col": col,
         "groups": unique_groups,
         "treatment": group_treatment,
@@ -271,6 +360,7 @@ def de_analysis(
         "n_samples": adata.n_obs,
         "n_features": n_features,
     }
+    adata.uns["de_params"] = de_params
 
     print(
         f"[de_analysis] Done. Results stored in "
@@ -278,5 +368,8 @@ def de_analysis(
         f"and adata.uns['de_params'].",
         flush=True,
     )
+
+    # ── 10. Optional persistence to disk ──
+    _persist_de_results(de_results, de_params, output_dir)
 
     return adata

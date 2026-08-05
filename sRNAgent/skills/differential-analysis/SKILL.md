@@ -124,6 +124,10 @@ print(adata.uns["de_params"])
 |------|------|------|
 | `group_col` | 自动检测 | 指定分组列名 |
 | `control_group` | 字母序第一个 | 指定对照组，该组作为比较基线 |
+| `output_dir` | `None` | 把 DE 全表落盘为 `<output_dir>/de_results.csv` 并登记 `<output_dir>/de_results_manifest.json`，结果跨会话可查 |
+| `force` | `False` | 设为 `True` 强制重算（默认：`adata.uns` 已有相同对比的 `de_results` 时直接复用缓存，不重跑） |
+
+> ⚠️ **幂等**：`de_analysis` 检测到 `adata.uns` 中已有相同 group 列 + 相同 treatment/control 的结果时会**跳过重算**（打印 `Cached results found`）。数据或分组变了想重跑时传 `force=True`。
 
 ### 4. 查看特定 miRNA 的差异结果
 
@@ -147,17 +151,54 @@ down = sig[sig["log_fc"] < 0]
 print(f"显著差异: {len(sig)} (上调 {len(up)}, 下调 {len(down)})")
 ```
 
-### 5. 保存结果
+### 5. 保存结果（必须，保证跨会话可查）
 
 ```python
-# 所有结果都在 adata 中，直接保存 h5ad 即可
+# 跑 DE 时直接落盘 CSV + manifest（推荐）
+sa.diff.de_analysis(adata, control_group="Normal", output_dir="de_results")
+
+# 同时把带结果的 adata 写回 h5ad（uns 含 de_results / de_params）
 adata.write("de_results.h5ad")
 
-# 重新加载后结果仍在
+# 保存后 reload 验证结果仍在，再回复用户
 reload = ad.read_h5ad("de_results.h5ad")
+assert "de_results" in reload.uns, "DE 结果未随 h5ad 保存！"
 print(reload.uns["de_results"].head())
 print(reload.uns["de_params"])
 ```
+
+> ⚠️ **持久化契约**：只有把 `uns['de_results']` 存进 h5ad（或落盘 CSV），新会话/新提问才能直接查结果。**如果 h5ad 里没有 DE 结果，不要为了回答查询而偷偷重跑 DE** —— 先按下面的"查询已有结果"流程查找。
+
+### 6. 查询已有差异分析结果（只读查询，禁止重跑）
+
+用户问"XX 的差异分析结果"时，按顺序查找，找到即止，**绝不重跑 DE**：
+
+```python
+import anndata as ad
+import os, glob
+
+# 1) 先看 adata.uns 里有没有
+adata = ad.read_h5ad("de_results.h5ad")  # 或工作区里最近的 h5ad
+if "de_results" in adata.uns:
+    de = adata.uns["de_results"]
+    if "hsa-miR-21-5p" in de.index:
+        print(de.loc["hsa-miR-21-5p"])
+    raise SystemExit  # 找到即止，直接回复用户
+
+# 2) 再看工作区里登记的结果文件
+for manifest in glob.glob("**/de_results_manifest.json", recursive=True):
+    print(open(manifest).read())
+if os.path.exists("de_results/de_results.csv"):
+    import pandas as pd
+    de = pd.read_csv("de_results/de_results.csv", index_col=0)
+    print(de.loc["hsa-miR-21-5p"])
+    raise SystemExit
+
+# 3) 旧 session 记录（run_report.json / chat.json）
+# ... 都没有 → 才向用户说明"现有结果不存在"，询问是否需要重新分析
+```
+
+> ⚠️ 只有全部找不到、且用户明确要求重跑时，才执行新的 DE；重跑前必须告知用户。
 
 ## 附录：如何获取分组信息
 

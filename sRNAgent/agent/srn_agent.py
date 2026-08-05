@@ -815,7 +815,12 @@ def _build_system_prompt(skill_overview: str, extra_system: str = "") -> str:
         "`import sRNAgent as sa` as variable `sa`.\n"
         "4. Prefer `sa.fastq.fastq_dl(...)` and other registered sRNAgent APIs.\n"
         "5. When listing skills, ONLY mention skills from the Registered skills section below.\n"
-        "6. Call `finish` with a concise summary when done.\n\n"
+        "6. Read-only questions about existing results (e.g. 'miRNA-21 的差异分析结果'): "
+        "check adata.uns / result manifests / past sessions FIRST — never re-run "
+        "expensive analysis (DE, quantification, alignment) to answer a lookup.\n"
+        "7. After running analysis, PERSIST results: save the adata (with uns results) "
+        "back to the h5ad and register result file paths in the workspace.\n"
+        "8. Call `finish` with a concise summary when done.\n\n"
         "## Registered skills\n"
         f"{skills_block}\n"
     )
