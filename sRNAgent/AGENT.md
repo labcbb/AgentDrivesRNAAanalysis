@@ -87,3 +87,17 @@ if "trimmed_path" not in adata.obs_keys():
 3. 旧 session 目录（`sessions/*/run_report.json`、`chat.json`）里的已完成记录
 
 **只有全部找不到、且用户明确要求重新分析时，才允许重跑**；重跑前先向用户说明"已有结果不存在，需要重算"。禁止为了回答一个查询问题而重跑昂贵的 limma-voom / 定量 / 比对流程。
+
+### 输出纪律：切片读取，禁止 print 大对象
+
+从 `adata.uns` / `adata.obs` 读结果时，**只输出需要的切片**，禁止 `print(adata)`、`print(整张 DataFrame)` 或打印会生成巨量文本的对象 —— 大输出会触发 LLM 服务端内容过滤（`input new_sensitive`），导致任务被硬中断（历史上因此中断过，agent 被迫改走 CSV 路径）。
+
+```python
+de = adata.uns["de_results"]
+# ✅ 正确：只打印目标行 / 头部
+print(de.loc[["hsa-miR-21-5p", "hsa-miR-21-3p"]])
+print(de.head(10))
+# ❌ 错误：print(de) / print(adata) —— 输出过大触发过滤
+```
+
+优先读取 h5ad 的 `uns`（结果已随 h5ad 持久化），只有 h5ad 里没有时才读工作区 CSV；两条路都要用切片/限制行数的方式输出。

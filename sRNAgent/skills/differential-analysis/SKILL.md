@@ -182,7 +182,7 @@ adata = ad.read_h5ad("de_results.h5ad")  # 或工作区里最近的 h5ad
 if "de_results" in adata.uns:
     de = adata.uns["de_results"]
     if "hsa-miR-21-5p" in de.index:
-        print(de.loc["hsa-miR-21-5p"])
+        print(de.loc["hsa-miR-21-5p"])   # ✅ 切片输出，禁止 print(de) 整表
     raise SystemExit  # 找到即止，直接回复用户
 
 # 2) 再看工作区里登记的结果文件
@@ -191,13 +191,14 @@ for manifest in glob.glob("**/de_results_manifest.json", recursive=True):
 if os.path.exists("de_results/de_results.csv"):
     import pandas as pd
     de = pd.read_csv("de_results/de_results.csv", index_col=0)
-    print(de.loc["hsa-miR-21-5p"])
+    print(de.loc["hsa-miR-21-5p"])       # ✅ 只打印目标行
     raise SystemExit
 
 # 3) 旧 session 记录（run_report.json / chat.json）
 # ... 都没有 → 才向用户说明"现有结果不存在"，询问是否需要重新分析
 ```
 
+> ⚠️ **输出纪律**：查询时只用切片输出（`df.loc[...]` / `df.head(n)`），**禁止 `print(adata)` / `print(整张 DE 表)`** —— 大输出会触发 LLM 服务端内容过滤（`input new_sensitive`），导致任务被硬中断。
 > ⚠️ 只有全部找不到、且用户明确要求重跑时，才执行新的 DE；重跑前必须告知用户。
 
 ## 附录：如何获取分组信息
