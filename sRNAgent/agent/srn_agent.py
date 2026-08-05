@@ -754,6 +754,12 @@ def _parse_progress_output(text: str, *, workspace: Optional[Path] = None, code:
     highlights = highlights[-4:]
     stage = _infer_progress_stage(highlights or candidates)
     detail = _truncate_result("\n".join(highlights or candidates[-2:]), 180)
+    # tRAX 等工具的累计进度标记（如 '[trax] progress: 12/30'）：
+    # 覆盖 stage 显示"已完成 N/M 样本"，让用户能直观看到批量任务进度
+    progress_match = re.search(r"progress:\s*(\d+)\s*/\s*(\d+)", cleaned)
+    if progress_match:
+        done_n, total_n = int(progress_match.group(1)), int(progress_match.group(2))
+        stage = f"已完成 {done_n}/{total_n} 样本"
     base = {
         "stage": stage,
         "highlights": highlights,
