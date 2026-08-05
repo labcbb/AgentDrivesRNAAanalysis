@@ -17,6 +17,7 @@ if str(SRNAGENT_PROJECT) not in sys.path:
 
 from sRNAgent.agent.agent_config import EXECUTION_TIMEOUT_SEC, ExecutionConfig, SandboxFallbackPolicy  # noqa: E402
 from sRNAgent.agent.bootstrap import initialize_registries  # noqa: E402
+from sRNAgent.agent.context import estimate_tokens, truncate_text  # noqa: E402
 from sRNAgent.agent.llm_client import LLMConfig  # noqa: E402
 from sRNAgent.agent.srn_agent import AgentCancelledError, SRNAgent  # noqa: E402
 
@@ -81,6 +82,9 @@ _STREAM_SENTINEL = object()
 _APPROVAL_TIMEOUT_SEC = 600
 _SSE_HEARTBEAT_SEC = 10
 _KERNEL_DRAIN_MAX_SEC = 6 * 3600
+_MAX_MEMORY_CONTEXT_TOKENS = 2400
+_MAX_EXECUTION_CONTEXT_TOKENS = 1200
+_MAX_RUN_CONTEXT_TOKENS = 3200
 
 
 def _default_execution_config(chat_id: str = "") -> ExecutionConfig:
@@ -541,17 +545,37 @@ def approve_code(run_id: str, request_id: str, approved: bool) -> bool:
         return True
 
 
-def _inject_execution_context(extra_system: str, body: Dict[str, Any]) -> str:
-    execution_context = str(body.get("executionContext") or "").strip()
-    if not execution_context:
-        return extra_system
-    block = (
-        "## Recent tool execution (internal context only — do not show or repeat to the user)\n"
-        f"{execution_context}"
+def _trim_context_block(text: str, *, max_tokens: int) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return ""
+    if estimate_tokens(value) <= max_tokens:
+        return value
+    max_chars = max(800, max_tokens * 4)
+    return truncate_text(value, max_chars).strip()
+
+
+def _build_run_context(chat_id: str, body: Dict[str, Any]) -> str:
+    blocks: List[str] = []
+    memory_context = build_session_memory_context(chat_id) if chat_id else ""
+    memory_context = _trim_context_block(memory_context, max_tokens=_MAX_MEMORY_CONTEXT_TOKENS)
+    if memory_context:
+        blocks.append(memory_context)
+
+    execution_context = _trim_context_block(
+        str(body.get("executionContext") or "").strip(),
+        max_tokens=_MAX_EXECUTION_CONTEXT_TOKENS,
     )
-    if extra_system:
-        return f"{extra_system}\n\n{block}"
-    return block
+    if execution_context:
+        blocks.append(
+            "## Recent tool execution（internal context only — do not show or repeat to the user）\n"
+            f"{execution_context}"
+        )
+
+    if not blocks:
+        return ""
+    combined = "\n\n".join(blocks)
+    return _trim_context_block(combined, max_tokens=_MAX_RUN_CONTEXT_TOKENS)
 
 
 def _plan_mode_enabled(agent_cfg: Dict[str, Any]) -> bool:
@@ -568,10 +592,6 @@ def _build_agent(body: Dict[str, Any]) -> tuple[SRNAgent, Dict[str, Any]]:
     chat_id = _resolve_chat_id(body)
     llm_config = LLMConfig.from_ui_payload(account, vendor, agent_cfg)
     extra_system = str(agent_cfg.get("systemPrompt") or "").strip()
-    memory_context = build_session_memory_context(chat_id) if chat_id else ""
-    if memory_context:
-        extra_system = f"{extra_system}\n\n{memory_context}".strip() if extra_system else memory_context
-    extra_system = _inject_execution_context(extra_system, body)
     max_turns = int(agent_cfg.get("maxTurns") or 100)
     max_turns = max(1, min(max_turns, 100))
     agent = SRNAgent(
@@ -684,22 +704,27 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         chat_id = _resolve_chat_id(body)
+        run_context = _build_run_context(chat_id, body)
         use_plan_mode = _plan_mode_enabled(agent_cfg)
         resume = bool(body.get("resume") or body.get("continueRun") or False)
         if use_plan_mode:
             if not resume:
                 clear_plan(chat_id)
-            memory_context = build_session_memory_context(chat_id)
             text = agent.run_planned(
                 messages,
-                extra_context=memory_context,
+                extra_context=run_context,
                 chat_id=chat_id,
                 save_plan=save_plan,
                 load_plan=load_plan,
                 resume=resume,
             )
         else:
-            text = agent.run_with_history(messages, chat_id=chat_id, resume=resume)
+            text = agent.run_with_history(
+                messages,
+                chat_id=chat_id,
+                resume=resume,
+                extra_context=run_context,
+            )
     except AgentCancelledError:
         return {"ok": False, "error": "已停止", "cancelled": True}
     except Exception as exc:  # noqa: BLE001
@@ -968,12 +993,13 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
             on_progress({"type": "status", "message": "Agent 就绪，正在请求 LLM…"})
             use_plan_mode = _plan_mode_enabled(agent_cfg)
+            run_context = _build_run_context(chat_id, body)
             if use_plan_mode:
-                clear_plan(chat_id)
-                memory_context = build_session_memory_context(chat_id)
+                if not resume:
+                    clear_plan(chat_id)
                 text = agent.run_planned(
                     messages,
-                    extra_context=memory_context,
+                    extra_context=run_context,
                     chat_id=chat_id,
                     save_plan=save_plan,
                     load_plan=load_plan,
@@ -989,7 +1015,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                     messages,
                     chat_id=chat_id,
                     resume=resume,
-                    extra_context=build_session_memory_context(chat_id),
+                    extra_context=run_context,
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                     code_approval_callback=request_code_approval,

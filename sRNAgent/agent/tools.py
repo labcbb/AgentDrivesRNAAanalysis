@@ -1,11 +1,74 @@
 """Agent tool handlers wired to sRNAgent function + skill registries."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .execution import ExecutionBackend, execute_agent_code
-from ..skill_registry import SkillRegistry
+from ..skill_registry import SkillDefinition, SkillMetadata, SkillRegistry
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
+
+
+def _tokenize(text: str) -> List[str]:
+    return [token.lower() for token in _TOKEN_RE.findall(str(text or "")) if token.strip()]
+
+
+def rank_skill_matches(
+    skill_registry: Optional[SkillRegistry],
+    query: str,
+) -> List[Tuple[SkillMetadata, int]]:
+    if not skill_registry or not skill_registry.skill_metadata:
+        return []
+    raw_query = str(query or "").strip()
+    if not raw_query:
+        return []
+
+    query_lower = raw_query.lower()
+    query_tokens = _tokenize(raw_query)
+    scored: List[Tuple[SkillMetadata, int]] = []
+
+    for meta in skill_registry.skill_metadata.values():
+        score = 0
+        slug = meta.slug.lower()
+        name = meta.name.lower()
+        description = meta.description.lower()
+        searchable = f"{slug} {name} {description}"
+        meta_tokens = set(_tokenize(searchable))
+
+        if query_lower == slug:
+            score += 120
+        if query_lower == name:
+            score += 100
+        if slug.startswith(query_lower):
+            score += 60
+        if query_lower and query_lower in searchable:
+            score += 35
+
+        for token in query_tokens:
+            if token == slug:
+                score += 40
+            elif token in meta_tokens:
+                score += 18
+            elif token in searchable:
+                score += 10
+
+        if score > 0:
+            scored.append((meta, score))
+
+    scored.sort(key=lambda item: (-item[1], len(item[0].slug), item[0].slug))
+    return scored
+
+
+def resolve_skill_query(
+    skill_registry: Optional[SkillRegistry],
+    query: str,
+) -> Optional[SkillDefinition]:
+    matches = rank_skill_matches(skill_registry, query)
+    if not matches:
+        return None
+    return skill_registry.load_full_skill(matches[0][0].slug) if skill_registry else None
 
 
 def search_functions(function_registry: Any, query: str) -> str:
@@ -39,15 +102,7 @@ def search_skills(skill_registry: Optional[SkillRegistry], query: str) -> str:
     if not skill_registry or not skill_registry.skill_metadata:
         return "No domain skills available."
 
-    query_lower = query.lower()
-    scored: List[tuple[Any, int]] = []
-    for meta in skill_registry.skill_metadata.values():
-        searchable = f"{meta.name} {meta.description} {meta.slug}".lower()
-        score = sum(1 for word in query_lower.split() if word in searchable)
-        if score > 0:
-            scored.append((meta, score))
-
-    scored.sort(key=lambda item: item[1], reverse=True)
+    scored = rank_skill_matches(skill_registry, query)
 
     if not scored:
         slugs = ", ".join(m.slug for m in skill_registry.skill_metadata.values())

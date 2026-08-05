@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from sRNAgent.agent.agent_config import ExecutionConfig
 from sRNAgent.agent.llm_client import ChatCompletion, LLMConfig, ToolCall

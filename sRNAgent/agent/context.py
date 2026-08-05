@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 
 _TRUNCATED_MARKER = "\n…[内容已截断]"
-_SUMMARY_ROLE = "system"
+_SUMMARY_ROLE = "assistant"
 _SUMMARY_PREFIX = "[会话摘要（早期对话已压缩，保留关键决策、路径、参数与结果）]"
 
 
@@ -74,10 +74,25 @@ def should_compact(messages: List[Dict[str, Any]], max_tokens: int) -> bool:
     return max_tokens > 0 and messages_tokens(messages) > max_tokens
 
 
-def _split_system(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    systems = [m for m in messages if m.get("role") == "system"]
-    rest = [m for m in messages if m.get("role") != "system"]
-    return systems, rest
+def _is_summary_message(message: Dict[str, Any]) -> bool:
+    content = str(message.get("content") or "").strip()
+    return bool(content.startswith(_SUMMARY_PREFIX))
+
+
+def _split_messages(
+    messages: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    systems: List[Dict[str, Any]] = []
+    summaries: List[Dict[str, Any]] = []
+    rest: List[Dict[str, Any]] = []
+    for message in messages:
+        if _is_summary_message(message):
+            summaries.append(message)
+        elif message.get("role") == "system":
+            systems.append(message)
+        else:
+            rest.append(message)
+    return systems, summaries, rest
 
 
 def _llm_summarize(
@@ -124,16 +139,16 @@ def _llm_summarize(
 
 
 def _drop_oldest_until_fit(
-    systems: List[Dict[str, Any]],
+    prefix: List[Dict[str, Any]],
     rest: List[Dict[str, Any]],
     max_tokens: int,
     keep_recent: int,
 ) -> List[Dict[str, Any]]:
     """Fallback compaction: drop oldest turns until the budget fits."""
     kept = rest[-keep_recent:]
-    while kept and messages_tokens(systems + kept) > max_tokens and len(kept) > 1:
+    while kept and messages_tokens(prefix + kept) > max_tokens and len(kept) > 1:
         kept = kept[1:]
-    return systems + kept
+    return prefix + kept
 
 
 def compact_messages(
@@ -153,11 +168,11 @@ def compact_messages(
     if len(messages) <= 1:
         return messages
 
-    systems, rest = _split_system(messages)
+    systems, summaries, rest = _split_messages(messages)
     if len(rest) <= keep_recent:
-        return messages
+        return systems + summaries + rest
 
-    to_summarize = rest[:-keep_recent]
+    to_summarize = summaries + rest[:-keep_recent]
     to_keep = rest[-keep_recent:]
 
     summary = _llm_summarize(llm, to_summarize) if llm is not None else ""
@@ -168,4 +183,4 @@ def compact_messages(
 
     if on_compact:
         on_compact("")
-    return _drop_oldest_until_fit(systems, rest, max_tokens, keep_recent)
+    return _drop_oldest_until_fit(systems + summaries, rest, max_tokens, keep_recent)

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+
 from . import agent
-from .Tools import alignment, diff, fastq, quant, reference
 from ._registry import (
     export_registry,
     find_function,
@@ -18,6 +19,12 @@ from .agent import SRNAgent, initialize_registries
 from .skill_registry import SkillRegistry, build_skill_registry
 
 __version__ = "0.1.0"
+
+
+def __getattr__(name: str):
+    if name in {"alignment", "diff", "fastq", "quant", "reference"}:
+        return import_module(f".Tools.{name}", __name__)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "agent",

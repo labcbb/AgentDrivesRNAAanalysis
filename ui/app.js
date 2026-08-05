@@ -282,12 +282,14 @@ chatScroll?.addEventListener("scroll", () => {
 });
 
 let codeStickToBottom = true;
+let suppressCodeAutoScroll = false;
 function _updateCodeStickToBottom() {
   const inner = getCodePanelInner();
   if (!inner) return;
   const distance = inner.scrollHeight - inner.scrollTop - inner.clientHeight;
   codeStickToBottom = distance <= 50;
 }
+agentCodeInner?.addEventListener("scroll", _updateCodeStickToBottom, { passive: true });
 
 function scrollThreadToBottom() {
   if (!chatScroll || !chatStickToBottom) return;
@@ -299,16 +301,35 @@ function scrollThreadToBottom() {
 
 function scrollCodePanelToBottom() {
   const inner = getCodePanelInner();
-  if (!inner || !codeStickToBottom) return;
+  if (!inner || !codeStickToBottom || suppressCodeAutoScroll) return;
   requestAnimationFrame(() => {
     const cur = getCodePanelInner();
-    if (!cur || !codeStickToBottom) return;
+    if (!cur || !codeStickToBottom || suppressCodeAutoScroll) return;
     if (cur.scrollHeight <= cur.clientHeight + 1) {
       cur.scrollTop = 0;
       return;
     }
     cur.scrollTop = cur.scrollHeight;
   });
+}
+
+function captureCodePanelScrollState() {
+  const inner = getCodePanelInner();
+  if (!inner) return null;
+  return {
+    stickToBottom: codeStickToBottom,
+    scrollTop: inner.scrollTop,
+    scrollHeight: inner.scrollHeight,
+    clientHeight: inner.clientHeight,
+  };
+}
+
+function restoreCodePanelScrollState(state) {
+  const inner = getCodePanelInner();
+  if (!inner || !state || state.stickToBottom) return;
+  const maxTop = Math.max(0, inner.scrollHeight - inner.clientHeight);
+  inner.scrollTop = Math.min(state.scrollTop, maxTop);
+  _updateCodeStickToBottom();
 }
 
 function isProgressNoiseLine(line) {
@@ -321,9 +342,152 @@ function isProgressNoiseLine(line) {
   return false;
 }
 
+function countInflightSamples(text) {
+  const value = String(text || "");
+  if (!value) return 0;
+  const tupleMatches = value.match(/\(\s*'[^']*'\s*,\s*'[^']*'\s*\)/g);
+  if (tupleMatches?.length) return tupleMatches.length;
+  const payload = value.split(/[:：]/).slice(1).join(":").trim();
+  if (!payload) return 0;
+  if (payload === "[]" || payload === "{}" || payload === "()") return 0;
+  return 1;
+}
+
+function extractExecutionConcurrency(artifact) {
+  const text = `${artifact?.description || ""} ${artifact?.stage || ""} ${artifact?.progressLabel || ""}`;
+  const jobsMatch = text.match(/\bjobs\s*=\s*(\d+)/i);
+  if (jobsMatch) {
+    const jobs = Number(jobsMatch[1]);
+    if (Number.isFinite(jobs) && jobs > 0) return jobs;
+  }
+  return null;
+}
+
+function inferExecutionPhaseLabel(payload = {}) {
+  const texts = [
+    payload.description,
+    payload.stage,
+    payload.progressLabel,
+    ...(Array.isArray(payload.highlights) ? payload.highlights : []),
+  ]
+    .map((line) => String(line || "").trim())
+    .filter(Boolean);
+  if (!texts.length) return "";
+  const joined = texts.join("\n");
+  const lower = joined.toLowerCase();
+
+  if ((/pirna|piRNA/.test(joined) || /pirna/.test(lower)) && (/quant|count|定量|表达/.test(joined) || /quant|count/.test(lower))) {
+    return "当前任务：piRNA 定量";
+  }
+  if (/mirdeep2|mirdeep/.test(lower) || ((/mirna|miRNA/.test(joined) || /mirna/.test(lower)) && (/quant|count|定量|novel|表达/.test(joined) || /quant|count|novel/.test(lower)))) {
+    return "当前任务：miRNA 定量 / miRDeep2";
+  }
+  if ((/trax/.test(lower) || /trna|tRNA/.test(joined) || /trna/.test(lower)) && (/quant|count|定量|表达/.test(joined) || /quant|count/.test(lower))) {
+    return "当前任务：tRNA 定量";
+  }
+  if (/bowtie|align|alignment|比对/.test(joined) || /bowtie|align/.test(lower)) {
+    return "当前任务：序列比对";
+  }
+  if (/cutadapt|trim|修剪|去接头/.test(joined) || /cutadapt|trim/.test(lower)) {
+    return "当前任务：接头修剪";
+  }
+  if (/fastqc|multiqc|质控|\bqc\b/.test(joined) || /fastqc|multiqc|\bqc\b/.test(lower)) {
+    return "当前任务：质控";
+  }
+  if (/download|下载/.test(joined) || /download/.test(lower)) {
+    return "当前任务：下载数据";
+  }
+  return "";
+}
+
+function resolveExecutionPhaseTitle(event, existing) {
+  const rawHighlights = Array.isArray(event?.highlights)
+    ? event.highlights.filter(Boolean)
+    : String(event?.snippet || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+  const hasProgressFields = Boolean(
+    event?.progressOverallPct != null
+    || event?.progressFilePct != null
+    || event?.progressRun
+    || event?.progressFileTotal
+    || event?.progressBytesTotal
+    || event?.progressLabel
+    || Number(event?.progressBytes) > 0
+    || event?.progressIndeterminate,
+  );
+  const isDownloadTask = Boolean(event?.isDownloadTask || existing?.isDownloadTask || hasProgressFields);
+  const highlights = filterExecutionHighlights(rawHighlights, { isDownloadTask });
+  const phaseDescription = inferExecutionPhaseLabel({
+    description: event?.description || event?.summary || existing?.description || "",
+    stage: event?.stage || existing?.stage || "",
+    progressLabel: event?.progressLabel || existing?.progressLabel || "",
+    highlights,
+  });
+  return {
+    isDownloadTask,
+    highlights,
+    phaseDescription,
+    title: phaseDescription || event?.summary || event?.description || "代码执行中",
+  };
+}
+
+function extractBatchExecutionSummary(artifact) {
+  const texts = [
+    artifact?.stage,
+    artifact?.progressLabel,
+    ...(Array.isArray(artifact?.highlights) ? artifact.highlights : []),
+  ]
+    .map((line) => String(line || "").trim())
+    .filter(Boolean);
+
+  let done = null;
+  let total = null;
+  let running = null;
+
+  texts.forEach((text) => {
+    const batchMatch = text.match(/已完成\s*(\d+)\s*\/\s*(\d+)\s*样本/);
+    if (batchMatch) {
+      done = Number(batchMatch[1]);
+      total = Number(batchMatch[2]);
+      return;
+    }
+    const progressMatch = text.match(/^progress\s*:\s*(\d+)\s*\/\s*(\d+)/i);
+    if (progressMatch) {
+      done = Number(progressMatch[1]);
+      total = Number(progressMatch[2]);
+      return;
+    }
+    if (/^(进行中|inflight)\s*[:：]/i.test(text)) {
+      running = countInflightSamples(text);
+    }
+  });
+
+  if ((!Number.isFinite(running) || running == null) && !artifact?.done && !artifact?.stopped) {
+    const jobs = extractExecutionConcurrency(artifact);
+    if (jobs != null && Number.isFinite(done) && Number.isFinite(total)) {
+      running = Math.max(0, Math.min(jobs, total - done));
+    }
+  }
+
+  if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return null;
+  return {
+    done,
+    total,
+    running: Number.isFinite(running) ? Math.max(0, running) : null,
+  };
+}
+
 function filterExecutionHighlights(highlights, artifact) {
   const items = Array.isArray(highlights) ? highlights.filter(Boolean) : [];
-  const filtered = items.filter((line) => !isProgressNoiseLine(line));
+  const filtered = items.filter((line) => {
+    const text = String(line || "").trim();
+    if (isProgressNoiseLine(text)) return false;
+    if (/^progress\s*:\s*\d+\s*\/\s*\d+/i.test(text)) return false;
+    if (/^(进行中|inflight)\s*[:：]/i.test(text)) return false;
+    return true;
+  });
   if (artifact?.isDownloadTask) return [];
   return filtered;
 }
@@ -440,11 +604,21 @@ function normalizeMessage(item) {
       : String(item?.content || ""),
   };
   if (role === "assistant" && Array.isArray(item?.thinkingSteps)) {
-    message.thinkingSteps = item.thinkingSteps.map((step) => ({
+    const normalizedSteps = item.thinkingSteps.map((step) => ({
+      id: step?.id ? String(step.id) : "",
       kind: String(step?.kind || "tool"),
       title: String(step?.title || ""),
       body: step?.body ? String(step.body) : "",
     }));
+    const lastPlanStep = normalizedSteps.filter((step) => step.kind === "plan").at(-1) || null;
+    message.thinkingSteps = normalizedSteps.filter((step) => {
+      if (step.kind !== "plan") return true;
+      return step === lastPlanStep;
+    });
+    const storedRoundCount = Number(item?.thinkingRoundCount);
+    message.thinkingRoundCount = Number.isFinite(storedRoundCount) && storedRoundCount > 0
+      ? storedRoundCount
+      : normalizedSteps.length;
   }
   if (role === "assistant" && Array.isArray(item?.executionLog)) {
     message.executionLog = item.executionLog.map((entry) => ({
@@ -599,16 +773,32 @@ function ensureActiveChatRecord() {
   return chat;
 }
 
-function recordThinkingStep(step) {
+function recordThinkingStep(step, options = {}) {
   const chat = ensureActiveChatRecord();
   const entry = chatHistory[chatHistory.length - 1];
   if (!entry || entry.role !== "assistant") return;
   if (!Array.isArray(entry.thinkingSteps)) entry.thinkingSteps = [];
-  entry.thinkingSteps.push({
+  const nextStep = {
+    id: step.id || "",
     kind: step.kind || "tool",
     title: step.title || "",
     body: step.body || "",
-  });
+  };
+  if (nextStep.id) {
+    const index = entry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id);
+    if (index >= 0) {
+      entry.thinkingSteps[index] = nextStep;
+    } else {
+      entry.thinkingSteps.push(nextStep);
+    }
+  } else {
+    entry.thinkingSteps.push(nextStep);
+  }
+  const roundIncrement = Number(options.roundIncrement ?? 1);
+  if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
+    const current = Number(entry.thinkingRoundCount) || 0;
+    entry.thinkingRoundCount = Math.max(0, current + roundIncrement);
+  }
   persistActiveChat();
 }
 
@@ -963,28 +1153,23 @@ function syncRunStatusToUI(chatId, status, options = {}) {
       }
     }
     if (status.plan?.steps?.length && target) {
-      const done = status.plan.steps.filter((s) => s.status === "done").length;
-      const total = status.plan.steps.length;
-      const planTitle = status.plan.goal || "执行计划";
-      const stepsEl = getThinkingStepsEl(target);
-      const existingPlan = stepsEl?.querySelector(".chat-thinking__step--plan");
-      if (!existingPlan) {
-        appendThinkingStep(
-          target,
-          {
-            kind: "plan",
-            title: `${planTitle} (${done}/${total})`,
-            body: status.plan.steps
-              .map((s) => {
-                const mark =
-                  s.status === "done" ? "✓" : s.status === "running" ? "▶" : s.status === "failed" ? "✗" : "○";
-                return `${mark} ${s.title || s.goal || s.id}`;
-              })
-              .join("\n"),
-          },
-          { persist: false },
-        );
-      }
+      const planTitle = resolvePlanSnapshotTitle(status.plan.goal);
+      appendThinkingStep(
+        target,
+        {
+          id: "current-plan",
+          kind: "plan",
+          title: planTitle,
+          body: status.plan.steps
+            .map((s) => {
+              const mark =
+                s.status === "done" ? "✓" : s.status === "running" ? "▶" : s.status === "failed" ? "✗" : "○";
+              return `${mark} ${s.title || s.goal || s.id}`;
+            })
+            .join("\n"),
+        },
+        { persist: false },
+      );
     }
     ensureBackgroundExecutionCard(status, { showStop: isActiveChatSending() });
     scrollThreadToBottom();
@@ -1140,7 +1325,13 @@ function applyLiveFollowEvent(chatId, event) {
   const messages = chat.messages || [];
   let assistantEntry = [...messages].reverse().find((item) => item.role === "assistant");
   if (!assistantEntry) {
-    assistantEntry = { role: "assistant", content: "实时同步中…", thinkingSteps: [], executionLog: [] };
+    assistantEntry = {
+      role: "assistant",
+      content: "实时同步中…",
+      thinkingSteps: [],
+      thinkingRoundCount: 0,
+      executionLog: [],
+    };
     messages.push(assistantEntry);
     chat.messages = messages;
   }
@@ -1450,6 +1641,8 @@ function renderChatThread() {
     const group = appendMessage(item.role, item.role === "assistant" ? assistantContentForDisplay(item) || fallback : (item.content || fallback));
     if (item.role === "assistant" && Array.isArray(item.thinkingSteps) && item.thinkingSteps.length) {
       item.thinkingSteps.forEach((step) => appendThinkingStep(group, step, { persist: false }));
+      setThinkingRoundCount(group, item.thinkingRoundCount || item.thinkingSteps.length);
+      updateThinkingSummaryCount(getThinkingStepsEl(group));
       const thinkingEl = group.querySelector(".chat-thinking");
       if (thinkingEl) thinkingEl.open = false;
     }
@@ -1783,13 +1976,47 @@ function getThinkingSummaryEl(group) {
   return group?.querySelector(".chat-thinking__summary") || null;
 }
 
+function resolvePlanSnapshotTitle(goal, eventType = "") {
+  const baseTitle = String(goal || "").trim() || "当前流程";
+  if (eventType === "plan_revised") return `${baseTitle}（已更新）`;
+  if (eventType === "plan_complete") return `${baseTitle}（已完成）`;
+  return baseTitle;
+}
+
+function setThinkingRoundCount(group, roundCount) {
+  const panel = group?.querySelector(".chat-thinking");
+  if (!panel) return;
+  const value = Number(roundCount);
+  panel.dataset.roundCount = Number.isFinite(value) && value > 0 ? String(value) : "0";
+}
+
+function updateThinkingSummaryCount(stepsEl) {
+  if (!stepsEl) return;
+  const panel = stepsEl.closest(".chat-thinking");
+  const summaryEl = panel?.querySelector(".chat-thinking__summary");
+  if (summaryEl) {
+    const roundCount = Number(panel?.dataset.roundCount || 0);
+    const suffix = roundCount > 0 ? `，累计 ${roundCount} 轮` : "";
+    summaryEl.textContent = `Thinking (${stepsEl.children.length}${suffix})`;
+  }
+}
+
 function appendThinkingStep(group, step, options = {}) {
   ensureThinkingPanel(group);
   const stepsEl = getThinkingStepsEl(group);
   if (!stepsEl) return;
 
-  const item = document.createElement("div");
-  item.className = `chat-thinking__step chat-thinking__step--${step.kind}`;
+  const stepId = String(step?.id || "").trim();
+  let item = stepId ? stepsEl.querySelector(`.chat-thinking__step[data-step-id="${CSS.escape(stepId)}"]`) : null;
+  if (!item) {
+    item = document.createElement("div");
+    item.className = `chat-thinking__step chat-thinking__step--${step.kind}`;
+    if (stepId) item.dataset.stepId = stepId;
+    stepsEl.appendChild(item);
+  } else {
+    item.className = `chat-thinking__step chat-thinking__step--${step.kind}`;
+    item.innerHTML = "";
+  }
 
   const title = document.createElement("div");
   title.className = "chat-thinking__step-title";
@@ -1803,17 +2030,17 @@ function appendThinkingStep(group, step, options = {}) {
     item.appendChild(body);
   }
 
-  stepsEl.appendChild(item);
-
-  const summaryEl = getThinkingSummaryEl(group);
-  const count = stepsEl.children.length;
-  if (summaryEl) {
-    summaryEl.textContent = `Thinking (${count})`;
+  const roundIncrement = Number(options.roundIncrement ?? (options.persist !== false ? 1 : 0));
+  if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
+    const panel = stepsEl.closest(".chat-thinking");
+    const currentRounds = Number(panel?.dataset.roundCount || 0) || 0;
+    if (panel) panel.dataset.roundCount = String(Math.max(0, currentRounds + roundIncrement));
   }
+  updateThinkingSummaryCount(stepsEl);
   scrollThreadToBottom();
 
   if (options.persist !== false) {
-    recordThinkingStep(step);
+    recordThinkingStep(step, { roundIncrement });
   }
 }
 
@@ -2095,8 +2322,29 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
     ? `· ${artifact.elapsedLabel}`
     : "";
   card.querySelector(".code-execution-progress__desc").textContent = artifact.description || "";
-  card.querySelector(".code-execution-progress__stage").textContent =
-    artifact.stage || (artifact.stopped ? "已终止" : artifact.done ? "已完成" : "运行中");
+  const batchSummary = extractBatchExecutionSummary(artifact);
+  const hasBatchSummary = Boolean(batchSummary && !artifact.done && !artifact.stopped);
+  const concurrency = extractExecutionConcurrency(artifact);
+  const runningCount = batchSummary?.running ?? concurrency;
+  const phaseSummary = hasBatchSummary
+    ? [
+      `总样本 ${batchSummary.total}`,
+      runningCount != null ? `运行中 ${runningCount}` : "",
+      `已完成 ${batchSummary.done}`,
+    ].filter(Boolean).join(" · ")
+    : [
+      artifact.elapsedLabel ? `已运行 ${artifact.elapsedLabel}` : "",
+      runningCount != null ? `并行任务 ${runningCount}` : "",
+      artifact.done ? "当前进度 已完成" : artifact.stopped ? "当前进度 已终止" : "当前进度 等待首个状态",
+    ].filter(Boolean).join(" · ");
+  const stageLabelEl = card.querySelector(".code-execution-progress__stage-label");
+  const stageEl = card.querySelector(".code-execution-progress__stage");
+  if (stageLabelEl) {
+    stageLabelEl.textContent = hasBatchSummary ? "样本进度" : "运行概况";
+  }
+  if (stageEl) {
+    stageEl.textContent = phaseSummary || (artifact.stage || (artifact.stopped ? "已终止" : artifact.done ? "已完成" : "运行中"));
+  }
 
   const highlights = filterExecutionHighlights(artifact.highlights, artifact);
   const listEl = card.querySelector(".code-execution-progress__highlights");
@@ -2133,17 +2381,12 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
     }
   }
   // 批量任务进度（stage 含"已完成 12/30 样本"）：用百分比驱动进度条
-  let batchProgressDone = 0;
-  let batchProgressTotal = 0;
-  const stageText = artifact.stage || "";
-  const batchMatch = stageText.match(/已完成\s*(\d+)\s*\/\s*(\d+)/);
-  if (batchMatch) {
-    batchProgressDone = Number(batchMatch[1]);
-    batchProgressTotal = Number(batchMatch[2]);
-    if (batchProgressTotal > 0 && !hasPct && filePct == null) {
-      overallPct = (batchProgressDone / batchProgressTotal) * 100;
-      hasPct = true;
-    }
+  const batchProgressDone = batchSummary?.done || 0;
+  const batchProgressTotal = batchSummary?.total || 0;
+  const batchRunning = batchSummary?.running;
+  if (batchProgressTotal > 0 && !hasPct && filePct == null) {
+    overallPct = (batchProgressDone / batchProgressTotal) * 100;
+    hasPct = true;
   }
   const hasBytes = Number(artifact.progressBytes) > 0;
   const hasProgress =
@@ -2176,9 +2419,9 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
 
   const runLabel = artifact.progressRun || "";
   let displayLabel = artifact.progressLabel || artifact.stage || "下载中…";
-  // 批量任务进度：进度条标签直接显示"已完成 X/Y（Z%）"
-  if (batchProgressTotal > 0 && overallPct > 0) {
-    displayLabel = `已完成 ${batchProgressDone}/${batchProgressTotal}（${overallPct.toFixed(1)}%）`;
+  // 批量任务进度：显示整体样本完成度，避免把 inflight 原始列表塞进 UI
+  if (batchProgressTotal > 0) {
+    displayLabel = `样本进度 ${batchProgressDone}/${batchProgressTotal}（${overallPct.toFixed(1)}%）`;
   }
   if (runLabel && fileIndex && fileTotal && hasPct && filePct != null) {
     displayLabel = `${runLabel} · 本文件 ${filePct.toFixed(1)}% · 整体 ${Number(barPct).toFixed(1)}% (${fileIndex}/${fileTotal})`;
@@ -2192,8 +2435,24 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
   if (barWrap && barFill) {
     barFill.classList.remove("code-execution-progress__bar-fill--indeterminate");
     if (!hasProgress) {
-      barWrap.hidden = true;
-      barFill.style.width = "0";
+      if (!artifact.done && !artifact.stopped) {
+        barWrap.hidden = false;
+        barFill.classList.add("code-execution-progress__bar-fill--indeterminate");
+        barFill.style.width = "";
+        if (barLabel) {
+          barLabel.textContent = "任务已启动，等待进度输出";
+        }
+        if (barMeta) {
+          barMeta.textContent = [
+            artifact.elapsedLabel ? `已运行 ${artifact.elapsedLabel}` : "",
+            runningCount != null ? `并行任务 ${runningCount}` : "",
+            artifact.stage ? `状态 ${artifact.stage}` : "",
+          ].filter(Boolean).join(" · ");
+        }
+      } else {
+        barWrap.hidden = true;
+        barFill.style.width = "0";
+      }
     } else {
       barWrap.hidden = false;
       barFill.classList.toggle(
@@ -2210,7 +2469,13 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
         barLabel.textContent = displayLabel;
       }
       if (barMeta) {
-        if (Number.isFinite(bytes) && Number.isFinite(bytesTotal) && bytesTotal > 0) {
+        if (batchProgressTotal > 0) {
+          barMeta.textContent = [
+            `总样本 ${batchProgressTotal}`,
+            batchRunning != null ? `运行中 ${batchRunning}` : "",
+            `已完成 ${batchProgressDone}`,
+          ].filter(Boolean).join(" · ");
+        } else if (Number.isFinite(bytes) && Number.isFinite(bytesTotal) && bytesTotal > 0) {
           const fmt = (value) => `${(value / 1024 / 1024).toFixed(1)} MB`;
           const fileText = filePct != null ? `本文件 ${filePct.toFixed(1)}%` : "";
           const overallText = `整体 ${Number(barPct).toFixed(1)}%`;
@@ -2297,6 +2562,9 @@ function renderExecutionArtifact(artifact, options = {}) {
 
 function renderCodePanel(codePanel, options = {}) {
   const interactive = Boolean(options.interactive) || isActiveChatSending();
+  const scrollState = captureCodePanelScrollState();
+  const preserveScroll = Boolean(scrollState && !scrollState.stickToBottom);
+  suppressCodeAutoScroll = preserveScroll;
   resetCodePanel();
 
   const normalized = (compactCodePanelForRender(codePanel) || []).map((item) => {
@@ -2323,9 +2591,14 @@ function renderCodePanel(codePanel, options = {}) {
       });
     }
   });
+  suppressCodeAutoScroll = false;
   syncCodePanelVisibility();
   void hydrateExecutionCodes();
-  scrollCodePanelToBottom();
+  if (preserveScroll) {
+    restoreCodePanelScrollState(scrollState);
+  } else {
+    scrollCodePanelToBottom();
+  }
 }
 
 function markApprovalCard(card, status) {
@@ -2514,13 +2787,6 @@ function ensureCodeExecutionProgress(_group, executionId) {
 }
 
 function updateCodeExecutionProgress(group, event) {
-  // 首次拿到 code panel inner 时绑定 scroll 监听（stick-to-bottom）
-  const _codeInner = getCodePanelInner();
-  if (_codeInner && !_codeInner._stickBound) {
-    _codeInner.addEventListener("scroll", _updateCodeStickToBottom);
-    _codeInner._stickBound = true;
-  }
-
   if (event.type === "code_execution_started") {
     markRunningExecutionsStopped();
     removeBackgroundExecutionCard();
@@ -2550,25 +2816,14 @@ function updateCodeExecutionProgress(group, event) {
   const title = event.type === "code_execution_started" ? "代码已开始运行" : "代码仍在运行";
   const stageText = event.stage || (event.type === "code_execution_started" ? "已启动，等待输出" : "运行中");
 
-  const hasProgressFields = Boolean(
-    event.progressOverallPct != null
-    || event.progressFilePct != null
-    || event.progressRun
-    || event.progressFileTotal
-    || event.progressBytesTotal
-    || event.progressLabel
-    || Number(event.progressBytes) > 0
-    || event.progressIndeterminate,
+  const {
+    isDownloadTask,
+    highlights,
+    phaseDescription,
+  } = resolveExecutionPhaseTitle(
+    { ...event, stage: stageText },
+    existing,
   );
-  const isDownloadTask = Boolean(event.isDownloadTask || existing?.isDownloadTask || hasProgressFields);
-
-  const rawHighlights = Array.isArray(event.highlights)
-    ? event.highlights.filter(Boolean)
-    : String(event.snippet || "")
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-  const highlights = filterExecutionHighlights(rawHighlights, { isDownloadTask });
 
   let hint = "点击「停止」将中断 Jupyter 内核中的代码。";
   if (isDownloadTask) {
@@ -2581,7 +2836,7 @@ function updateCodeExecutionProgress(group, event) {
     type: "execution",
     id: executionId,
     title,
-    description: event.description || event.summary || existing?.description || "",
+    description: phaseDescription || event.description || event.summary || existing?.description || "",
     code: executionCode,
     stage: stageText,
     highlights: highlights.slice(-4),
@@ -2812,14 +3067,30 @@ function finishBackgroundCodeProgress(streamChatId) {
   stream.codeExecutionId = null;
 }
 
-function appendThinkingStepToEntry(assistantEntry, step) {
+function appendThinkingStepToEntry(assistantEntry, step, options = {}) {
   if (!assistantEntry) return;
   if (!Array.isArray(assistantEntry.thinkingSteps)) assistantEntry.thinkingSteps = [];
-  assistantEntry.thinkingSteps.push({
+  const nextStep = {
+    id: step.id || "",
     kind: step.kind || "tool",
     title: step.title || "",
     body: step.body || "",
-  });
+  };
+  if (nextStep.id) {
+    const index = assistantEntry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id);
+    if (index >= 0) {
+      assistantEntry.thinkingSteps[index] = nextStep;
+    } else {
+      assistantEntry.thinkingSteps.push(nextStep);
+    }
+  } else {
+    assistantEntry.thinkingSteps.push(nextStep);
+  }
+  const roundIncrement = Number(options.roundIncrement ?? 1);
+  if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
+    const current = Number(assistantEntry.thinkingRoundCount) || 0;
+    assistantEntry.thinkingRoundCount = Math.max(0, current + roundIncrement);
+  }
 }
 
 function handleAgentStreamEventBackground(streamChatId, streamMessages, assistantEntry, event) {
@@ -2849,9 +3120,11 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
       }
     }
     if (event.plan?.steps?.length) {
+      const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
       appendThinkingStepToEntry(assistantEntry, {
+        id: "current-plan",
         kind: "plan",
-        title: event.plan.goal || "执行计划",
+        title: planTitle,
         body: event.plan.steps
           .map((s) => {
             const mark =
@@ -2864,12 +3137,6 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     return;
   }
   if (event.type === "code_execution_started" || event.type === "code_execution_progress") {
-    const stage = event.stage || (event.type === "code_execution_started" ? "已启动" : "运行中");
-    appendThinkingStepToEntry(assistantEntry, {
-      kind: "tool",
-      title: event.summary || event.description || "代码执行中",
-      body: stage,
-    });
     recordBackgroundCodeProgress(streamChatId, event);
     return;
   }
@@ -2881,14 +3148,7 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     freezeAssistantFinalText(assistantEntry, stripExecutionMemoryBlock(event.content));
     return;
   }
-  if (event.type === "thinking" && String(event.content || "").trim()) {
-    appendThinkingStepToEntry(assistantEntry, {
-      kind: "thinking",
-      title: "Thinking",
-      body: event.content,
-    });
-    return;
-  }
+  if (event.type === "thinking" && String(event.content || "").trim()) return;
   if (event.type === "tool_call" && event.name !== "finish") {
     appendExecutionLog(
       { tool: event.name, title: event.summary || event.name, summary: "" },
@@ -2897,7 +3157,7 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     );
     appendThinkingStepToEntry(assistantEntry, {
       kind: "tool",
-      title: event.summary || event.name,
+      title: event.name === "execute_code" ? "开始执行代码" : (event.summary || event.name),
     });
     return;
   }
@@ -2910,8 +3170,7 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     if (event.name === "execute_code") {
       appendThinkingStepToEntry(assistantEntry, {
         kind: "result",
-        title: event.summary || "execute_code 完成",
-        body: event.content || "",
+        title: "代码执行完成",
       });
       finishBackgroundCodeProgress(streamChatId);
       if (streamChatId === activeChatId) {
@@ -2994,12 +3253,11 @@ function handleAgentStreamEvent(group, event) {
       }
     }
     if (event.plan?.steps?.length) {
-      const done = event.plan.steps.filter((s) => s.status === "done").length;
-      const total = event.plan.steps.length;
-      const planTitle = event.plan.goal || "执行计划";
+      const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
       appendThinkingStep(group, {
+        id: "current-plan",
         kind: "plan",
-        title: `${planTitle} (${done}/${total})`,
+        title: planTitle,
         body: event.plan.steps
           .map((s) => {
             const mark =
@@ -3033,14 +3291,7 @@ function handleAgentStreamEvent(group, event) {
     return;
   }
 
-  if (event.type === "thinking" && String(event.content || "").trim()) {
-    appendThinkingStep(group, {
-      kind: "thinking",
-      title: "Thinking",
-      body: event.content,
-    });
-    return;
-  }
+  if (event.type === "thinking" && String(event.content || "").trim()) return;
 
   if (event.type === "tool_call" && event.name !== "finish") {
     appendExecutionLog({
@@ -3050,7 +3301,7 @@ function handleAgentStreamEvent(group, event) {
     });
     appendThinkingStep(group, {
       kind: "tool",
-      title: event.summary || event.name,
+      title: event.name === "execute_code" ? "开始执行代码" : (event.summary || event.name),
     });
     return;
   }
@@ -3070,8 +3321,7 @@ function handleAgentStreamEvent(group, event) {
       finishCodeExecutionProgress(group);
       appendThinkingStep(group, {
         kind: "result",
-        title: event.summary || "execute_code 完成",
-        body: event.content || "",
+        title: "代码执行完成",
       });
     }
     return;
@@ -3278,7 +3528,7 @@ async function handleSend() {
     persistChatMessages(streamChatId, streamMessages);
     appendMessage("user", value);
     streamMessages.push({ role: "user", content: value });
-    assistantEntry = { role: "assistant", content: "", thinkingSteps: [] };
+    assistantEntry = { role: "assistant", content: "", thinkingSteps: [], thinkingRoundCount: 0 };
     streamMessages.push(assistantEntry);
     ensureActiveChatRecord();
     persistChatMessages(streamChatId, streamMessages);
@@ -3459,7 +3709,7 @@ async function handleSend() {
       });
       if (assistantEntry && finalText) freezeAssistantFinalText(assistantEntry, finalText);
       else if (!assistantEntry) {
-        streamMessages.push({ role: "assistant", content: finalText || "", thinkingSteps: [] });
+        streamMessages.push({ role: "assistant", content: finalText || "", thinkingSteps: [], thinkingRoundCount: 0 });
       }
       if (streamChatId === activeChatId) {
         const displayText = finalText || "（无回复内容）";

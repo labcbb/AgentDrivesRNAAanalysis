@@ -402,7 +402,15 @@ def is_orphan_session(chat_id: str) -> bool:
     if isinstance(plan, dict) and isinstance(plan.get("steps"), list) and plan["steps"]:
         return False
     memory = _read_json(path / "session_memory.json")
-    if isinstance(memory, dict) and (memory.get("events") or memory.get("entries")):
+    if isinstance(memory, dict) and (
+        memory.get("steps")
+        or memory.get("artifacts")
+        or memory.get("facts")
+        or memory.get("updatedAt")
+    ):
+        return False
+    work_log = path / "work_log.jsonl"
+    if work_log.exists() and work_log.stat().st_size > 0:
         return False
     replay = path / "replay.py"
     if replay.exists() and replay.stat().st_size > 0:

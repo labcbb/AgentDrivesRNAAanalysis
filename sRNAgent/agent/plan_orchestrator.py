@@ -9,7 +9,7 @@ import json
 import re
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from .tools import list_available_skills
+from .tools import list_available_skills, resolve_skill_query
 
 if TYPE_CHECKING:
     from .srn_agent import SRNAgent, ProgressCallback, CodeApprovalCallback
@@ -204,12 +204,20 @@ def _build_executor_system_prompt(
     step_index: int,
     step_total: int,
     plan_goal: str,
+    skill_prompt: str = "",
 ) -> str:
     skill_hint = ""
     if step.get("skill"):
         skill_hint = (
             f"\nRecommended skill for this step: `{step['skill']}` "
             "(call search_skills first if you need workflow guidance)."
+        )
+    skill_block = ""
+    if skill_prompt:
+        skill_block = (
+            "\n## Bound workflow skill for this subtask\n"
+            "Follow the workflow constraints below as hard guidance for this step.\n\n"
+            f"{skill_prompt}\n"
         )
     step_block = (
         f"\n## Current subtask ({step_index}/{step_total})\n"
@@ -224,7 +232,7 @@ def _build_executor_system_prompt(
         "'Task completed', 'Step done').\n"
         "- The Jupyter kernel state (e.g. adata) persists across steps.\n"
     )
-    return f"{agent_system_prompt}\n{step_block}"
+    return f"{agent_system_prompt}\n{skill_block}{step_block}"
 
 
 def _build_step_user_message(
@@ -521,6 +529,12 @@ class PlanOrchestrator:
         code_approval_callback: Optional["CodeApprovalCallback"] = None,
     ) -> str:
         checkpoint_extra = {"plan": plan, "step_id": step.get("id")}
+        bound_skill = None
+        skill_prompt = ""
+        if str(step.get("skill") or "").strip():
+            bound_skill = resolve_skill_query(self.agent.skill_registry, str(step.get("skill") or ""))
+            if bound_skill is not None:
+                skill_prompt = bound_skill.prompt_instructions(max_chars=5000)
 
         # Single-step chat-like tasks: use normal conversation loop (no subtask framing).
         if step_total == 1 and not str(step.get("skill") or "").strip():
@@ -555,6 +569,7 @@ class PlanOrchestrator:
             step_index=step_index,
             step_total=step_total,
             plan_goal=plan_goal,
+            skill_prompt=skill_prompt,
         )
         if resume_messages:
             messages: List[Dict[str, Any]] = resume_messages

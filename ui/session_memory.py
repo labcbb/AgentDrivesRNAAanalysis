@@ -17,10 +17,16 @@ _WORK_LOG_FILE = "work_log.jsonl"
 _LOCK = threading.RLock()
 _MAX_STEPS = 48
 _MAX_ARTIFACTS = 64
+_MAX_FACTS = 32
 _MAX_WORK_LOG_LINES = 200
 
 _ARTIFACT_RE = re.compile(
-    r"(?:[\w./-]+/)?[\w.-]+\.(?:fastq(?:\.gz)?|fa(?:\.gz)?|gtf(?:\.gz)?|tsv|csv|bam|bai|dict)(?:\b|$)",
+    r"(?:[\w./-]+/)?[\w.-]+\.(?:"
+    r"fastq(?:\.gz)?|fq(?:\.gz)?|fa(?:\.gz)?|fasta(?:\.gz)?|"
+    r"gtf(?:\.gz)?|gff(?:\.gz)?|bed|tsv|csv|json|yaml|yml|"
+    r"bam|bai|sam|dict|html|pdf|png|jpg|jpeg|svg|"
+    r"h5ad|h5mu|ipynb|xlsx|xls|txt"
+    r")(?:\b|$)",
     re.IGNORECASE,
 )
 _RUN_RE = re.compile(r"\b(SRR|ERR|DRR|SRP|GSE|GSM)\d+\b")
@@ -29,7 +35,24 @@ _IMPORTANT_DIRS = (
     "ref",
     "metadata_srna",
     "metadata",
-    "srp335685_pipeline",
+    "pipeline",
+    "results",
+    "report",
+    "reports",
+    "figures",
+    "plots",
+    "aligned",
+    "counts",
+    "qc",
+    "trimmed",
+)
+_FACT_PATTERNS = (
+    re.compile(r"(adapter|接头).{0,40}(确认|使用|设为|设置为|为)\s*[:：]?\s*([^\n，。;；]{1,120})", re.I),
+    re.compile(r"(分组|group).{0,20}(确认|使用|设为|设置为)\s*[:：]?\s*([^\n，。;；]{1,120})", re.I),
+    re.compile(r"(novel miRNA).{0,20}(关闭|禁用|启用|开启|false|true)", re.I),
+    re.compile(r"(链特异性|strand(?:ed)?).{0,20}(确认|为|设为|设置为)\s*[:：]?\s*([^\n，。;；]{1,120})", re.I),
+    re.compile(r"\b(jobs\s*=\s*\d+)\b", re.I),
+    re.compile(r"\b(force\s*=\s*(?:True|False))\b", re.I),
 )
 
 
@@ -44,15 +67,17 @@ def _utc_now() -> str:
 
 def load_session_memory(chat_id: str) -> Dict[str, Any]:
     if not chat_id:
-        return {"steps": [], "artifacts": [], "updatedAt": None}
+        return {"steps": [], "artifacts": [], "facts": [], "updatedAt": None}
     payload = _read_json(_memory_path(chat_id))
     if not payload:
-        return {"steps": [], "artifacts": [], "updatedAt": None}
+        return {"steps": [], "artifacts": [], "facts": [], "updatedAt": None}
     steps = payload.get("steps") if isinstance(payload.get("steps"), list) else []
     artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), list) else []
+    facts = payload.get("facts") if isinstance(payload.get("facts"), list) else []
     return {
         "steps": steps,
         "artifacts": [str(item) for item in artifacts if str(item).strip()],
+        "facts": [str(item) for item in facts if str(item).strip()],
         "updatedAt": payload.get("updatedAt"),
     }
 
@@ -65,6 +90,7 @@ def save_session_memory(chat_id: str, payload: Dict[str, Any]) -> None:
         "chatId": chat_id,
         "steps": payload.get("steps") or [],
         "artifacts": payload.get("artifacts") or [],
+        "facts": payload.get("facts") or [],
         "updatedAt": _utc_now(),
     }
     with _LOCK:
@@ -86,6 +112,22 @@ def _extract_artifacts(text: str) -> List[str]:
             if candidate not in seen:
                 seen.add(candidate)
                 found.append(candidate)
+    return found
+
+
+def _extract_facts(text: str) -> List[str]:
+    found: List[str] = []
+    seen: set[str] = set()
+    raw = str(text or "")
+    if not raw:
+        return found
+    for pattern in _FACT_PATTERNS:
+        for match in pattern.finditer(raw):
+            fact = " ".join(part.strip() for part in match.groups() if part and str(part).strip())
+            fact = re.sub(r"\s+", " ", fact).strip(" :：-")
+            if fact and fact not in seen:
+                seen.add(fact)
+                found.append(fact[:180])
     return found
 
 
@@ -112,6 +154,11 @@ def _append_step(chat_id: str, summary: str, *, tool: str = "", detail: str = ""
             if item not in artifacts:
                 artifacts.append(item)
         memory["artifacts"] = artifacts[-_MAX_ARTIFACTS:]
+        facts = list(memory.get("facts") or [])
+        for item in _extract_facts(f"{summary}\n{detail}"):
+            if item not in facts:
+                facts.append(item)
+        memory["facts"] = facts[-_MAX_FACTS:]
         save_session_memory(chat_id, memory)
 
 
@@ -172,6 +219,8 @@ def build_workspace_manifest(*, max_files: int = 36) -> str:
 
     def add_file(path: Path) -> None:
         rel = str(path.relative_to(root))
+        if rel.startswith("sessions/") or "/sessions/" in rel:
+            return
         if rel in seen or not path.is_file():
             return
         try:
@@ -189,7 +238,21 @@ def build_workspace_manifest(*, max_files: int = 36) -> str:
             if path.is_file():
                 add_file(path)
 
-    for pattern in ("**/fastq-run-info.tsv", "**/*run-info*.tsv", "**/*.fa.gz"):
+    for pattern in (
+        "**/fastq-run-info.tsv",
+        "**/*run-info*.tsv",
+        "**/*.fa.gz",
+        "**/*.h5ad",
+        "**/*.html",
+        "**/*.pdf",
+        "**/*.png",
+        "**/*.svg",
+        "**/*.json",
+        "**/*.ipynb",
+        "**/*.xlsx",
+        "**/*counts*.csv",
+        "**/*de_results*.csv",
+    ):
         for path in sorted(root.glob(pattern)):
             if path.is_file():
                 add_file(path)
@@ -213,10 +276,11 @@ def build_session_memory_context(chat_id: str) -> str:
     memory = load_session_memory(chat_id)
     steps = memory.get("steps") or []
     artifacts = memory.get("artifacts") or []
+    facts = memory.get("facts") or []
     manifest = build_workspace_manifest()
     errors_context = build_session_errors_context(chat_id)
 
-    if not steps and not artifacts and not manifest and not errors_context:
+    if not steps and not artifacts and not facts and not manifest and not errors_context:
         return ""
 
     lines = [
@@ -235,6 +299,12 @@ def build_session_memory_context(chat_id: str) -> str:
             summary = str(step.get("summary") or "").strip()
             if summary:
                 lines.append(f"- {summary}")
+
+    if facts:
+        lines.append("")
+        lines.append("### 已确认的关键事实")
+        for item in facts[-12:]:
+            lines.append(f"- {item}")
 
     if artifacts:
         lines.append("")

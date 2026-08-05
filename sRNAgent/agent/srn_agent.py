@@ -62,6 +62,12 @@ _REFERENCE_DL_RE = re.compile(
     re.IGNORECASE,
 )
 _OUTDIR_RE = re.compile(r"""output_dir\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_INTERNAL_REPORT_RE = re.compile(
+    r"已向用户|已向用户发送|已向.*发送|等待.{0,8}下一步|等待用户|"
+    r"task completed|step (is )?done|waiting for (the )?user|"
+    r"回复用户|向用户回复|发送问候",
+    re.I,
+)
 
 
 class AgentCancelledError(Exception):
@@ -189,6 +195,41 @@ def _infer_progress_stage(lines: List[str]) -> str:
     if lines:
         return "任务进行中"
     return "等待输出"
+
+
+def _progress_summary(parsed: Dict[str, Any], fallback: str) -> str:
+    stage = str(parsed.get("stage") or "").strip()
+    progress_label = str(parsed.get("progressLabel") or "").strip()
+    highlights = parsed.get("highlights") or []
+    text = "\n".join(
+        [
+            stage,
+            progress_label,
+            *[str(item).strip() for item in highlights if str(item).strip()],
+        ]
+    )
+    lower = text.lower()
+    if ("pirna" in lower) and any(token in lower for token in ("quant", "count")):
+        return "execute_code — 当前任务：piRNA 定量"
+    if ("mirdeep2" in lower or "mirdeep" in lower) or (
+        "mirna" in lower and any(token in lower for token in ("quant", "count", "novel"))
+    ):
+        return "execute_code — 当前任务：miRNA 定量 / miRDeep2"
+    if ("trax" in lower or "trna" in lower) and any(token in lower for token in ("quant", "count")):
+        return "execute_code — 当前任务：tRNA 定量"
+    if any(token in lower for token in ("bowtie", "align", "alignment")):
+        return "execute_code — 当前任务：序列比对"
+    if any(token in lower for token in ("cutadapt", "trim")):
+        return "execute_code — 当前任务：接头修剪"
+    if any(token in lower for token in ("fastqc", "multiqc", " qc ")):
+        return "execute_code — 当前任务：质控"
+    if "download" in lower:
+        return "execute_code — 当前任务：下载数据"
+    if stage:
+        return f"execute_code — {stage}"
+    if progress_label:
+        return f"execute_code — {progress_label}"
+    return fallback
 
 
 def _parse_download_progress_marker(text: str) -> Dict[str, Any]:
@@ -799,6 +840,22 @@ def _resolve_answer_text(completion: Any) -> str:
     return thinking
 
 
+def _extract_last_user_query(messages: List[Dict[str, Any]]) -> str:
+    for item in reversed(messages):
+        if item.get("role") == "user":
+            content = str(item.get("content") or "").strip()
+            if content:
+                return content
+    return ""
+
+
+def _looks_like_internal_report(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    return bool(_INTERNAL_REPORT_RE.search(value))
+
+
 def _package_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -1077,6 +1134,46 @@ class SRNAgent:
         )
         return messages
 
+    def _ensure_user_facing_reply(
+        self,
+        messages: List[Dict[str, Any]],
+        text: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+        cancel_event: Optional[Any] = None,
+    ) -> str:
+        value = str(text or "").strip()
+        if not _looks_like_internal_report(value):
+            return value
+        user_query = _extract_last_user_query(messages)
+        self._emit_progress(on_progress, "status", message="正在整理回复…")
+        completion = self._llm_complete_cancellable(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are sRNAgent. Rewrite the draft into the final user-facing chat reply. "
+                        "Use the same language as the user. Reply directly in second person. "
+                        "Never mention internal workflow status such as '已向用户', '等待下一步', "
+                        "'Task completed', or 'Step done'. Output only the final reply."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Original user request:\n{user_query or '(unknown)'}\n\n"
+                        f"Draft reply:\n{value}"
+                    ),
+                },
+            ],
+            tools=None,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+            enable_thinking=False,
+        )
+        rewritten = str(getattr(completion, "content", "") or "").strip()
+        return rewritten or value
+
     @staticmethod
     def _progress_payload_from_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
         payload = {
@@ -1130,11 +1227,12 @@ class SRNAgent:
                 return
             last_stream_progress[0] = now
             elapsed = now - start_box[0]
+            progress_summary = _progress_summary(parsed, summary)
             self._emit_progress(
                 on_progress,
                 "code_execution_progress",
                 turn=turn,
-                summary=summary,
+                summary=progress_summary,
                 description=description,
                 elapsedSec=int(elapsed),
                 elapsedLabel=_format_elapsed(elapsed),
@@ -1162,6 +1260,8 @@ class SRNAgent:
             summary=summary,
             description=description,
             code=str(arguments.get("code") or ""),
+            elapsedSec=0,
+            elapsedLabel="0 秒",
             stage="已开始",
             nextUpdateSec=_next_progress_wait(0),
         )
@@ -1211,11 +1311,12 @@ class SRNAgent:
                 elapsed = now - start
                 raw_stream = stream_state["stdout"] or stream_state["stderr"]
                 parsed = _parse_progress_output(raw_stream, workspace=workspace, code=code_text)
+                progress_summary = _progress_summary(parsed, summary)
                 self._emit_progress(
                     on_progress,
                     "code_execution_progress",
                     turn=turn,
-                    summary=summary,
+                    summary=progress_summary,
                     description=description,
                     elapsedSec=int(elapsed),
                     elapsedLabel=_format_elapsed(elapsed),
@@ -1233,11 +1334,12 @@ class SRNAgent:
             elapsed = now - start
             raw_stream = stream_state["stdout"] or stream_state["stderr"]
             parsed = _parse_progress_output(raw_stream, workspace=workspace, code=code_text)
+            progress_summary = _progress_summary(parsed, summary)
             self._emit_progress(
                 on_progress,
                 "code_execution_progress",
                 turn=turn,
-                summary=summary,
+                summary=progress_summary,
                 description=description,
                 elapsedSec=int(elapsed),
                 elapsedLabel=_format_elapsed(elapsed),
@@ -1340,6 +1442,12 @@ class SRNAgent:
 
                     if call.name == "finish":
                         message = str(call.arguments.get("message", "Task completed."))
+                        message = self._ensure_user_facing_reply(
+                            messages,
+                            message,
+                            on_progress=on_progress,
+                            cancel_event=cancel_event,
+                        )
                         self._save_run_checkpoint(
                             messages, chat_id, checkpoint_extra
                         )
@@ -1404,6 +1512,12 @@ class SRNAgent:
 
             answer = _resolve_answer_text(completion)
             if answer:
+                answer = self._ensure_user_facing_reply(
+                    messages,
+                    answer,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                )
                 self._save_run_checkpoint(messages, chat_id, checkpoint_extra)
                 self._emit_progress(
                     on_progress,

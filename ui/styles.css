@@ -2139,6 +2139,7 @@ a {
   align-items: center;
   gap: 8px;
   margin-bottom: 6px;
+  min-width: 0;
 }
 
 .code-execution-progress__toggle {
@@ -2226,11 +2227,16 @@ a {
 }
 
 .code-execution-progress__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-inline-start: 2px;
   font-weight: 600;
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .code-execution-progress__elapsed {
+  flex-shrink: 0;
   color: var(--muted);
   font-size: 12px;
 }
@@ -2238,15 +2244,18 @@ a {
 .code-execution-progress__desc,
 .code-execution-progress__hint,
 .code-execution-progress__empty {
+  padding-inline-start: 2px;
   font-size: 12px;
   color: var(--muted);
   line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .code-execution-progress__stage-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
   margin-top: 8px;
   padding: 8px 10px;
   border-radius: 8px;
@@ -2255,16 +2264,21 @@ a {
 }
 
 .code-execution-progress__stage-label {
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--muted);
   white-space: nowrap;
+  line-height: 1.5;
 }
 
 .code-execution-progress__stage {
-  font-size: 13px;
+  min-width: 0;
+  padding-inline-start: 2px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text);
-  line-height: 1.4;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .code-execution-progress__bar-wrap {
@@ -2278,6 +2292,7 @@ a {
 }
 
 .code-execution-progress__bar-label {
+  padding-inline-start: 2px;
   font-size: 12px;
   color: var(--text);
   line-height: 1.4;
@@ -2319,8 +2334,10 @@ a {
 }
 
 .code-execution-progress__bar-meta {
-  font-size: 11px;
+  padding-inline-start: 2px;
+  font-size: 12px;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .code-execution-progress__highlights {
@@ -2332,7 +2349,7 @@ a {
 }
 
 .code-execution-progress__highlight {
-  padding: 8px 10px;
+  padding: 8px 10px 8px 12px;
   border-radius: 8px;
   background: color-mix(in srgb, var(--bg) 70%, transparent);
   border: 1px solid var(--border);

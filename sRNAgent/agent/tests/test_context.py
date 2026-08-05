@@ -4,9 +4,10 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from sRNAgent.agent.context import (  # noqa: E402
+    _SUMMARY_PREFIX,
     bounded_tool_result,
     compact_messages,
     estimate_tokens,
@@ -115,6 +116,9 @@ def test_compact_messages_with_llm_summary():
     assert "turn 15 内容" in str(out[-5]["content"])
     assert not any("turn 0 内容" in str(m.get("content") or "") for m in out)
     assert llm.calls == 1
+    summary_messages = [m for m in out if _SUMMARY_PREFIX in str(m.get("content") or "")]
+    assert len(summary_messages) == 1
+    assert summary_messages[0]["role"] == "assistant"
 
 
 def test_compact_messages_fallback_without_llm():
@@ -129,6 +133,22 @@ def test_compact_messages_noop_when_short():
     messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}]
     out = compact_messages(messages, llm=None, max_tokens=48000, keep_recent=12)
     assert out == messages
+
+
+def test_compact_messages_replaces_previous_summary_block():
+    messages = [
+        {"role": "system", "content": "system rule"},
+        {"role": "assistant", "content": f"{_SUMMARY_PREFIX}\n旧摘要"},
+    ] + [
+        {"role": "user", "content": f"turn {i} 内容"}
+        for i in range(18)
+    ]
+    llm = _FakeLLM(summary="【新摘要】已完成下载、比对与结果保存，保留关键决策与输出路径。")
+    out = compact_messages(messages, llm=llm, max_tokens=48000, keep_recent=4)
+    summaries = [m for m in out if _SUMMARY_PREFIX in str(m.get("content") or "")]
+    assert len(summaries) == 1
+    assert "旧摘要" not in str(summaries[0].get("content") or "")
+    assert "新摘要" in str(summaries[0].get("content") or "")
 
 
 if __name__ == "__main__":
