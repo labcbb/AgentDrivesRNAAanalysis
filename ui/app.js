@@ -264,22 +264,43 @@ function initTheme() {
   setTheme(saved === "light" ? "light" : "dark");
 }
 
-function scrollThreadToBottom() {
+// 用户向上滚动查看历史内容时，强制滚到底会让用户丢失滚动位置。
+// 用 stick-to-bottom 标志：用户主动向上滚后停止自动跟随，新内容到达时
+// 也不再拉回底部；用户重新滚到底部再恢复跟随。
+let chatStickToBottom = true;
+chatScroll?.addEventListener("scroll", () => {
   if (!chatScroll) return;
+  const distance = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight;
+  chatStickToBottom = distance <= 50;
+});
+
+let codeStickToBottom = true;
+function _updateCodeStickToBottom() {
+  const inner = getCodePanelInner();
+  if (!inner) return;
+  const distance = inner.scrollHeight - inner.scrollTop - inner.clientHeight;
+  codeStickToBottom = distance <= 50;
+}
+
+function scrollThreadToBottom() {
+  if (!chatScroll || !chatStickToBottom) return;
   requestAnimationFrame(() => {
+    if (!chatStickToBottom) return;
     chatScroll.scrollTop = chatScroll.scrollHeight;
   });
 }
 
 function scrollCodePanelToBottom() {
   const inner = getCodePanelInner();
-  if (!inner) return;
+  if (!inner || !codeStickToBottom) return;
   requestAnimationFrame(() => {
-    if (inner.scrollHeight <= inner.clientHeight + 1) {
-      inner.scrollTop = 0;
+    const cur = getCodePanelInner();
+    if (!cur || !codeStickToBottom) return;
+    if (cur.scrollHeight <= cur.clientHeight + 1) {
+      cur.scrollTop = 0;
       return;
     }
-    inner.scrollTop = inner.scrollHeight;
+    cur.scrollTop = cur.scrollHeight;
   });
 }
 
@@ -2486,6 +2507,13 @@ function ensureCodeExecutionProgress(_group, executionId) {
 }
 
 function updateCodeExecutionProgress(group, event) {
+  // 首次拿到 code panel inner 时绑定 scroll 监听（stick-to-bottom）
+  const _codeInner = getCodePanelInner();
+  if (_codeInner && !_codeInner._stickBound) {
+    _codeInner.addEventListener("scroll", _updateCodeStickToBottom);
+    _codeInner._stickBound = true;
+  }
+
   if (event.type === "code_execution_started") {
     markRunningExecutionsStopped();
     removeBackgroundExecutionCard();
