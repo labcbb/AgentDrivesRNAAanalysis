@@ -888,6 +888,9 @@ class SRNAgent:
         self.max_context_tokens = int(getattr(exec_cfg, "max_context_tokens", 48000))
         self.keep_recent_messages = int(getattr(exec_cfg, "keep_recent_messages", 12))
         self.max_tool_result_chars = int(getattr(exec_cfg, "max_tool_result_chars", 8000))
+        self._code_no_output_timeout_sec = int(
+            getattr(exec_cfg, "code_no_output_timeout_sec", 120)
+        )
         self.enable_checkpoint = bool(getattr(exec_cfg, "enable_checkpoint", True))
         self.checkpoint_dir = getattr(exec_cfg, "checkpoint_dir", None)
 
@@ -1162,6 +1165,11 @@ class SRNAgent:
         next_fire = start + _next_progress_wait(0)
         progress_index = 0
         last_sse_heartbeat = start
+        # 内核无响应检测：完全无输出超过阈值则中断内核并返回诊断，
+        # 避免 execute_code 无限等待（EXECUTION_TIMEOUT_SEC 达 10 小时）
+        no_output_timeout = self._code_no_output_timeout_sec
+        last_output_at = start
+        timed_out = False
 
         while thread.is_alive():
             if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
@@ -1172,6 +1180,25 @@ class SRNAgent:
                 break
 
             now = time.monotonic()
+            raw_stream = stream_state["stdout"] or stream_state["stderr"]
+            if raw_stream:
+                last_output_at = now
+            elif (
+                not timed_out
+                and no_output_timeout > 0
+                and now - last_output_at >= no_output_timeout
+            ):
+                timed_out = True
+                self._emit_progress(
+                    on_progress,
+                    "status",
+                    message=(
+                        f"execute_code 内核无响应超过 "
+                        f"{int(now - last_output_at)}s（无任何输出），正在中断内核…"
+                    ),
+                )
+                self._interrupt_running_code()
+
             if on_progress and now - last_sse_heartbeat >= _SSE_PROGRESS_HEARTBEAT_SEC:
                 elapsed = now - start
                 raw_stream = stream_state["stdout"] or stream_state["stderr"]
@@ -1215,6 +1242,25 @@ class SRNAgent:
             progress_index += 1
             next_fire = now + _next_progress_wait(progress_index)
 
+        if timed_out:
+            tail = str(result_box["value"] or result_box["error"] or "")
+            self._emit_progress(
+                on_progress,
+                "status",
+                message=(
+                    f"execute_code 内核无响应，已中断内核"
+                    f"（耗时 {_format_elapsed(time.monotonic() - start)}）"
+                ),
+            )
+            return (
+                "⚠️ execute_code 内核无响应超过 "
+                f"{int(no_output_timeout)}s（期间无任何输出），已中断内核。\n"
+                "可能原因：内核被前一个长任务占用、或内核已卡死。\n"
+                "建议：确认所需产物已落盘；若是重试/合并场景，直接读取已有的结果文件"
+                "（如 *_counts.csv / -trnacounts.txt / de_results.csv），避免再次触发同样的阻塞；"
+                "必要时告知用户检查是否有残留进程。\n\n"
+                f"中断后返回：{_truncate_result(tail, 500)}"
+            )
         if result_box["error"] is not None:
             raise result_box["error"]
         return str(result_box["value"] or "")

@@ -20,6 +20,10 @@ EXECUTION_TIMEOUT_SEC = 36000  # 10 hours
 # Abort when a download file stops growing for this long.
 DOWNLOAD_STALL_TIMEOUT_SEC = 180  # 3 minutes
 DOWNLOAD_STALL_POLL_SEC = 30
+# If an execute_code produces NO output at all for this long, the kernel is
+# likely busy/stuck (e.g. a previous long task still holds it) — interrupt it
+# and return a diagnostic instead of waiting up to EXECUTION_TIMEOUT_SEC.
+CODE_NO_OUTPUT_TIMEOUT_SEC = 120
 
 
 @dataclass
@@ -40,6 +44,8 @@ class ExecutionConfig:
     # Interruption-safe resume.
     enable_checkpoint: bool = True
     checkpoint_dir: Optional[Path] = None
+    # Interrupt + diagnose when execute_code emits nothing for this long.
+    code_no_output_timeout_sec: int = CODE_NO_OUTPUT_TIMEOUT_SEC
 
 
 class SandboxExecutionError(RuntimeError):
