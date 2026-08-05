@@ -26,7 +26,7 @@ from anndata import AnnData
 
 from ..._registry import register_function
 from ..._utils import run_cli_cmd, run_threads
-from ._matrix import store_count_matrix
+from .tRAX import store_count_matrix
 
 
 # ---------------------------------------------------------------------------
