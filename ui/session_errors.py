@@ -45,8 +45,8 @@ def _truncate_preserve_tail(text: str, limit: int, tail: int = 600) -> str:
     value = str(text or "").strip()
     if len(value) <= limit:
         return value
-    head = max(limit - tail - 1, 1)
     marker = "\n…[已截断]…\n"
+    head = max(limit - len(marker) - tail, 1)
     return f"{value[:head]}{marker}{value[-tail:]}"
 
 

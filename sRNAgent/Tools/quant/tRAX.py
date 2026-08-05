@@ -435,7 +435,7 @@ def trax_quant(
                 existing.shape[1] == len(sample_names)
                 and all(s in existing.columns for s in sample_names)
             )
-        except (FileNotFoundError, ValueError):
+        except (OSError, ValueError):
             counts_ready = False
 
     if counts_ready:
