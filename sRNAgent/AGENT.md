@@ -128,6 +128,18 @@ UI 左侧的 **Branch Chat（监管者）** 是**旁路只读 Agent**，与当�
 - 各 skill 已给出对应的 `jobs` / `cores` / `threads` 示例，调用前先查 skill。
 - 如果用户没指定并行数，**agent 应根据样本量主动选择一个合理的 `jobs` 值**，不要默认串行。
 
+## 批处理调用与产物复用
+
+避免两种反复重做的反模式：
+
+- **批量工具一次 `execute_code` 处理全部样本**，不要按样本拆 N 次 cell：
+  按样本拆 cell 会让 Jupyter 内核反复重启（import + 读 h5ad 开销叠加），且与前一次手动 stop 留下的内核残留锁叠加，容易在下一步 `read_h5ad` 死锁。正确做法：`sa.quant.trax_quant(adata, ...)`、`sa.alignment.bowtie(adata, ...)`、`sa.quant.feature_count(adata, ...)`、`sa.quant.quantify_mirna(adata, ...)` 都接受整个 adata，在**一次调用**里处理 `adata.obs` 里的全部样本（工具内部 Pool/run_threads 已处理并发）。
+- **优先读取已落盘产物**，不重算：
+  - 合并 counts → 读 `trax_out/<exp>-trnacounts.txt` / `mirna_expression_counts.csv` / `de_results_all.csv` / `*_manifest.json`
+  - 查询差异结果 → 读 `adata.uns['de_results']` / `adata.uns['de_top']`（**不要为了查 miR-21 重跑 limma-voom**）
+  - 跑前先 `Path(...).exists()` 确认产物齐全；齐全就直接用，不存在再调用工具
+- 工具自带的幂等（`pylimma.de_analysis` 缓存命中、`tRAX.trax_quant` trnacounts 已存在则跳过）会自动复用结果，**优先信任缓存，不要主动 force=True**。
+
 ## 执行超时处理（内核无响应）
 
 `execute_code` 提交后如果**长时间（默认 120 秒）没有任何输出**，系统会中断内核并返回以 `⚠️ execute_code 内核无响应` 开头的诊断。遇到时：
