@@ -18,6 +18,7 @@ dependencies:
   - bowtie2>=2.5
   - infernal>=1.1.4
   - pip:
+      - mirtop
       - mudata
       - anndata
       - fastq-dl

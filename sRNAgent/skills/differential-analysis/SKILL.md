@@ -1,7 +1,7 @@
 ---
 name: differential-analysis
 title: miRNA differential expression analysis (limma-voom)
-description: "Filter lowly expressed miRNAs and run limma-voom differential expression on AnnData. User must provide group labels in adata.obs."
+description: "Filter lowly expressed miRNAs and run limma-voom differential expression on AnnData. Default to unpaired design unless the user explicitly requests paired and the data truly support paired analysis."
 ---
 
 # miRNA Differential Expression Analysis
@@ -11,6 +11,7 @@ description: "Filter lowly expressed miRNAs and run limma-voom differential expr
 This skill covers differential expression analysis for miRNA-seq data using limma-voom (pylimma):
 
 > MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+> 统计设计约束：**默认使用非配对（unpaired）设计**。只有当用户明确要求配对（paired），且数据确实存在可用配对关系时，才允许切换到配对设计。
 
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|
@@ -45,6 +46,9 @@ adata.uns["de_params"]   ← 对比元信息
 > 2. **主动向用户展示当前的分组情况**，让用户确认是否正确。
 > 3. 如果用户尚未设置分组，询问用户希望如何分组。
 > 4. 如果用户不确定分组来源，可以询问用户是否有样本信息表（CSV/Excel），或从 SRA/GEO 元数据获取（参见附录）。
+> 5. **必须单独确认统计设计是 `unpaired` 还是 `paired`。默认是 `unpaired`；只有用户明确指定 `paired` 才能切换。**
+> 6. 如果发现当前数据并不支持 paired（例如 `paired_feasible=false`、没有真实一一对应配对关系），**必须终止 paired 路线**，不得自动切回 paired，也不得把 paired/unpaired 两套都跑一遍。
+> 7. 如果存在多个候选检验方案或设计冲突，**先 ask user**，不要默认两套都跑。
 
 ## Instructions
 
@@ -105,6 +109,7 @@ sa.diff.filter_low_expression(adata, min_mean=1.0)
 
 ```python
 # 自动检测 group 列，指定对照组
+# 默认按非配对设计；除非用户明确要求 paired，否则不要加入 patient blocking / pairing 因子
 sa.diff.de_analysis(adata, control_group="Normal")
 
 # 查看结果
@@ -120,6 +125,14 @@ print(adata.uns["de_params"])
 5. 全部基因的结果存入 `adata.uns["de_results"]`
 6. 对比元信息存入 `adata.uns["de_params"]`
 
+**统计设计强约束：**
+
+1. 默认按 **unpaired** 设计执行差异分析。
+2. 只有用户明确说“做配对检验 / paired”，且数据存在真实配对关系时，才允许使用 paired 设计。
+3. 如果用户明确要求 **unpaired**，不得自动切回 paired，不得加入 `patient blocking`、`donor blocking`、`group + patient_id` 之类的设计矩阵。
+4. 如果系统或上下文提示 `paired_feasible=false`，必须停止 paired 路线，并先向用户确认是否改为 unpaired。
+5. 没有用户明确授权时，禁止同时运行 paired 和 unpaired 两套 DE。
+
 **参数说明：**
 
 | 参数 | 默认 | 说明 |
@@ -130,6 +143,7 @@ print(adata.uns["de_params"])
 | `force` | `False` | 设为 `True` 强制重算（默认：`adata.uns` 已有相同对比的 `de_results` 时直接复用缓存，不重跑） |
 
 > ⚠️ **幂等**：`de_analysis` 检测到 `adata.uns` 中已有相同 group 列 + 相同 treatment/control 的结果时会**跳过重算**（打印 `Cached results found`）。数据或分组变了想重跑时传 `force=True`。
+> ⚠️ **默认设计**：如果用户没有明确指定统计设计，统一按 **unpaired** 处理。
 
 ### 4. 查看特定 miRNA 的差异结果
 

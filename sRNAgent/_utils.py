@@ -45,6 +45,12 @@ def get_mod_adata(data: Any, mod: str = "srna") -> AnnData:
 
 def merge_mod_result(container: Any, result: Any, *, mod: str = "srna", fallback: Optional[AnnData] = None):
     if is_mudata(result):
+        if is_mudata(container):
+            for existing_mod, existing_adata in container.mod.items():
+                if existing_mod not in result.mod:
+                    result.mod[existing_mod] = existing_adata
+            for key, value in getattr(container, "uns", {}).items():
+                result.uns.setdefault(key, value)
         return result
     if is_mudata(container):
         if result is None:

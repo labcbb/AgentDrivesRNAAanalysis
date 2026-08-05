@@ -164,6 +164,10 @@ def _persist_de_results(
         "Run limma-voom differential expression analysis on AnnData "
         "using pylimma.  Raw counts are read from "
         "``adata.layers['counts']`` (fallback: ``adata.X``).\n\n"
+        "**Default design** — this tool performs **unpaired** differential "
+        "analysis by default (design matrix ``~0+group``). Do not add paired / "
+        "patient-blocking terms unless the user explicitly requests a separate "
+        "paired workflow and the data truly support pairing.\n\n"
         "**Group column detection** — if ``group_col`` is not specified, "
         "the function auto-detects common column names "
         "``['group', 'Condition', 'treatment', …]`` in ``adata.obs``.\n\n"
@@ -217,6 +221,7 @@ def de_analysis(
     control_group
         Group label to use as the baseline (control) in the contrast.
         If not given, the first group alphabetically is used.
+        This tool still runs the default **unpaired** design.
     output_dir
         Optional directory to persist the DE table to as
         ``de_results.csv`` + ``de_results_manifest.json``.
@@ -233,6 +238,8 @@ def de_analysis(
         - ``adata.uns["de_params"]`` — dict with comparison metadata.
         - ``adata.layers["voom_E"]``, ``adata.layers["voom_weights"]``
           (from ``voom``).
+        By default the stored design metadata is ``design='unpaired'`` with
+        formula ``~0+group``.
     """
     # ── 1. Ensure raw counts ──
     if "counts" in adata.layers:
@@ -299,6 +306,7 @@ def de_analysis(
         f"(treatment - control)",
         flush=True,
     )
+    print("[de_analysis] Design: unpaired (default, formula ~0+group)", flush=True)
 
     # ── 4. Idempotency: reuse cached results when the contrast matches ──
     if not force and _cached_de_matches(adata, col, group_control, group_treatment):
@@ -356,6 +364,9 @@ def de_analysis(
         "groups": unique_groups,
         "treatment": group_treatment,
         "control": group_control,
+        "design": "unpaired",
+        "paired": False,
+        "design_formula": f"~0+{col}",
         "contrast_formula": contrast_formula,
         "n_samples": adata.n_obs,
         "n_features": n_features,

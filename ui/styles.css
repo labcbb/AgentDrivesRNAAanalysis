@@ -2052,6 +2052,102 @@ a {
   overflow: auto;
 }
 
+.chat-thinking__step--plan {
+  border-left-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+}
+
+.chat-thinking__plan-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.chat-thinking__plan-stat {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel-strong) 45%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 82%, var(--accent) 18%);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.chat-thinking__plan-note {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--panel));
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.chat-thinking__plan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chat-thinking__plan-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-strong) 32%, transparent);
+  border: 1px solid color-mix(in srgb, var(--border) 88%, transparent);
+}
+
+.chat-thinking__plan-item--running {
+  border-color: color-mix(in srgb, var(--accent) 36%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+}
+
+.chat-thinking__plan-item--done {
+  border-color: color-mix(in srgb, var(--ok) 22%, var(--border));
+}
+
+.chat-thinking__plan-item--failed {
+  border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+  background: color-mix(in srgb, var(--danger) 8%, var(--panel));
+}
+
+.chat-thinking__plan-marker {
+  flex: 0 0 auto;
+  width: 16px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-strong);
+}
+
+.chat-thinking__plan-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-strong);
+}
+
+.chat-thinking__plan-badge {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 65%, transparent);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.chat-thinking__plan-badge--auto {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+}
+
 .code-approval {
   margin-bottom: 10px;
   padding: 12px;

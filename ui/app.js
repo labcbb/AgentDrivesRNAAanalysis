@@ -88,6 +88,7 @@ const chatStreams = new Map();
 let nextStreamGeneration = 0;
 const STREAM_IDLE_MS = 3600000;
 const STREAM_STATUS_POLL_MS = 4000;
+const EXECUTION_ELAPSED_TICK_MS = 1000;
 /** @type {Map<string, { abortController: AbortController, runId: string, codeExecutionId: string|null, lastSeq: number }>} */
 const liveFollows = new Map();
 /** @type {Map<string, string[]>} 主任务运行期间用户发的新消息先排队，当前任务结束后自动发送 */
@@ -96,6 +97,7 @@ const BACKGROUND_WATCH_POLL_MS = 3000;
 const BACKGROUND_EXECUTION_ID = "background-kernel-run";
 /** @type {Map<string, { timer: number, startedAt: number, pending: Element|null, assistantEntry: any|null }>} */
 const backgroundWatches = new Map();
+let executionElapsedTimer = null;
 
 function isChatStreaming(chatId) {
   if (!chatId) return false;
@@ -394,6 +396,13 @@ function inferExecutionPhaseLabel(payload = {}) {
   if (/fastqc|multiqc|质控|\bqc\b/.test(joined) || /fastqc|multiqc|\bqc\b/.test(lower)) {
     return "当前任务：质控";
   }
+  if (
+    /fragmentomics|fragomics|fragment-analysis|片段组学/.test(joined)
+    || /fragmentomics|fragomics|fragment-analysis/.test(lower)
+    || /(?:\bFSD\b|\bFSC\b|\bRCD\b|\bEDM\b|\bBPM\b)/.test(joined)
+  ) {
+    return "当前任务：片段组学";
+  }
   if (/download|下载/.test(joined) || /download/.test(lower)) {
     return "当前任务：下载数据";
   }
@@ -528,6 +537,73 @@ function normalizeExecutionArtifact(artifact) {
   return artifact;
 }
 
+function formatElapsedLabel(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return `${total} 秒`;
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  if (mins < 60) return `${mins} 分 ${secs} 秒`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `${hours} 小时 ${remMins} 分`;
+}
+
+function resolveExecutionStartedAt(artifact, fallbackNow = Date.now()) {
+  const startedAt = Number(artifact?.startedAt);
+  if (Number.isFinite(startedAt) && startedAt > 0) return startedAt;
+  const elapsedSec = Number(artifact?.elapsedSec);
+  if (Number.isFinite(elapsedSec) && elapsedSec >= 0) {
+    return Math.max(0, fallbackNow - elapsedSec * 1000);
+  }
+  return fallbackNow;
+}
+
+function hydrateExecutionElapsed(artifact, now = Date.now()) {
+  if (!artifact || artifact.type !== "execution" || artifact.done || artifact.stopped) return artifact;
+  const startedAt = resolveExecutionStartedAt(artifact, now);
+  const elapsedSec = Math.max(0, Math.floor((now - startedAt) / 1000));
+  return {
+    ...artifact,
+    startedAt,
+    elapsedSec,
+    elapsedLabel: formatElapsedLabel(elapsedSec),
+  };
+}
+
+function refreshRunningExecutionElapsed() {
+  const chat = getActiveChatRecord();
+  if (!chat?.codePanel || !Array.isArray(chat.codePanel)) return;
+  const now = Date.now();
+  let changed = false;
+  chat.codePanel = chat.codePanel.map((artifact) => {
+    if (artifact?.type !== "execution" || artifact.done || artifact.stopped) return artifact;
+    const next = hydrateExecutionElapsed(artifact, now);
+    if (
+      next.startedAt !== artifact.startedAt
+      || next.elapsedSec !== artifact.elapsedSec
+      || next.elapsedLabel !== artifact.elapsedLabel
+    ) {
+      changed = true;
+    }
+    return next;
+  });
+  if (!changed) return;
+  chat.codePanel.forEach((artifact) => {
+    if (artifact?.type !== "execution" || artifact.done || artifact.stopped) return;
+    const card = getExecutionCard(artifact.id);
+    if (card) applyExecutionCardState(card, normalizeExecutionArtifact(artifact), {
+      showStop: isActiveChatSending() && !artifact.done && !artifact.stopped,
+    });
+  });
+}
+
+function ensureExecutionElapsedTimer() {
+  if (executionElapsedTimer != null) return;
+  executionElapsedTimer = window.setInterval(() => {
+    refreshRunningExecutionElapsed();
+  }, EXECUTION_ELAPSED_TICK_MS);
+}
+
 function welcomeCardHtml() {
   return `
     <div class="welcome-card">
@@ -609,6 +685,7 @@ function normalizeMessage(item) {
       kind: String(step?.kind || "tool"),
       title: String(step?.title || ""),
       body: step?.body ? String(step.body) : "",
+      data: step?.data && typeof step.data === "object" ? step.data : null,
     }));
     const lastPlanStep = normalizedSteps.filter((step) => step.kind === "plan").at(-1) || null;
     message.thinkingSteps = normalizedSteps.filter((step) => {
@@ -619,6 +696,12 @@ function normalizeMessage(item) {
     message.thinkingRoundCount = Number.isFinite(storedRoundCount) && storedRoundCount > 0
       ? storedRoundCount
       : normalizedSteps.length;
+  }
+  if (role === "assistant") {
+    const storedLiveEventSeq = Number(item?.liveEventSeq);
+    if (Number.isFinite(storedLiveEventSeq) && storedLiveEventSeq > 0) {
+      message.liveEventSeq = storedLiveEventSeq;
+    }
   }
   if (role === "assistant" && Array.isArray(item?.executionLog)) {
     message.executionLog = item.executionLog.map((entry) => ({
@@ -783,10 +866,13 @@ function recordThinkingStep(step, options = {}) {
     kind: step.kind || "tool",
     title: step.title || "",
     body: step.body || "",
+    data: step.data && typeof step.data === "object" ? step.data : null,
   };
+  let existed = false;
   if (nextStep.id) {
     const index = entry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id);
     if (index >= 0) {
+      existed = true;
       entry.thinkingSteps[index] = nextStep;
     } else {
       entry.thinkingSteps.push(nextStep);
@@ -794,7 +880,8 @@ function recordThinkingStep(step, options = {}) {
   } else {
     entry.thinkingSteps.push(nextStep);
   }
-  const roundIncrement = Number(options.roundIncrement ?? 1);
+  const defaultRoundIncrement = existed ? 0 : 1;
+  const roundIncrement = Number(options.roundIncrement ?? defaultRoundIncrement);
   if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
     const current = Number(entry.thinkingRoundCount) || 0;
     entry.thinkingRoundCount = Math.max(0, current + roundIncrement);
@@ -1064,6 +1151,14 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
   const hint = status?.backgroundActive
     ? "流式连接已断开，正在轮询后端状态。请勿重复发送消息以免打断任务。"
     : "长任务执行中，界面将自动刷新进度。";
+  const existing = getActiveChatRecord()?.codePanel?.find(
+    (item) => item.type === "execution" && item.id === BACKGROUND_EXECUTION_ID,
+  );
+  const watch = backgroundWatches.get(status?.chatId || activeChatId);
+  const startedAt = Number(existing?.startedAt)
+    || Number(watch?.startedAt)
+    || Date.now();
+  const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
 
   applyExecutionCardState(
     card,
@@ -1073,6 +1168,9 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
       title,
       description: status?.plan?.goal || "",
       stage,
+      startedAt,
+      elapsedSec,
+      elapsedLabel: formatElapsedLabel(elapsedSec),
       done: false,
       stopped: false,
       hint,
@@ -1085,6 +1183,9 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
     title,
     description: status?.plan?.goal || "",
     stage,
+    startedAt,
+    elapsedSec,
+    elapsedLabel: formatElapsedLabel(elapsedSec),
     done: false,
     stopped: false,
     hint,
@@ -1339,6 +1440,17 @@ function applyLiveFollowEvent(chatId, event) {
     chatHistory = messages;
   }
 
+  const eventSeq = Number(event?._seq);
+  const seenSeq = Number(assistantEntry?.liveEventSeq || 0);
+  if (Number.isFinite(eventSeq) && eventSeq > 0 && eventSeq <= seenSeq) {
+    return;
+  }
+
+  const markLiveEventSeen = () => {
+    if (!(Number.isFinite(eventSeq) && eventSeq > 0) || !assistantEntry) return;
+    assistantEntry.liveEventSeq = Math.max(Number(assistantEntry.liveEventSeq) || 0, eventSeq);
+  };
+
   const isVisible = chatId === activeChatId;
   if (!isVisible) {
     const shell = ensureFollowerStreamShell(chatId, follow, messages, assistantEntry);
@@ -1347,6 +1459,7 @@ function applyLiveFollowEvent(chatId, event) {
       shell.codeExecutionId = follow.codeExecutionId;
     }
     handleAgentStreamEventBackground(chatId, messages, assistantEntry, event);
+    markLiveEventSeen();
     if (follow) {
       follow.codeExecutionId = chatStreams.get(chatId)?.codeExecutionId || follow.codeExecutionId;
     }
@@ -1359,6 +1472,7 @@ function applyLiveFollowEvent(chatId, event) {
       });
     }
     handleAgentStreamEvent(target, event);
+    markLiveEventSeen();
     if (event.type === "final" && event.content) {
       assistantEntry.content = stripExecutionMemoryBlock(event.content);
       persistChatMessages(chatId, messages);
@@ -1456,6 +1570,16 @@ function truncateExecutionSummary(text, max = 360) {
   return `${value.slice(0, max - 1)}…`;
 }
 
+function compactExecutionContextSummary(log) {
+  const tool = String(log?.tool || "").trim();
+  const summary = String(log?.summary || "").trim();
+  if (!summary) return "";
+  if (tool === "execute_code") {
+    return "已执行代码；详细 stdout/stderr 请查看代码卡片或产物文件";
+  }
+  return truncateExecutionSummary(summary, 180);
+}
+
 function stripExecutionMemoryBlock(content) {
   const text = String(content || "");
   const marker = "\n\n[本轮执行记录]\n";
@@ -1475,7 +1599,7 @@ function formatExecutionLogBlock(logs) {
     .slice(-12)
     .map((log) => {
       const title = String(log?.title || log?.tool || "步骤").trim();
-      const summary = String(log?.summary || "").trim();
+      const summary = compactExecutionContextSummary(log);
       return summary ? `- ${title}: ${summary}` : `- ${title}`;
     })
     .filter(Boolean)
@@ -1483,13 +1607,7 @@ function formatExecutionLogBlock(logs) {
 }
 
 function buildExecutionContextForApi() {
-  const sections = [];
-  for (const item of chatHistory) {
-    if (item.role !== "assistant") continue;
-    const block = formatExecutionLogBlock(item.executionLog);
-    if (block) sections.push(block);
-  }
-  return sections.slice(-2).join("\n\n");
+  return "";
 }
 
 function appendExecutionLog(entry, assistant = getLastAssistantEntry(), options = {}) {
@@ -1983,6 +2101,39 @@ function resolvePlanSnapshotTitle(goal, eventType = "") {
   return baseTitle;
 }
 
+function summarizePlanStepStatus(status) {
+  if (status === "done") return { mark: "✓", label: "已完成" };
+  if (status === "running") return { mark: "▶", label: "进行中" };
+  if (status === "failed") return { mark: "✗", label: "失败" };
+  return { mark: "○", label: "待执行" };
+}
+
+function buildThinkingPlanData(plan, eventType = "", message = "") {
+  const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+  const done = steps.filter((step) => step?.status === "done").length;
+  const running = steps.filter((step) => step?.status === "running").length;
+  const failed = steps.filter((step) => step?.status === "failed").length;
+  const pending = Math.max(0, steps.length - done - running - failed);
+  const autoInserted = steps.filter((step) => step?.autoInserted);
+  return {
+    eventType: String(eventType || ""),
+    message: String(message || ""),
+    total: steps.length,
+    done,
+    running,
+    failed,
+    pending,
+    autoInsertedCount: autoInserted.length,
+    autoInsertedTitles: autoInserted.map((step) => String(step?.title || step?.goal || step?.id || "")).filter(Boolean),
+    steps: steps.map((step) => ({
+      id: String(step?.id || ""),
+      title: String(step?.title || step?.goal || step?.id || ""),
+      status: String(step?.status || "pending"),
+      autoInserted: Boolean(step?.autoInserted),
+    })),
+  };
+}
+
 function setThinkingRoundCount(group, roundCount) {
   const panel = group?.querySelector(".chat-thinking");
   if (!panel) return;
@@ -2001,6 +2152,86 @@ function updateThinkingSummaryCount(stepsEl) {
   }
 }
 
+function renderPlanThinkingStep(item, step) {
+  const data = step?.data && typeof step.data === "object" ? step.data : {};
+  const steps = Array.isArray(data.steps) ? data.steps : [];
+  const autoInsertedCount = Number(data.autoInsertedCount) || 0;
+  const stats = document.createElement("div");
+  stats.className = "chat-thinking__plan-stats";
+
+  const statItems = [
+    ["总步骤", Number(data.total) || steps.length || 0],
+    ["已完成", Number(data.done) || 0],
+    ["进行中", Number(data.running) || 0],
+    ["待执行", Number(data.pending) || 0],
+  ];
+  if ((Number(data.failed) || 0) > 0) statItems.push(["失败", Number(data.failed) || 0]);
+  if (autoInsertedCount > 0) statItems.push(["自动补全", autoInsertedCount]);
+
+  statItems.forEach(([label, value]) => {
+    const chip = document.createElement("span");
+    chip.className = "chat-thinking__plan-stat";
+    chip.textContent = `${label} ${value}`;
+    stats.appendChild(chip);
+  });
+  item.appendChild(stats);
+
+  if (autoInsertedCount > 0) {
+    const hint = document.createElement("div");
+    hint.className = "chat-thinking__plan-note";
+    const titles = Array.isArray(data.autoInsertedTitles) ? data.autoInsertedTitles.filter(Boolean) : [];
+    hint.textContent = titles.length
+      ? `已根据当前上下文自动补全前置步骤：${titles.join(" -> ")}`
+      : "已根据当前上下文自动补全前置步骤";
+    item.appendChild(hint);
+  } else if (data.eventType === "plan_revised") {
+    const hint = document.createElement("div");
+    hint.className = "chat-thinking__plan-note";
+    hint.textContent = "计划已根据最新执行结果更新。";
+    item.appendChild(hint);
+  }
+
+  if (steps.length) {
+    const list = document.createElement("div");
+    list.className = "chat-thinking__plan-list";
+    steps.forEach((planStep) => {
+      const row = document.createElement("div");
+      const info = summarizePlanStepStatus(planStep.status);
+      row.className = `chat-thinking__plan-item chat-thinking__plan-item--${planStep.status || "pending"}`;
+
+      const marker = document.createElement("span");
+      marker.className = "chat-thinking__plan-marker";
+      marker.textContent = info.mark;
+      row.appendChild(marker);
+
+      const title = document.createElement("span");
+      title.className = "chat-thinking__plan-text";
+      title.textContent = planStep.title || "";
+      row.appendChild(title);
+
+      const status = document.createElement("span");
+      status.className = "chat-thinking__plan-badge";
+      status.textContent = info.label;
+      row.appendChild(status);
+
+      if (planStep.autoInserted) {
+        const autoBadge = document.createElement("span");
+        autoBadge.className = "chat-thinking__plan-badge chat-thinking__plan-badge--auto";
+        autoBadge.textContent = "自动补全";
+        row.appendChild(autoBadge);
+      }
+
+      list.appendChild(row);
+    });
+    item.appendChild(list);
+  } else if (step.body) {
+    const body = document.createElement("pre");
+    body.className = "chat-thinking__step-body";
+    body.textContent = step.body;
+    item.appendChild(body);
+  }
+}
+
 function appendThinkingStep(group, step, options = {}) {
   ensureThinkingPanel(group);
   const stepsEl = getThinkingStepsEl(group);
@@ -2008,6 +2239,7 @@ function appendThinkingStep(group, step, options = {}) {
 
   const stepId = String(step?.id || "").trim();
   let item = stepId ? stepsEl.querySelector(`.chat-thinking__step[data-step-id="${CSS.escape(stepId)}"]`) : null;
+  const existed = Boolean(item);
   if (!item) {
     item = document.createElement("div");
     item.className = `chat-thinking__step chat-thinking__step--${step.kind}`;
@@ -2023,14 +2255,17 @@ function appendThinkingStep(group, step, options = {}) {
   title.textContent = step.title;
   item.appendChild(title);
 
-  if (step.body) {
+  if (step.kind === "plan") {
+    renderPlanThinkingStep(item, step);
+  } else if (step.body) {
     const body = document.createElement("pre");
     body.className = "chat-thinking__step-body";
     body.textContent = step.body;
     item.appendChild(body);
   }
 
-  const roundIncrement = Number(options.roundIncrement ?? (options.persist !== false ? 1 : 0));
+  const defaultRoundIncrement = options.persist !== false ? (existed ? 0 : 1) : 0;
+  const roundIncrement = Number(options.roundIncrement ?? defaultRoundIncrement);
   if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
     const panel = stepsEl.closest(".chat-thinking");
     const currentRounds = Number(panel?.dataset.roundCount || 0) || 0;
@@ -2158,6 +2393,25 @@ function markRunningExecutionsStopped() {
 function getExecutionCard(executionId) {
   if (!executionId) return null;
   return getCodePanelInner()?.querySelector(`[data-execution-id="${executionId}"]`) || null;
+}
+
+function findRunningExecutionArtifact(chat = getActiveChatRecord()) {
+  if (!chat?.codePanel || !Array.isArray(chat.codePanel)) return null;
+  const running = chat.codePanel.filter(
+    (item) =>
+      item?.type === "execution"
+      && item.id
+      && item.id !== BACKGROUND_EXECUTION_ID
+      && !item.done
+      && !item.stopped,
+  );
+  return running.at(-1) || null;
+}
+
+function restoreActiveCodeExecutionId(chat = getActiveChatRecord()) {
+  const running = findRunningExecutionArtifact(chat);
+  activeCodeExecutionId = running?.id || null;
+  return activeCodeExecutionId;
 }
 
 function wireExecutionStopButton(card) {
@@ -2582,11 +2836,13 @@ function renderCodePanel(codePanel, options = {}) {
     persistActiveChat();
   }
 
+  restoreActiveCodeExecutionId(chat);
+
   sanitized.forEach((artifact) => {
     if (artifact.type === "approval") {
       renderApprovalArtifact(artifact, interactive);
     } else if (artifact.type === "execution") {
-      renderExecutionArtifact(normalizeExecutionArtifact(artifact), {
+      renderExecutionArtifact(normalizeExecutionArtifact(hydrateExecutionElapsed(artifact)), {
         showStop: interactive && isActiveChatSending() && !artifact.done && !artifact.stopped,
       });
     }
@@ -2795,7 +3051,7 @@ function updateCodeExecutionProgress(group, event) {
     if (stream) stream.codeExecutionId = activeCodeExecutionId;
   }
 
-  const executionId = activeCodeExecutionId;
+  const executionId = activeCodeExecutionId || restoreActiveCodeExecutionId();
   if (!executionId) return;
 
   const chat = getActiveChatRecord();
@@ -2813,6 +3069,8 @@ function updateCodeExecutionProgress(group, event) {
   }
 
   const elapsed = event.elapsedLabel || (event.elapsedSec != null ? `${event.elapsedSec} 秒` : "") || existing?.elapsedLabel || "";
+  const startedAt = existing?.startedAt
+    || (event.elapsedSec != null ? Date.now() - Number(event.elapsedSec) * 1000 : Date.now());
   const title = event.type === "code_execution_started" ? "代码已开始运行" : "代码仍在运行";
   const stageText = event.stage || (event.type === "code_execution_started" ? "已启动，等待输出" : "运行中");
 
@@ -2840,6 +3098,8 @@ function updateCodeExecutionProgress(group, event) {
     code: executionCode,
     stage: stageText,
     highlights: highlights.slice(-4),
+    startedAt,
+    elapsedSec: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)),
     elapsedLabel: elapsed,
     hint,
     done: false,
@@ -2930,6 +3190,8 @@ function buildCodeProgressArtifact(event, existing, executionId) {
     || (event.elapsedSec != null ? `${event.elapsedSec} 秒` : "")
     || existing?.elapsedLabel
     || "";
+  const startedAt = existing?.startedAt
+    || (event.elapsedSec != null ? Date.now() - Number(event.elapsedSec) * 1000 : Date.now());
   const title = event.type === "code_execution_started" ? "代码已开始运行" : "代码仍在运行";
   const stageText = event.stage
     || (event.type === "code_execution_started" ? "已启动，等待输出" : "运行中");
@@ -2961,6 +3223,8 @@ function buildCodeProgressArtifact(event, existing, executionId) {
     code: executionCode,
     stage: stageText,
     highlights: highlights.slice(-4),
+    startedAt,
+    elapsedSec: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)),
     elapsedLabel: elapsed,
     hint: isDownloadTask
       ? "下载进度实时更新；点击「停止」可中断内核。"
@@ -3075,10 +3339,13 @@ function appendThinkingStepToEntry(assistantEntry, step, options = {}) {
     kind: step.kind || "tool",
     title: step.title || "",
     body: step.body || "",
+    data: step.data && typeof step.data === "object" ? step.data : null,
   };
+  let existed = false;
   if (nextStep.id) {
     const index = assistantEntry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id);
     if (index >= 0) {
+      existed = true;
       assistantEntry.thinkingSteps[index] = nextStep;
     } else {
       assistantEntry.thinkingSteps.push(nextStep);
@@ -3086,7 +3353,8 @@ function appendThinkingStepToEntry(assistantEntry, step, options = {}) {
   } else {
     assistantEntry.thinkingSteps.push(nextStep);
   }
-  const roundIncrement = Number(options.roundIncrement ?? 1);
+  const defaultRoundIncrement = existed ? 0 : 1;
+  const roundIncrement = Number(options.roundIncrement ?? defaultRoundIncrement);
   if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
     const current = Number(assistantEntry.thinkingRoundCount) || 0;
     assistantEntry.thinkingRoundCount = Math.max(0, current + roundIncrement);
@@ -3121,10 +3389,12 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     }
     if (event.plan?.steps?.length) {
       const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
+      const planData = buildThinkingPlanData(event.plan, event.type, msg);
       appendThinkingStepToEntry(assistantEntry, {
         id: "current-plan",
         kind: "plan",
         title: planTitle,
+        data: planData,
         body: event.plan.steps
           .map((s) => {
             const mark =
@@ -3162,8 +3432,11 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     return;
   }
   if (event.type === "tool_result") {
+    const executionSummary = event.name === "execute_code"
+      ? "已执行代码；详细 stdout/stderr 请查看代码卡片或产物文件"
+      : (event.content || "");
     appendExecutionLog(
-      { tool: event.name, title: event.summary || event.name, summary: event.content || "" },
+      { tool: event.name, title: event.summary || event.name, summary: executionSummary },
       assistantEntry,
       { chatId: streamChatId, messages: streamMessages },
     );
@@ -3254,10 +3527,12 @@ function handleAgentStreamEvent(group, event) {
     }
     if (event.plan?.steps?.length) {
       const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
+      const planData = buildThinkingPlanData(event.plan, event.type, msg);
       appendThinkingStep(group, {
         id: "current-plan",
         kind: "plan",
         title: planTitle,
+        data: planData,
         body: event.plan.steps
           .map((s) => {
             const mark =
@@ -3312,10 +3587,13 @@ function handleAgentStreamEvent(group, event) {
   }
 
   if (event.type === "tool_result") {
+    const executionSummary = event.name === "execute_code"
+      ? "已执行代码；详细 stdout/stderr 请查看代码卡片或产物文件"
+      : (event.content || "");
     appendExecutionLog({
       tool: event.name,
       title: event.summary || event.name,
-      summary: event.content || "",
+      summary: executionSummary,
     });
     if (event.name === "execute_code") {
       finishCodeExecutionProgress(group);
@@ -4198,6 +4476,7 @@ bindUploadCard("drop-zone-analysis", "file-input-analysis", "Analysis Mode");
 bindUploadCard("drop-zone-preview", "file-input-preview", "Preview Mode");
 
 initTheme();
+ensureExecutionElapsedTimer();
 void initChatSessions();
 updateAutoApproveUi();
 setLeftPanelMode("code");

@@ -68,6 +68,27 @@ _INTERNAL_REPORT_RE = re.compile(
     r"回复用户|向用户回复|发送问候",
     re.I,
 )
+_ANALYSIS_DESIGN_RE = re.compile(r"analysis\.design\s*=\s*([a-z_]+)", re.I)
+_ANALYSIS_PAIRED_FEASIBLE_RE = re.compile(r"analysis\.paired_feasible\s*=\s*(true|false|none|null)", re.I)
+_HTML_REPORT_REQUESTED_RE = re.compile(r"deliverables\.html_report_requested\s*=\s*(true|false)", re.I)
+_REQUIREMENTS_FLAG_RE = re.compile(
+    r"requirements\.(default_unpaired|html_report_requested|mudata_required|whole_genome_bam_required)\s*=\s*(true|false)",
+    re.I,
+)
+_REQUIREMENT_ITEM_RE = re.compile(r"^-\s*requirement:\s*(.+)$", re.M)
+_DE_CODE_RE = re.compile(r"sa\.diff\.de_analysis|de_analysis\(|limma|differential", re.I)
+_PAIRED_CODE_RE = re.compile(r"(?<!un)\bpaired\b|(?<!非)配对", re.I)
+_PATIENT_BLOCKING_CODE_RE = re.compile(
+    r"patient[_\s-]*blocking|patient[_\s-]*block|donor[_\s-]*block|"
+    r"group\s*\+\s*patient(?:_id)?|patient_id",
+    re.I,
+)
+_CURRENT_STEP_TITLE_RE = re.compile(r"Title:\s*(.+)")
+_CURRENT_STEP_GOAL_RE = re.compile(r"Goal:\s*(.+)")
+_REPORT_STEP_RE = re.compile(r"html\s*报告|html report|report\.html|生成.*html|报告", re.I)
+_HTML_OUTPUT_RE = re.compile(r"\.html\b|write_html\(|<html", re.I)
+_FRAGOMICS_CODE_RE = re.compile(r"sa\.fragment\.fragomics\(", re.I)
+_FRAG_RESULT_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*.*sa\.fragment\.fragomics\(", re.M)
 
 
 class AgentCancelledError(Exception):
@@ -98,6 +119,130 @@ def _truncate_result(text: str, limit: int = 600) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1].rstrip() + "…"
+
+
+def _extract_analysis_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    text = "\n".join(str(item.get("content") or "") for item in messages if item.get("content"))
+    design_match = _ANALYSIS_DESIGN_RE.search(text)
+    feasible_match = _ANALYSIS_PAIRED_FEASIBLE_RE.search(text)
+    design = str(design_match.group(1) if design_match else "").strip().lower()
+    feasible_text = str(feasible_match.group(1) if feasible_match else "").strip().lower()
+    paired_feasible: Optional[bool] = None
+    if feasible_text == "true":
+        paired_feasible = True
+    elif feasible_text == "false":
+        paired_feasible = False
+    return {
+        "design": design,
+        "paired_feasible": paired_feasible,
+    }
+
+
+def _extract_deliverables_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    text = "\n".join(str(item.get("content") or "") for item in messages if item.get("content"))
+    html_match = _HTML_REPORT_REQUESTED_RE.search(text)
+    html_requested = str(html_match.group(1) if html_match else "").strip().lower() == "true"
+    return {
+        "html_report_requested": html_requested,
+    }
+
+
+def _extract_requirements_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    text = "\n".join(str(item.get("content") or "") for item in messages if item.get("content"))
+    flags: Dict[str, Any] = {"items": []}
+    for key, value in _REQUIREMENTS_FLAG_RE.findall(text):
+        flags[str(key).strip()] = str(value).strip().lower() == "true"
+    items = [str(item).strip() for item in _REQUIREMENT_ITEM_RE.findall(text) if str(item).strip()]
+    if items:
+        flags["items"] = items[:10]
+    return flags
+
+
+def _extract_current_subtask(messages: List[Dict[str, Any]]) -> Dict[str, str]:
+    text = "\n".join(str(item.get("content") or "") for item in messages if item.get("content"))
+    title_matches = _CURRENT_STEP_TITLE_RE.findall(text)
+    goal_matches = _CURRENT_STEP_GOAL_RE.findall(text)
+    title = str(title_matches[-1] if title_matches else "").strip()
+    goal = str(goal_matches[-1] if goal_matches else "").strip()
+    return {"title": title, "goal": goal}
+
+
+def _audit_execute_code_policy(
+    messages: List[Dict[str, Any]],
+    arguments: Dict[str, Any],
+) -> str:
+    policy = _extract_analysis_policy(messages)
+    deliverables = _extract_deliverables_policy(messages)
+    requirements = _extract_requirements_policy(messages)
+    subtask = _extract_current_subtask(messages)
+    design = str(policy.get("design") or "").strip().lower()
+    paired_feasible = policy.get("paired_feasible")
+    code = str(arguments.get("code") or "")
+    description = str(arguments.get("description") or "")
+    combined = f"{description}\n{code}"
+    is_de_code = bool(_DE_CODE_RE.search(combined))
+    report_requested = bool(deliverables.get("html_report_requested"))
+    if requirements.get("html_report_requested") is not None:
+        report_requested = report_requested or bool(requirements.get("html_report_requested"))
+    current_step_text = " ".join([subtask.get("title") or "", subtask.get("goal") or "", description])
+    if report_requested and _REPORT_STEP_RE.search(current_step_text) and not _HTML_OUTPUT_RE.search(combined):
+        return (
+            "POLICY_VIOLATION: 当前任务明确要求生成真实 HTML 报告，但代码没有写出任何 .html 产物。\n"
+            "请生成真实的 HTML 文件（如 report.html），并输出/登记该文件路径；"
+            "不要只返回纯文本总结或仅依赖 session run_report。"
+        )
+
+    mudata_required = bool(requirements.get("mudata_required"))
+    if _FRAGOMICS_CODE_RE.search(code):
+        assign_match = _FRAG_RESULT_ASSIGN_RE.search(code)
+        if not assign_match:
+            return (
+                "POLICY_VIOLATION: 调用 sa.fragment.fragomics(...) 时必须接收返回值，"
+                "因为结果可能是 AnnData，也可能是在已有小RNA定量时返回 MuData。"
+            )
+        var_name = assign_match.group(1)
+        has_safe_branch = (
+            f"{var_name}.mod[" in code
+            or f"hasattr({var_name}, \"mod\")" in code
+            or f"hasattr({var_name}, 'mod')" in code
+            or ".h5mu" in code
+            or "fragmentomics_only.h5ad" in code
+        )
+        if mudata_required and not has_safe_branch:
+            return (
+                "POLICY_VIOLATION: 当前高优先级要求明确需要 MuData，但 fragomics 返回值没有按 AnnData / MuData 双分支安全处理。\n"
+                "如果已有小RNA定量，默认应返回 MuData，并保存/操作 `result.mod['fragmentomics']` 或写出 `.h5mu`；"
+                "不要把返回值直接当普通 AnnData 使用。"
+            )
+
+    if not is_de_code:
+        return ""
+
+    if design == "needs_confirmation":
+        return (
+            "POLICY_VIOLATION: 当前差异分析设计仍需用户确认，禁止直接执行 DE 代码。\n"
+            "原因：用户请求的设计与数据可行性冲突（如 paired 不可行）。\n"
+            "请先向用户确认是否改为 unpaired，或要求用户提供真实配对信息；"
+            "不要执行 sa.diff.de_analysis(...)。"
+        )
+
+    uses_paired = bool(_PAIRED_CODE_RE.search(combined) or _PATIENT_BLOCKING_CODE_RE.search(combined))
+    default_unpaired = bool(requirements.get("default_unpaired"))
+    if (design == "unpaired" or default_unpaired) and uses_paired:
+        return (
+            "POLICY_VIOLATION: 当前结构化意图要求 unpaired，但代码仍包含 paired / patient blocking 设计。\n"
+            "请重写为非配对差异分析：\n"
+            "- 不要使用 paired / 配对\n"
+            "- 不要使用 patient blocking / donor blocking / patient_id\n"
+            "- 不要使用 group + patient_id 设计矩阵\n"
+            "- 默认按 unpaired 重新生成 sa.diff.de_analysis(...) 代码"
+        )
+    if paired_feasible is False and uses_paired:
+        return (
+            "POLICY_VIOLATION: 当前上下文明确显示 paired 不可行，但代码仍在尝试 paired / patient blocking。\n"
+            "请停止 paired 路线，并改为 unpaired；若必须 paired，先向用户确认并要求提供真实配对关系。"
+        )
+    return ""
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -1462,11 +1607,30 @@ class SRNAgent:
                     if call.name == "execute_code":
                         code = str(call.arguments.get("code") or "")
                         description = str(call.arguments.get("description") or "")
+                        policy_violation = _audit_execute_code_policy(messages, call.arguments)
                         approved = True
-                        if code_approval_callback is not None:
+                        if policy_violation:
+                            result = policy_violation
+                        elif code_approval_callback is not None:
                             request_id = str(uuid.uuid4())
                             approved = code_approval_callback(request_id, code, description)
-                        if not approved:
+                            if not approved:
+                                result = (
+                                    "User denied code execution. Explain what the code would do "
+                                    "and ask whether to try again."
+                                )
+                            elif on_progress is not None:
+                                result = self._run_execute_code_with_progress(
+                                    call.arguments,
+                                    on_progress=on_progress,
+                                    cancel_event=cancel_event,
+                                    turn=turn + 1,
+                                    summary=summary,
+                                    description=description,
+                                )
+                            else:
+                                result = self.dispatch_tool(call.name, call.arguments)
+                        elif not approved:
                             result = (
                                 "User denied code execution. Explain what the code would do "
                                 "and ask whether to try again."

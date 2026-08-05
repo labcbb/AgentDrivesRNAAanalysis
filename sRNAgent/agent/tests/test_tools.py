@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -12,7 +13,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import sRNAgent as sa  # noqa: E402
 from sRNAgent.agent.llm_client import ChatCompletion  # noqa: E402
-from sRNAgent.agent.srn_agent import SRNAgent  # noqa: E402
+from sRNAgent.agent.srn_agent import SRNAgent, _audit_execute_code_policy  # noqa: E402
 from sRNAgent.agent.tools import rank_skill_matches, resolve_skill_query, search_skills  # noqa: E402
 from sRNAgent.skill_registry import SkillDefinition, SkillMetadata  # noqa: E402
 
@@ -140,6 +141,132 @@ def test_registered_adata_tool_accepts_mudata_explicit_mod():
     assert isinstance(result, md.MuData)
     assert "logcpm" in result.mod["fragmentomics"].layers
     assert "logcpm" not in result.mod["srna"].layers
+
+
+def test_execute_code_policy_blocks_paired_code_when_design_is_unpaired():
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "## Structured analysis policy\n"
+                "- analysis.design = unpaired\n"
+                "- analysis.paired_feasible = false\n"
+            ),
+        }
+    ]
+    arguments = {
+        "description": "运行 miRNA 差异分析",
+        "code": (
+            "design = '~0 + group + patient_id'\n"
+            "sa.diff.de_analysis(adata, control_group='Normal')\n"
+        ),
+    }
+    result = _audit_execute_code_policy(messages, arguments)
+    assert "POLICY_VIOLATION" in result
+    assert "unpaired" in result
+
+
+def test_execute_code_policy_allows_unpaired_de_code():
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "## Structured analysis policy\n"
+                "- analysis.design = unpaired\n"
+                "- analysis.paired_feasible = false\n"
+            ),
+        }
+    ]
+    arguments = {
+        "description": "运行 miRNA 差异分析",
+        "code": "sa.diff.de_analysis(adata, control_group='Normal')\n",
+    }
+    result = _audit_execute_code_policy(messages, arguments)
+    assert result == ""
+
+
+def test_execute_code_policy_blocks_report_step_without_html_output():
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "## Required deliverables\n"
+                "- deliverables.html_report_requested = true\n"
+                "## Current subtask (5/5)\n"
+                "Title: 汇总差异结果并生成 HTML 报告\n"
+                "Goal: 生成 report.html 并写回路径\n"
+            ),
+        }
+    ]
+    arguments = {
+        "description": "汇总结果",
+        "code": "print('summary only')\n",
+    }
+    result = _audit_execute_code_policy(messages, arguments)
+    assert "POLICY_VIOLATION" in result
+    assert ".html" in result
+
+
+def test_execute_code_policy_blocks_fragomics_without_safe_result_handling():
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "## High priority user requirements\n"
+                "- requirements.mudata_required = true\n"
+                "- requirement: 如果已经有小RNA定量，片段组学结果必须放在 MuData 下。\n"
+            ),
+        }
+    ]
+    arguments = {
+        "description": "运行片段组学",
+        "code": (
+            "adata = sa.fragment.fragomics(adata, genome_fasta='ref/genome.fa')\n"
+            "print(adata.X.shape)\n"
+        ),
+    }
+    result = _audit_execute_code_policy(messages, arguments)
+    assert "POLICY_VIOLATION" in result
+    assert "MuData" in result
+
+
+def test_execute_code_policy_respects_default_unpaired_requirement_flag():
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "## High priority user requirements\n"
+                "- requirements.default_unpaired = true\n"
+                "- requirement: 差异分析默认非配对。\n"
+            ),
+        }
+    ]
+    arguments = {
+        "description": "运行差异分析",
+        "code": (
+            "design = '~0 + group + patient_id'\n"
+            "sa.diff.de_analysis(adata, control_group='normal')\n"
+        ),
+    }
+    result = _audit_execute_code_policy(messages, arguments)
+    assert "POLICY_VIOLATION" in result
+    assert "unpaired" in result
+
+
+def test_de_analysis_stores_default_unpaired_design_metadata():
+    adata = ad.AnnData(
+        X=np.array([[10.0, 0.0], [12.0, 1.0], [2.0, 11.0], [1.0, 10.0]], dtype=float),
+        obs=pd.DataFrame({"group": ["tumor", "tumor", "normal", "normal"]}, index=["S1", "S2", "S3", "S4"]),
+        var=pd.DataFrame(index=["gene1", "gene2"]),
+    )
+    adata.layers["counts"] = adata.X.copy()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = sa.diff.de_analysis(adata, group_col="group", control_group="normal", output_dir=tmpdir, force=True)
+
+    params = result.uns["de_params"]
+    assert params["design"] == "unpaired"
+    assert params["paired"] is False
+    assert params["design_formula"] == "~0+group"
 
 
 if __name__ == "__main__":

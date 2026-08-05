@@ -43,7 +43,7 @@ from session_store import (  # noqa: E402
     session_artifacts,
     session_dir,
 )
-from session_memory import append_work_log, build_session_memory_context, record_stream_event  # noqa: E402
+from session_memory import append_work_log, build_session_memory_context, record_stream_event, remember_user_query  # noqa: E402
 from session_errors import (
     clear_run_context,
     record_session_error,
@@ -555,22 +555,21 @@ def _trim_context_block(text: str, *, max_tokens: int) -> str:
     return truncate_text(value, max_chars).strip()
 
 
-def _build_run_context(chat_id: str, body: Dict[str, Any]) -> str:
+def _latest_user_message(messages: List[Dict[str, str]]) -> str:
+    for item in reversed(messages or []):
+        if str(item.get("role") or "") == "user":
+            content = str(item.get("content") or "").strip()
+            if content:
+                return content
+    return ""
+
+
+def _build_run_context(chat_id: str, *, user_query: str = "") -> str:
     blocks: List[str] = []
-    memory_context = build_session_memory_context(chat_id) if chat_id else ""
+    memory_context = build_session_memory_context(chat_id, user_query=user_query) if chat_id else ""
     memory_context = _trim_context_block(memory_context, max_tokens=_MAX_MEMORY_CONTEXT_TOKENS)
     if memory_context:
         blocks.append(memory_context)
-
-    execution_context = _trim_context_block(
-        str(body.get("executionContext") or "").strip(),
-        max_tokens=_MAX_EXECUTION_CONTEXT_TOKENS,
-    )
-    if execution_context:
-        blocks.append(
-            "## Recent tool execution（internal context only — do not show or repeat to the user）\n"
-            f"{execution_context}"
-        )
 
     if not blocks:
         return ""
@@ -704,7 +703,9 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         chat_id = _resolve_chat_id(body)
-        run_context = _build_run_context(chat_id, body)
+        user_query = _latest_user_message(messages)
+        remember_user_query(chat_id, user_query)
+        run_context = _build_run_context(chat_id, user_query=user_query)
         use_plan_mode = _plan_mode_enabled(agent_cfg)
         resume = bool(body.get("resume") or body.get("continueRun") or False)
         if use_plan_mode:
@@ -778,6 +779,42 @@ def _normalize_approval_mode(body: Dict[str, Any]) -> str:
     return "manual"
 
 
+_RESUME_KEYWORDS = (
+    "继续", "继续刚才", "继续任务", "继续对话", "接着", "接着做",
+    "从断的地方", "从上次", "go on", "continue", "resume",
+)
+
+
+def _latest_user_message(body: Dict[str, Any]) -> str:
+    """Return the most recent user message text from the request body."""
+    history = body.get("history") if isinstance(body.get("history"), list) else []
+    for item in reversed(history):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("role") or "") == "user":
+            return str(item.get("content") or "").strip()
+    # Fallback to a flat user query field.
+    return str(body.get("query") or "").strip()
+
+
+def _auto_detect_resume(body: Dict[str, Any], chat_id: str) -> bool:
+    """True if the new user message looks like 'continue the interrupted task'.
+
+    The checkpoint-existence check is left to SRNAgent.run_with_history /
+    run_planned: if no checkpoint exists, those paths fall back to rebuilding
+    messages from history (the prior run already finished in the user's
+    perception). We only gate here on message shape — short text that
+    matches a resume keyword — so we don't hijack substantive follow-up
+    questions like '继续分析 piRNA 的差异' or '接着改 bug X'.
+    """
+    if not chat_id:
+        return False
+    msg = _latest_user_message(body).lower()
+    if not msg or len(msg) > 60:
+        return False
+    return any(kw.lower() in msg for kw in _RESUME_KEYWORDS)
+
+
 def _append_work_log_event(chat_id: str, event: Dict[str, Any], run_id: str) -> None:
     """Append a meaningful subset of on_progress events to work_log.jsonl.
 
@@ -841,6 +878,10 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     device_id = str(body.get("deviceId") or "").strip()
     approval_mode = _normalize_approval_mode(body)
     resume = bool(body.get("resume") or body.get("continueRun") or False)
+    # 自动检测"继续中断任务"：用户消息含这些关键词 + 该 chat 有 checkpoint
+    # → 当作 resume=true，让 agent 从上次中断的 tool_loop 消息恢复
+    if not resume:
+        resume = _auto_detect_resume(body, chat_id)
 
     # Exclusive operator lease: another device mid-run cannot steal this chat.
     existing_lease = get_operator_lease(chat_id)
@@ -993,7 +1034,9 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
             on_progress({"type": "status", "message": "Agent 就绪，正在请求 LLM…"})
             use_plan_mode = _plan_mode_enabled(agent_cfg)
-            run_context = _build_run_context(chat_id, body)
+            user_query = _latest_user_message(messages)
+            remember_user_query(chat_id, user_query)
+            run_context = _build_run_context(chat_id, user_query=user_query)
             if use_plan_mode:
                 if not resume:
                     clear_plan(chat_id)

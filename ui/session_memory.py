@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from session_errors import build_session_errors_context
+from session_plan import load_plan, plan_progress_summary
 from session_store import _read_json, _write_json, ensure_session_dir, sanitize_chat_id
 from work_space import get_work_space
 
@@ -54,6 +55,16 @@ _FACT_PATTERNS = (
     re.compile(r"\b(jobs\s*=\s*\d+)\b", re.I),
     re.compile(r"\b(force\s*=\s*(?:True|False))\b", re.I),
 )
+_HTML_REPORT_RE = re.compile(r"html\s*报告|html report|report\.html|生成.*html|写.*html|报告", re.I)
+_MUDATA_RE = re.compile(r"\bmudata\b|MuData|h5mu|放在\s*mudata|放到\s*mudata|返回\s*mudata", re.I)
+_WHOLE_GENOME_BAM_RE = re.compile(r"全基因组.*bam|whole[-\s]*genome\s+bam|genome[-\s]*aligned\s+bam", re.I)
+_UNPAIRED_RE = re.compile(r"\bunpaired\b|非配对|不配对", re.I)
+_PAIRED_RE = re.compile(r"(?<!un)\bpaired\b|(?<!非)配对", re.I)
+_REQUIREMENT_CUE_RE = re.compile(
+    r"(必须|需要|要|不要|不能|默认|优先|如果|若|只有|除非|确保|记得|统一做|放在|生成|写入|保存|返回)",
+    re.I,
+)
+_KEYWORD_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}|[\u4e00-\u9fff]{2,}")
 
 
 def _memory_path(chat_id: str) -> Path:
@@ -67,17 +78,23 @@ def _utc_now() -> str:
 
 def load_session_memory(chat_id: str) -> Dict[str, Any]:
     if not chat_id:
-        return {"steps": [], "artifacts": [], "facts": [], "updatedAt": None}
+        return {"steps": [], "artifacts": [], "facts": [], "analysis": {}, "deliverables": {}, "requirements": {}, "updatedAt": None}
     payload = _read_json(_memory_path(chat_id))
     if not payload:
-        return {"steps": [], "artifacts": [], "facts": [], "updatedAt": None}
+        return {"steps": [], "artifacts": [], "facts": [], "analysis": {}, "deliverables": {}, "requirements": {}, "updatedAt": None}
     steps = payload.get("steps") if isinstance(payload.get("steps"), list) else []
     artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), list) else []
     facts = payload.get("facts") if isinstance(payload.get("facts"), list) else []
+    analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+    deliverables = payload.get("deliverables") if isinstance(payload.get("deliverables"), dict) else {}
+    requirements = payload.get("requirements") if isinstance(payload.get("requirements"), dict) else {}
     return {
         "steps": steps,
         "artifacts": [str(item) for item in artifacts if str(item).strip()],
         "facts": [str(item) for item in facts if str(item).strip()],
+        "analysis": analysis,
+        "deliverables": deliverables,
+        "requirements": requirements,
         "updatedAt": payload.get("updatedAt"),
     }
 
@@ -91,6 +108,9 @@ def save_session_memory(chat_id: str, payload: Dict[str, Any]) -> None:
         "steps": payload.get("steps") or [],
         "artifacts": payload.get("artifacts") or [],
         "facts": payload.get("facts") or [],
+        "analysis": payload.get("analysis") or {},
+        "deliverables": payload.get("deliverables") or {},
+        "requirements": payload.get("requirements") or {},
         "updatedAt": _utc_now(),
     }
     with _LOCK:
@@ -162,6 +182,186 @@ def _append_step(chat_id: str, summary: str, *, tool: str = "", detail: str = ""
         save_session_memory(chat_id, memory)
 
 
+def _save_analysis_memory(chat_id: str, analysis: Dict[str, Any]) -> None:
+    if not chat_id or not isinstance(analysis, dict) or not analysis:
+        return
+    with _LOCK:
+        memory = load_session_memory(chat_id)
+        current = dict(memory.get("analysis") or {})
+        merged = dict(current)
+        for key in ("design", "source", "reason"):
+            value = str(analysis.get(key) or "").strip()
+            if value:
+                merged[key] = value
+        if analysis.get("paired_feasible") is not None:
+            merged["paired_feasible"] = bool(analysis.get("paired_feasible"))
+        modalities = [
+            str(item).strip()
+            for item in (analysis.get("modalities") or [])
+            if str(item).strip()
+        ]
+        if modalities:
+            merged["modalities"] = modalities
+        if merged != current:
+            memory["analysis"] = merged
+            save_session_memory(chat_id, memory)
+
+
+def _save_deliverables_memory(chat_id: str, deliverables: Dict[str, Any]) -> None:
+    if not chat_id or not isinstance(deliverables, dict) or not deliverables:
+        return
+    with _LOCK:
+        memory = load_session_memory(chat_id)
+        current = dict(memory.get("deliverables") or {})
+        merged = dict(current)
+        if deliverables.get("html_report_requested") is not None:
+            merged["html_report_requested"] = bool(deliverables.get("html_report_requested"))
+        if deliverables.get("has_report_step") is not None:
+            merged["has_report_step"] = bool(deliverables.get("has_report_step"))
+        if merged != current:
+            memory["deliverables"] = merged
+            save_session_memory(chat_id, memory)
+
+
+def _save_requirements_memory(chat_id: str, requirements: Dict[str, Any]) -> None:
+    if not chat_id or not isinstance(requirements, dict) or not requirements:
+        return
+    with _LOCK:
+        memory = load_session_memory(chat_id)
+        current = dict(memory.get("requirements") or {})
+        merged = dict(current)
+        for key in (
+            "html_report_requested",
+            "mudata_required",
+            "whole_genome_bam_required",
+            "default_unpaired",
+        ):
+            if requirements.get(key) is not None:
+                merged[key] = bool(requirements.get(key))
+        items = [
+            str(item).strip()
+            for item in (requirements.get("items") or [])
+            if str(item).strip()
+        ]
+        if items:
+            merged["items"] = items[:10]
+        if merged != current:
+            memory["requirements"] = merged
+            save_session_memory(chat_id, memory)
+
+
+def _compact_execute_code_detail(detail: str) -> str:
+    lines: List[str] = []
+    seen: set[str] = set()
+    for raw in str(detail or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        keep = False
+        if _ARTIFACT_RE.search(line):
+            keep = True
+        elif any(pattern.search(line) for pattern in _FACT_PATTERNS):
+            keep = True
+        elif line.lower().startswith(("result:", "output:", "saved:", "wrote ", "written ")):
+            keep = True
+        if not keep:
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+        if len(lines) >= 6:
+            break
+    return "\n".join(lines)[:240]
+
+
+def _normalise_requirement_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip(" ，,。；;：:-")[:180]
+
+
+def _extract_requirement_items_from_query(text: str) -> List[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    candidates = re.split(r"[\n。；;]", raw)
+    found: List[str] = []
+    seen: set[str] = set()
+    for chunk in candidates:
+        value = _normalise_requirement_text(chunk)
+        if not value:
+            continue
+        if not (
+            _REQUIREMENT_CUE_RE.search(value)
+            or _HTML_REPORT_RE.search(value)
+            or _MUDATA_RE.search(value)
+            or _WHOLE_GENOME_BAM_RE.search(value)
+            or _UNPAIRED_RE.search(value)
+        ):
+            continue
+        if value not in seen:
+            seen.add(value)
+            found.append(value)
+    return found[:10]
+
+
+def _extract_requirement_flags_from_query(text: str) -> Dict[str, Any]:
+    raw = str(text or "").strip()
+    return {
+        "html_report_requested": bool(_HTML_REPORT_RE.search(raw)),
+        "mudata_required": bool(_MUDATA_RE.search(raw)),
+        "whole_genome_bam_required": bool(_WHOLE_GENOME_BAM_RE.search(raw)),
+        "default_unpaired": bool(_UNPAIRED_RE.search(raw)) or (not bool(_PAIRED_RE.search(raw)) and "差异分析" in raw),
+    }
+
+
+def remember_user_query(chat_id: str, user_query: str) -> None:
+    query = str(user_query or "").strip()
+    if not chat_id or not query:
+        return
+    with _LOCK:
+        memory = load_session_memory(chat_id)
+        changed = False
+
+        facts = list(memory.get("facts") or [])
+        for item in _extract_facts(query):
+            if item not in facts:
+                facts.append(item)
+                changed = True
+        if changed:
+            memory["facts"] = facts[-_MAX_FACTS:]
+
+        artifacts = list(memory.get("artifacts") or [])
+        for item in _extract_artifacts(query):
+            if item not in artifacts:
+                artifacts.append(item)
+                changed = True
+        if changed:
+            memory["artifacts"] = artifacts[-_MAX_ARTIFACTS:]
+
+        current_requirements = dict(memory.get("requirements") or {})
+        next_requirements = dict(current_requirements)
+        flags = _extract_requirement_flags_from_query(query)
+        for key, value in flags.items():
+            if value:
+                next_requirements[key] = True
+        items = list(current_requirements.get("items") or [])
+        seen_items = {str(item).strip() for item in items if str(item).strip()}
+        for item in _extract_requirement_items_from_query(query):
+            if item not in seen_items:
+                items.append(item)
+                seen_items.add(item)
+        if items:
+            next_requirements["items"] = items[:10]
+        if next_requirements != current_requirements:
+            memory["requirements"] = next_requirements
+            changed = True
+
+        if changed:
+            save_session_memory(chat_id, memory)
+
+
+
+
 def record_stream_event(chat_id: str, event: Dict[str, Any]) -> None:
     if not chat_id or not event:
         return
@@ -175,6 +375,11 @@ def record_stream_event(chat_id: str, event: Dict[str, Any]) -> None:
         name = str(event.get("name") or "")
         summary = str(event.get("summary") or name or "tool_result")
         detail = str(event.get("content") or "")
+        if name == "execute_code":
+            compact = _compact_execute_code_detail(detail)
+            if compact:
+                summary = f"{summary}（已压缩执行输出）"
+            detail = compact
         _append_step(chat_id, summary, tool=name, detail=detail)
         return
     if event_type == "final":
@@ -189,8 +394,18 @@ def record_stream_event(chat_id: str, event: Dict[str, Any]) -> None:
         return
     if event_type in ("plan_created", "plan_revised", "plan_complete"):
         message = str(event.get("message") or event_type).strip()
+        plan_payload = event.get("plan") if isinstance(event.get("plan"), dict) else {}
+        analysis = plan_payload.get("analysis") if isinstance(plan_payload.get("analysis"), dict) else {}
+        deliverables = plan_payload.get("deliverables") if isinstance(plan_payload.get("deliverables"), dict) else {}
+        requirements = plan_payload.get("requirements") if isinstance(plan_payload.get("requirements"), dict) else {}
+        if analysis:
+            _save_analysis_memory(chat_id, analysis)
+        if deliverables:
+            _save_deliverables_memory(chat_id, deliverables)
+        if requirements:
+            _save_requirements_memory(chat_id, requirements)
         if message:
-            _append_step(chat_id, message, tool="plan", detail=json.dumps(event.get("plan") or {}, ensure_ascii=False)[:800])
+            _append_step(chat_id, message, tool="plan", detail=json.dumps(plan_payload or {}, ensure_ascii=False)[:800])
         return
     if event_type in ("plan_step_start", "plan_step_done", "plan_step_failed"):
         message = str(event.get("message") or event_type).strip()
@@ -269,7 +484,73 @@ def build_workspace_manifest(*, max_files: int = 36) -> str:
     return "\n".join(lines)
 
 
-def build_session_memory_context(chat_id: str) -> str:
+def _format_active_plan_context(chat_id: str) -> str:
+    plan = load_plan(chat_id)
+    if not isinstance(plan, dict):
+        return ""
+    steps_raw = plan.get("steps") or []
+    steps = [step for step in steps_raw if isinstance(step, dict)]
+    if not steps:
+        return ""
+
+    active_steps = []
+    done_count = 0
+    for step in steps:
+        status = str(step.get("status") or "pending").strip().lower()
+        if status == "done":
+            done_count += 1
+        else:
+            active_steps.append(step)
+
+    # Completed plans do not need to dominate the resume context.
+    if not active_steps:
+        return ""
+
+    goal = str(plan.get("goal") or "").strip()
+    lines = ["### 当前未完成计划"]
+    if goal:
+        lines.append(f"- 目标：{goal}")
+    lines.append(f"- 进度：{plan_progress_summary(plan)}")
+
+    running = [
+        step for step in active_steps
+        if str(step.get("status") or "").strip().lower() == "running"
+    ]
+    pending = [
+        step for step in active_steps
+        if str(step.get("status") or "").strip().lower() == "pending"
+    ]
+    failed = [
+        step for step in active_steps
+        if str(step.get("status") or "").strip().lower() == "failed"
+    ]
+
+    def _append_steps(label: str, items: List[Dict[str, Any]], *, limit: int) -> None:
+        if not items:
+            return
+        lines.append(f"- {label}：")
+        for step in items[:limit]:
+            title = str(step.get("title") or step.get("goal") or step.get("id") or "未命名步骤").strip()
+            goal_text = str(step.get("goal") or "").strip()
+            skill = str(step.get("skill") or "").strip()
+            extra = goal_text if goal_text and goal_text != title else ""
+            if skill:
+                extra = f"{extra}；skill={skill}" if extra else f"skill={skill}"
+            if extra:
+                lines.append(f"  - {title}：{extra[:220]}")
+            else:
+                lines.append(f"  - {title}")
+
+    _append_steps("当前 running", running, limit=2)
+    _append_steps("后续 pending", pending, limit=4)
+    _append_steps("待处理 failed", failed, limit=2)
+
+    if done_count:
+        lines.append(f"- 已完成步骤数：{done_count}/{len(steps)}")
+    return "\n".join(lines)
+
+
+def build_session_memory_context(chat_id: str, *, user_query: str = "") -> str:
     if not chat_id:
         return ""
 
@@ -277,10 +558,21 @@ def build_session_memory_context(chat_id: str) -> str:
     steps = memory.get("steps") or []
     artifacts = memory.get("artifacts") or []
     facts = memory.get("facts") or []
+    analysis = memory.get("analysis") or {}
+    deliverables = memory.get("deliverables") or {}
+    requirements = memory.get("requirements") or {}
     manifest = build_workspace_manifest()
     errors_context = build_session_errors_context(chat_id)
+    plan = load_plan(chat_id)
+    if not analysis and isinstance(plan, dict) and isinstance(plan.get("analysis"), dict):
+        analysis = dict(plan.get("analysis") or {})
+    if not deliverables and isinstance(plan, dict) and isinstance(plan.get("deliverables"), dict):
+        deliverables = dict(plan.get("deliverables") or {})
+    if not requirements and isinstance(plan, dict) and isinstance(plan.get("requirements"), dict):
+        requirements = dict(plan.get("requirements") or {})
+    active_plan_context = _format_active_plan_context(chat_id)
 
-    if not steps and not artifacts and not facts and not manifest and not errors_context:
+    if not steps and not artifacts and not facts and not analysis and not deliverables and not requirements and not manifest and not errors_context and not active_plan_context:
         return ""
 
     lines = [
@@ -291,6 +583,58 @@ def build_session_memory_context(chat_id: str) -> str:
     if errors_context:
         lines.append("")
         lines.append(errors_context)
+
+    if analysis:
+        lines.append("")
+        lines.append("### 高优先级分析设计")
+        design = str(analysis.get("design") or "").strip()
+        if design:
+            lines.append(f"- analysis.design = {design}")
+        modalities = analysis.get("modalities") or []
+        if modalities:
+            joined = ", ".join(str(item) for item in modalities if str(item).strip())
+            if joined:
+                lines.append(f"- analysis.modalities = [{joined}]")
+        if analysis.get("paired_feasible") is not None:
+            lines.append(f"- analysis.paired_feasible = {str(bool(analysis.get('paired_feasible'))).lower()}")
+        source = str(analysis.get("source") or "").strip()
+        if source:
+            lines.append(f"- analysis.source = {source}")
+        reason = str(analysis.get("reason") or "").strip()
+        if reason:
+            lines.append(f"- analysis.reason = {reason}")
+
+    if deliverables:
+        lines.append("")
+        lines.append("### 高优先级交付要求")
+        if deliverables.get("html_report_requested") is not None:
+            lines.append(
+                f"- deliverables.html_report_requested = {str(bool(deliverables.get('html_report_requested'))).lower()}"
+            )
+        if deliverables.get("has_report_step") is not None:
+            lines.append(
+                f"- deliverables.has_report_step = {str(bool(deliverables.get('has_report_step'))).lower()}"
+            )
+
+    if requirements:
+        lines.append("")
+        lines.append("### 高优先级用户要求")
+        for key in (
+            "default_unpaired",
+            "html_report_requested",
+            "mudata_required",
+            "whole_genome_bam_required",
+        ):
+            if requirements.get(key) is not None:
+                lines.append(f"- requirements.{key} = {str(bool(requirements.get(key))).lower()}")
+        for item in requirements.get("items") or []:
+            text = str(item).strip()
+            if text:
+                lines.append(f"- requirement: {text}")
+
+    if active_plan_context:
+        lines.append("")
+        lines.append(active_plan_context)
 
     if steps:
         lines.append("")
@@ -322,6 +666,11 @@ def build_session_memory_context(chat_id: str) -> str:
         lines.append("")
         lines.append("### 最近工作日志（重启服务后 agent 会从这里读）")
         lines.append(work_log_text)
+
+    if user_query:
+        lines.append("")
+        lines.append("### 用户当前意图（最新一条 user 原文，记住后不要再问）")
+        lines.append(f"> {str(user_query).strip()[:400]}")
 
     return "\n".join(lines).strip()
 

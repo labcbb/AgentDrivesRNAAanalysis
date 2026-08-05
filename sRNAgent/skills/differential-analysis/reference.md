@@ -18,6 +18,7 @@ adata.layers["counts"] = adata.X.copy()
 sa.diff.filter_low_expression(adata, min_mean=1.0)
 
 # ── 4. Differential expression ──
+# Default to unpaired unless the user explicitly confirmed paired
 sa.diff.de_analysis(adata, control_group="Normal")
 
 # ── 5. Check specific miRNAs ──
@@ -43,6 +44,7 @@ import anndata as ad
 
 adata = ad.read_h5ad("quantified.h5ad")
 # Assumes adata.obs["group"] already set
+# Default DE design is unpaired
 
 adata.layers["counts"] = adata.X.copy()
 sa.diff.filter_low_expression(adata, min_mean=1.0)
@@ -157,6 +159,21 @@ sa.diff.de_analysis(
     output_dir=None,          # optional: write de_results.csv + manifest.json here
     force=False,              # True to recompute even if uns already has matching results
 )
+```
+
+## Design policy
+
+```python
+# default:
+# - use unpaired DE
+
+# only switch to paired when BOTH are true:
+# - the user explicitly requests paired
+# - the data really support paired matching
+
+# never do this automatically:
+# - add patient blocking when current intent is unpaired
+# - run paired and unpaired both "just in case"
 ```
 
 ## Output columns in `adata.uns["de_results"]`

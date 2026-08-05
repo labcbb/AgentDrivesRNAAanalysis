@@ -1,5 +1,5 @@
 """Bioinformatics tool wrappers for sRNAgent."""
 
-from . import diff, fastq
+from . import diff, fastq, fragment
 
-__all__ = ["diff", "fastq"]
+__all__ = ["diff", "fastq", "fragment"]
