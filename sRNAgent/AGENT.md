@@ -140,6 +140,15 @@ UI 左侧的 **Branch Chat（监管者）** 是**旁路只读 Agent**，与当�
   - 跑前先 `Path(...).exists()` 确认产物齐全；齐全就直接用，不存在再调用工具
 - 工具自带的幂等（`pylimma.de_analysis` 缓存命中、`tRAX.trax_quant` trnacounts 已存在则跳过）会自动复用结果，**优先信任缓存，不要主动 force=True**。
 
+## 严格遵循 skill：禁止发明 skill 外的流程与命名
+
+用户的定量/比对/分析任务**必须严格按 skill 执行**，这是"智能"的第一条标准：
+
+- **目录名、参数、函数**一律采用 skill 里写明的（如比对一律 `output_dir="aligned"`；定量用 `mirdeep2` / `trax_quant` / `idxstats` / `feature_count`，各自 output_dir 见对应 skill）。**禁止发明** skill 外的目录/变体（历史上出现过 agent 自创 `aligned_perm`、`aligned_strict`，skill 里根本没有）。
+- skill 里的**概念说明**（如"stringent/permissive mapping"）只是备选信息，**不是要求跑两条独立流程**；除非用户明确要对比两种模式，否则按 skill 主流程**一次完成**。
+- 执行前先加载对应 skill 的 SKILL.md，确认里面**有**这个操作；skill 没有覆盖的需求 → **先向用户报告缺口并询问**，不要自由发挥。
+- 不要因为"觉得更严谨"就额外加步骤、加目录、加参数。多做的、skill 没有的，就是偏离。
+
 ## 任务记忆与去重（避免"失忆"和"反复确认"）
 
 每一次回答前**先查会话级持久记忆**（`build_session_memory_context` 会在每次启动时注入 system prompt）：
