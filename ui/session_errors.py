@@ -39,6 +39,17 @@ def _truncate(text: str, limit: int) -> str:
     return value[: limit - 1] + "…"
 
 
+def _truncate_preserve_tail(text: str, limit: int, tail: int = 600) -> str:
+    """Truncate keeping both head and tail, so the real error line at the
+    bottom of a traceback survives even if the input exceeds ``limit``."""
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    head = max(limit - tail - 1, 1)
+    marker = "\n…[已截断]…\n"
+    return f"{value[:head]}{marker}{value[-tail:]}"
+
+
 def load_session_errors(chat_id: str) -> Dict[str, Any]:
     if not chat_id:
         return {"events": [], "updatedAt": None}
@@ -185,7 +196,8 @@ def record_session_error(
         "kind": str(kind or "unknown"),
         "source": str(source or ""),
         "summary": summary,
-        "detail": _truncate(detail, _DETAIL_MAX),
+        # detail 保留 head+tail，确保 traceback 尾部的真实错误行不被截掉
+        "detail": _truncate_preserve_tail(detail, _DETAIL_MAX),
         "context": {
             key: _truncate(str(value), _CONTEXT_MAX) if isinstance(value, str) else value
             for key, value in merged_context.items()

@@ -389,7 +389,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _write_sse_stream(self, event_iter, *, cancel_on_disconnect: bool = True) -> None:
+    def _write_sse_stream(self, event_iter, *, cancel_on_disconnect: bool = False) -> None:
+        """Stream SSE events.
+
+        ``cancel_on_disconnect`` is intentionally ``False`` by default:
+        a dropped client connection is NOT treated as user intent to stop the
+        task (frontend has explicit stop paths). No current route enables it.
+        """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")

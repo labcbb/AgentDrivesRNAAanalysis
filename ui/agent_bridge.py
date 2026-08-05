@@ -763,6 +763,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     chat_id = _resolve_chat_id(body)
     device_id = str(body.get("deviceId") or "").strip()
     approval_mode = _normalize_approval_mode(body)
+    resume = bool(body.get("resume") or body.get("continueRun") or False)
 
     # Exclusive operator lease: another device mid-run cannot steal this chat.
     existing_lease = get_operator_lease(chat_id)
@@ -922,6 +923,8 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                     extra_context=memory_context,
                     chat_id=chat_id,
                     save_plan=save_plan,
+                    load_plan=load_plan,
+                    resume=resume,
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                     code_approval_callback=request_code_approval,
@@ -929,6 +932,8 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             else:
                 text = agent.run_with_history(
                     messages,
+                    chat_id=chat_id,
+                    resume=resume,
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                     code_approval_callback=request_code_approval,

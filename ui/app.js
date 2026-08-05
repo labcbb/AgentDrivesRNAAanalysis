@@ -3114,6 +3114,7 @@ async function handleSend() {
       "assistant",
       `⏳ 当前任务运行中，消息已加入队列（待发送 ${q.length} 条）。当前任务结束后自动发送，无需重复操作。`,
     );
+    persistChatMessages(activeChatId, chatHistory);
     return;
   }
 

@@ -22,4 +22,5 @@ dependencies:
       - fastq-dl
       - tqdm
       - pylimma
+      - pytest
 
