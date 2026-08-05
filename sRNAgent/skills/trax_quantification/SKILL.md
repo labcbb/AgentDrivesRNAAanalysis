@@ -151,6 +151,8 @@ adata = sa.quant.tRAX(
 )
 ```
 
+> ⚡ **幂等（自动）**：如果 `trax_out/<experiment_name>-trnacounts.txt` 已存在且覆盖全部样本，`trax_quant` 会**跳过 tRAX 运行、直接合并 counts**（打印"输出已存在且覆盖全部 N 个样本，跳过 tRAX 运行"）。所以"合并 counts 到 adata 并保存 h5ad"这类步骤**不需要重跑 tRAX** —— 直接再次调用 `trax_quant`（或读取 `trax_out/trax_quant-trnacounts.txt`）即可秒级完成。只有新增样本 / 删掉输出文件时才会真正重跑。
+
 ## Outputs
 
 `sa.quant.tRAX` returns an `AnnData` object. tRNA fragment counts are stored in the shared expression matrix:

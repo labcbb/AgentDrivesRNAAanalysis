@@ -420,26 +420,49 @@ def trax_quant(
     if skipfqcheck:
         cmd.append("--skipfqcheck")
 
-    # 监控线程：定期统计已生成的 BAM 数并打印累计进度，
-    # 供执行层解析为 UI 进度（'[trax] progress: N/M'）
-    total_samples = len(entries)
-    stop_progress = threading.Event()
-
-    def _monitor_progress() -> None:
-        while not stop_progress.wait(15):
-            done = len(list(bam_dir.glob("*.bam")))
-            print(f"[trax] progress: {done}/{total_samples}", flush=True)
-
-    monitor = threading.Thread(target=_monitor_progress, daemon=True)
-    monitor.start()
-    try:
-        run_cli_cmd(cmd, cwd=str(out_dir))
-    finally:
-        stop_progress.set()
-        monitor.join(timeout=2)
-
     base = exp_dir / experiment_name
     trna_counts = str(base.with_name(f"{experiment_name}-trnacounts.txt"))
+
+    # 幂等：trnacounts.txt 已存在且覆盖全部样本 → 跳过 tRAX 运行，直接合并。
+    # 避免 agent 在"合并 counts 并保存 h5ad"步骤重跑 trax_quant 时
+    # 重新执行全部 30 个样本的 counting（lazyremap 只跳过 mapping）。
+    counts_ready = False
+    if not maponly:
+        try:
+            existing = _read_trax_counts(trna_counts)
+            sample_names = [entry["sample"] for entry in entries]
+            counts_ready = (
+                existing.shape[1] == len(sample_names)
+                and all(s in existing.columns for s in sample_names)
+            )
+        except (FileNotFoundError, ValueError):
+            counts_ready = False
+
+    if counts_ready:
+        print(
+            f"[trax] 输出已存在且覆盖全部 {len(entries)} 个样本，"
+            f"跳过 tRAX 运行，直接合并 counts",
+            flush=True,
+        )
+    else:
+        # 监控线程：定期统计已生成的 BAM 数并打印累计进度，
+        # 供执行层解析为 UI 进度（'[trax] progress: N/M'）
+        total_samples = len(entries)
+        stop_progress = threading.Event()
+
+        def _monitor_progress() -> None:
+            while not stop_progress.wait(15):
+                done = len(list(bam_dir.glob("*.bam")))
+                print(f"[trax] progress: {done}/{total_samples}", flush=True)
+
+        monitor = threading.Thread(target=_monitor_progress, daemon=True)
+        monitor.start()
+        try:
+            run_cli_cmd(cmd, cwd=str(out_dir))
+        finally:
+            stop_progress.set()
+            monitor.join(timeout=2)
+
     result: Dict[str, object] = {
         "experiment": experiment_name,
         "output_dir": str(out_dir),
