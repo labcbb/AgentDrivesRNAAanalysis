@@ -820,7 +820,13 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         try:
             update_run_context(chat_id, event)
             record_stream_event(chat_id, event)
-            record_stream_event_error(chat_id, event)
+            # 持久化错误时用完整 head+tail 结果（fullContent），
+            # 不用 UI 预览的 600 字符截断（避免 traceback 尾部错误行丢失）
+            persist_event = dict(event)
+            full = event.get("fullContent")
+            if full:
+                persist_event["content"] = full
+            record_stream_event_error(chat_id, persist_event)
             append_ledger_event(chat_id, event, run_id=run_id)
         except Exception:
             pass

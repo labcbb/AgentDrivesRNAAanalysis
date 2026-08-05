@@ -13,7 +13,9 @@ _ERRORS_FILE = "session_errors.json"
 _LOCK = threading.RLock()
 _MAX_EVENTS = 48
 _CONTEXT_MAX = 1200
-_DETAIL_MAX = 2400
+# 与 bounded_tool_result 的 max_chars 对齐：错误 detail 保留完整 head+tail，
+# 使 traceback 尾部（真正的错误行）能落盘，不再只有 600 字符的头部
+_DETAIL_MAX = 8000
 _SUMMARY_MAX = 500
 _DEDUP_SEC = 8
 

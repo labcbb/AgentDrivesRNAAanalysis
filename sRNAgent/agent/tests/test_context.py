@@ -66,6 +66,16 @@ def test_bounded_tool_result():
     assert "head" in out and "tail" in out
 
 
+def test_bounded_tool_result_keeps_error_tail():
+    """超长 traceback 截断后必须保留尾部的真实错误行（如 NameError）。"""
+    head = "Traceback (most recent call last):\n  File \"<string>\", line 1\n"
+    filler = "  context line\n" * 300
+    tail = "NameError: name 'pd' is not defined"
+    out = bounded_tool_result(head + filler + tail, 8000)
+    assert len(out) <= 8000
+    assert out.endswith(tail)
+
+
 def test_should_compact_threshold():
     small = [{"role": "user", "content": "hi"}]
     assert not should_compact(small, 48000)

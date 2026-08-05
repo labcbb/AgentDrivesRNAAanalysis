@@ -1327,6 +1327,10 @@ class SRNAgent:
                             name=call.name,
                             summary=summary,
                             content=_truncate_result(result),
+                            # 完整 head+tail 结果（bounded），供错误持久化用；
+                            # 避免 session_errors 只记录 600 字符的头部导致
+                            # traceback 关键行（尾部 NameError 等）丢失
+                            fullContent=result,
                         )
                     messages.append(
                         {
