@@ -6,6 +6,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+import anndata as ad  # noqa: E402
+import mudata as md  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import sRNAgent as sa  # noqa: E402
 from sRNAgent.agent.llm_client import ChatCompletion  # noqa: E402
 from sRNAgent.agent.srn_agent import SRNAgent  # noqa: E402
 from sRNAgent.agent.tools import rank_skill_matches, resolve_skill_query, search_skills  # noqa: E402
@@ -100,6 +105,41 @@ def test_ensure_user_facing_reply_rewrites_internal_report():
     assert "等待用户下一步" not in reply
     assert "请直接告诉我" in reply
     assert dummy.rewrite_calls == 1
+
+
+def test_registered_adata_tool_accepts_mudata_default_srna_mod():
+    adata = ad.AnnData(
+        X=np.array([[0.0, 3.0], [0.0, 5.0]], dtype=float),
+        obs=pd.DataFrame(index=["S1", "S2"]),
+        var=pd.DataFrame(index=["gene_low", "gene_high"]),
+    )
+    mdata = md.MuData({"srna": adata})
+
+    result = sa.diff.filter_low_expression(mdata)
+
+    assert isinstance(result, md.MuData)
+    assert result.mod["srna"].n_vars == 1
+    assert list(result.mod["srna"].var_names) == ["gene_high"]
+
+
+def test_registered_adata_tool_accepts_mudata_explicit_mod():
+    srna = ad.AnnData(
+        X=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+        obs=pd.DataFrame(index=["S1", "S2"]),
+        var=pd.DataFrame(index=["a", "b"]),
+    )
+    fragmentomics = ad.AnnData(
+        X=np.array([[10.0, 20.0], [30.0, 40.0]], dtype=float),
+        obs=pd.DataFrame(index=["S1", "S2"]),
+        var=pd.DataFrame(index=["frag1", "frag2"]),
+    )
+    mdata = md.MuData({"srna": srna, "fragmentomics": fragmentomics})
+
+    result = sa.quant.normalize_cpm(mdata, mod="fragmentomics")
+
+    assert isinstance(result, md.MuData)
+    assert "logcpm" in result.mod["fragmentomics"].layers
+    assert "logcpm" not in result.mod["srna"].layers
 
 
 if __name__ == "__main__":

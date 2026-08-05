@@ -309,7 +309,7 @@ def _run_bowtie_one(
 
     # Convert SAM → sorted BAM + index using pysam
     print(f"[pysam] {sam_path.name} -> {bam_path.name} (sorted + indexed)", flush=True)
-    pysam.sort("-o", str(bam_path), str(sam_path))
+    pysam.sort("-@", str(threads), "-o", str(bam_path), str(sam_path))
     pysam.index(str(bam_path))
     sam_path.unlink()  # remove temporary SAM
 
@@ -424,7 +424,7 @@ def bowtie(
     mapq: Optional[int] = None,
     quiet: bool = False,
     # Performance
-    threads: int = 1,
+    threads: int = 8,
     offrate: Optional[int] = None,
     reorder: bool = False,
     mm: bool = False,
@@ -512,7 +512,8 @@ def bowtie(
     quiet
         Print nothing except alignments (``--quiet``).
     threads
-        Parallel search threads per bowtie invocation (``-p``). Default 1.
+        Parallel search threads per bowtie invocation (``-p``) and SAM→BAM
+        sort threads (``pysam.sort -@``). Default 8.
     offrate
         Override index offrate (``-o``). Higher = less memory, slower.
     reorder

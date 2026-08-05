@@ -6,6 +6,15 @@
 
 **因此，检查分析过程 = 直接加载 adata 即可**：`adata.obs` 看样本级别结果，`adata.uns` 看步骤元数据与中间结果，`adata.X` 看表达矩阵。不需要去翻日志或重新推断中间文件，一切状态都在 adata 里。
 
+## MuData 兼容规则：外层容器可用，但执行内核仍是 srna AnnData
+
+当前 tool / skill 仍然围绕 **sRNA 模态的 AnnData** 设计；如果上层传入的是 `MuData`，默认一律取 `mdata.mod["srna"]` 作为执行对象，工具运行完成后再写回这个模态。
+
+- 允许：`AnnData` 直接作为输入
+- 允许：`MuData` 作为外层容器输入，默认操作 `mod="srna"`
+- 暂不支持：同一个 tool / skill 在一次调用里跨多个模态联合执行
+- 若用户显式指定其他模态，可通过 `mod=...` 选择；未指定时默认 `srna`
+
 ```python
 import anndata as ad
 import pandas as pd

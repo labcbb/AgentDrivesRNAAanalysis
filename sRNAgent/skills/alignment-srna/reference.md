@@ -228,7 +228,7 @@ sa.alignment.bowtie(
     no_unal=False,                 # suppress unaligned SAM records
     mapq=None,                     # MAPQ score
     quiet=False,                   # suppress output
-    threads=1,                     # Bowtie internal threads (-p)
+    threads=8,                     # Bowtie internal threads (-p) + SAM→BAM sort (-@); default 8
     offrate=None,                  # index offrate override
     reorder=False,                 # preserve input order
     mm=False,                      # memory-mapped I/O

@@ -10,6 +10,8 @@ description: "Count aligned sRNA-seq reads over genomic features (miRNA, piRNA, 
 
 After aligning sRNA-seq reads to the reference genome (`sa.alignment.bowtie`), the next step is **quantification** — counting how many reads overlap each genomic feature (miRNA, piRNA, etc.). This skill uses `sa.quant.feature_count`, a wrapper around [featureCounts](https://subread.sourceforge.net/).
 
+> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|
 | 1 | featureCounts | `sa.quant.feature_count` | Count aligned BAM reads against GTF/GFF3 features, output expression matrix merged into `adata.X` |

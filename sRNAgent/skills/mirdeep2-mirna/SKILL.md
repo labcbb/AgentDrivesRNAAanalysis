@@ -18,6 +18,8 @@ description: "Quantify known miRNAs and predict novel miRNAs using miRDeep2, wit
 
 miRDeep2 is a widely used tool for identifying known and novel miRNAs from small RNA-seq data. This skill wraps three miRDeep2 modules:
 
+> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|
 | 1 | mapper.pl | `sa.quant.quantify_mirna` (internal) | Preprocess FASTQ (adapter clip, length filter, collapse) + map to genome |

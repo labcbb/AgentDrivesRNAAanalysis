@@ -24,6 +24,8 @@ Small RNA sequencing (sRNA-seq, miRNA-seq, piRNA-seq) is typically **single-end*
 
 Throughout this skill, we use **SRP464891** -- a real sRNA-seq project with 10 samples -- as the running example.
 
+> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+
 | Run | BioSample | Sample label (for downstream) |
 |-----|-----------|-------------------------------|
 | SRR26304152 | SAMN37706862 | S1 |

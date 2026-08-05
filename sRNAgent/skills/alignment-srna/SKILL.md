@@ -10,6 +10,8 @@ description: "Align trimmed sRNA-seq FASTQ reads to the human reference genome u
 
 After adapter trimming and quality control (`fastq-qc` skill), the next step is **alignment** — mapping the trimmed sRNA-seq reads to a reference genome. This skill uses `sa.alignment.bowtie` to align small RNA reads (18–36 nt) with **single-end** mode.
 
+> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|
 | 1 | bowtie-build | `sa.alignment.bowtie_build` | Build Bowtie index from reference genome FASTA |

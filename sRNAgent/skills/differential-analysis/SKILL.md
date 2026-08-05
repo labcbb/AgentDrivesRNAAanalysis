@@ -10,6 +10,8 @@ description: "Filter lowly expressed miRNAs and run limma-voom differential expr
 
 This skill covers differential expression analysis for miRNA-seq data using limma-voom (pylimma):
 
+> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|
 | 1 | filter_low_expression | `sa.diff.filter_low_expression` | Remove miRNAs with mean count ≤ 1 |

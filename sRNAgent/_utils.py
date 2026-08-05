@@ -1,13 +1,103 @@
 """Internal CLI and threading utilities for sRNAgent."""
 from __future__ import annotations
 
+import inspect
 import shlex
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, TypeVar
+from typing import Any, Callable, List, Optional, Sequence, TypeVar
+
+from anndata import AnnData
+
+
+def _get_mudata_cls():
+    try:
+        from mudata import MuData  # type: ignore
+    except Exception:  # pragma: no cover - optional dependency
+        return None
+    return MuData
+
+
+def is_mudata(value: Any) -> bool:
+    mudata_cls = _get_mudata_cls()
+    return bool(mudata_cls is not None and isinstance(value, mudata_cls))
+
+
+def get_mod_adata(data: Any, mod: str = "srna") -> AnnData:
+    if isinstance(data, AnnData):
+        return data
+    if is_mudata(data):
+        if mod not in data.mod:
+            raise KeyError(
+                f"MuData does not contain modality {mod!r}. "
+                f"Available modalities: {list(data.mod.keys())}"
+            )
+        adata = data.mod[mod]
+        if not isinstance(adata, AnnData):
+            raise TypeError(f"MuData modality {mod!r} is not an AnnData object.")
+        return adata
+    raise TypeError("Expected AnnData or MuData input.")
+
+
+def merge_mod_result(container: Any, result: Any, *, mod: str = "srna", fallback: Optional[AnnData] = None):
+    if is_mudata(result):
+        return result
+    if is_mudata(container):
+        if result is None:
+            if fallback is not None:
+                container.mod[mod] = fallback
+            return container
+        if not isinstance(result, AnnData):
+            raise TypeError(
+                "MuData-wrapped tool must return AnnData (or MuData), "
+                f"got {type(result).__name__}."
+            )
+        container.mod[mod] = result
+        return container
+    return result
+
+
+def wrap_adata_tool_for_mudata(func: Callable, *, default_mod: str = "srna") -> Callable:
+    """Allow AnnData tools to accept MuData by routing through ``mdata.mod[mod]``."""
+    if not callable(func) or inspect.isclass(func):
+        return func
+    try:
+        params = list(inspect.signature(func).parameters.values())
+    except Exception:
+        return func
+    if not params:
+        return func
+    first = params[0]
+    if first.name != "adata" or first.kind not in (
+        inspect.Parameter.POSITIONAL_ONLY,
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+    ):
+        return func
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        mod = str(kwargs.pop("mod", default_mod) or default_mod)
+        if args:
+            data = args[0]
+            if is_mudata(data):
+                adata = get_mod_adata(data, mod=mod)
+                result = func(adata, *args[1:], **kwargs)
+                return merge_mod_result(data, result, mod=mod, fallback=adata)
+            return func(*args, **kwargs)
+        if "adata" in kwargs and is_mudata(kwargs["adata"]):
+            data = kwargs["adata"]
+            adata = get_mod_adata(data, mod=mod)
+            next_kwargs = dict(kwargs)
+            next_kwargs["adata"] = adata
+            result = func(**next_kwargs)
+            return merge_mod_result(data, result, mod=mod, fallback=adata)
+        return func(*args, **kwargs)
+
+    return wrapper
 
 
 def _watch_download_growth(

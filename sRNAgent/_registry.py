@@ -16,6 +16,8 @@ import warnings
 import json
 from pathlib import Path
 
+from ._utils import wrap_adata_tool_for_mudata
+
 _CAPABILITY_BRANCH_PARAMS = {
     "method",
     "backend",
@@ -230,13 +232,14 @@ class FunctionRegistry:
             raise ValueError(f"Invalid auto_fix value '{auto_fix}'. Valid values: 'auto', 'escalate', 'none'")
 
         # Generate function key
-        module_name = func.__module__
-        func_name = func.__name__
+        source_func = inspect.unwrap(func)
+        module_name = source_func.__module__
+        func_name = source_func.__name__
         full_name = f"{module_name}.{func_name}"
 
         # Extract function signature and parameters
         try:
-            sig = inspect.signature(func)
+            sig = inspect.signature(source_func)
             signature = str(sig)
             
             # Extract parameter details with defaults
@@ -248,7 +251,7 @@ class FunctionRegistry:
                 params_info.append(param_str)
             
             # Get full docstring for help
-            raw_doc = inspect.getdoc(func)
+            raw_doc = inspect.getdoc(source_func)
             if not raw_doc:
                 warnings.warn(
                     f"Function '{full_name}' is missing a docstring; agent help output may be limited.",
@@ -304,7 +307,7 @@ class FunctionRegistry:
         """Expand a registered callable into searchable virtual registry entries."""
 
         try:
-            source = inspect.getsource(func)
+            source = inspect.getsource(inspect.unwrap(func))
         except Exception:
             return []
 
@@ -1162,8 +1165,9 @@ def register_function(aliases: List[str],
     ...     pass
     """
     def decorator(func: Callable) -> Callable:
+        wrapped_func = wrap_adata_tool_for_mudata(func)
         _global_registry.register(
-            func=func,
+            func=wrapped_func,
             aliases=aliases,
             category=category,
             description=description,
@@ -1175,9 +1179,9 @@ def register_function(aliases: List[str],
             auto_fix=auto_fix
         )
         
-        @wraps(func)
+        @wraps(wrapped_func)
         def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
+            return wrapped_func(*args, **kwargs)
 
         # Add registry info to function
         wrapper._registry_info = {
@@ -1188,9 +1192,9 @@ def register_function(aliases: List[str],
 
         # If func is a class, copy over class methods and static methods
         import inspect
-        if inspect.isclass(func):
-            for name, value in inspect.getmembers(func):
-                if isinstance(inspect.getattr_static(func, name), (classmethod, staticmethod)):
+        if inspect.isclass(wrapped_func):
+            for name, value in inspect.getmembers(wrapped_func):
+                if isinstance(inspect.getattr_static(wrapped_func, name), (classmethod, staticmethod)):
                     setattr(wrapper, name, value)
 
         return wrapper
