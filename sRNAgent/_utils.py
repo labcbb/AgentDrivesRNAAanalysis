@@ -119,17 +119,30 @@ def run_threads(items: List[T], worker: Callable[[T], R], jobs: int) -> List[R]:
     """Execute *worker* on each *item* across up to *jobs* threads.
 
     When ``jobs <= 1`` or there is only one item, runs sequentially.
+
+    Prints ``progress: N/M`` after each item finishes so the agent execution
+    layer can surface cumulative sample progress (parsed by
+    ``_parse_progress_output`` into "已完成 N/M 样本").
     """
     n = len(items)
     if n == 0:
         return []
     if jobs is None or jobs <= 1 or n == 1:
-        return [worker(item) for item in items]
+        results = []
+        for i, item in enumerate(items, start=1):
+            results.append(worker(item))
+            print(f"progress: {i}/{n}", flush=True)
+        return results
 
     max_workers = max(1, min(jobs, n))
     results: List[Optional[R]] = [None] * n
+    done = 0
+    lock = threading.Lock()
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(worker, item): i for i, item in enumerate(items)}
         for fut in as_completed(futures):
             results[futures[fut]] = fut.result()
+            with lock:
+                done += 1
+            print(f"progress: {done}/{n}", flush=True)
     return [r for r in results if r is not None]
