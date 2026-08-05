@@ -93,7 +93,8 @@ def test_interrupted_run_writes_checkpoint_and_resumes():
             chat_id=chat_id,
             resume=True,
         )
-        assert text == "final answer"
+        assert text.startswith("final answer"), f"unexpected text: {text!r}"
+        assert "耗时" in text, "elapsed time should be appended to the answer"
         assert llm2.calls == 1
         resumed = llm2.seen_messages[0]
         resumed_text = "\n".join(str(m.get("content") or "") for m in resumed)

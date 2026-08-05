@@ -540,6 +540,7 @@ class PlanOrchestrator:
                     cancel_event=cancel_event,
                     code_approval_callback=code_approval_callback,
                     chat_id=self.chat_id,
+                    _attach_elapsed=False,
                 )
             return self._ensure_user_facing_reply(
                 user_query,
@@ -612,6 +613,7 @@ class PlanOrchestrator:
                 cancel_event=cancel_event,
                 code_approval_callback=code_approval_callback,
                 chat_id=self.chat_id,
+                _attach_elapsed=False,
             )
             result = self._ensure_user_facing_reply(
                 user_query,

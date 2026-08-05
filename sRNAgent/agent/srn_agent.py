@@ -1354,12 +1354,25 @@ class SRNAgent:
         self._emit_progress(on_progress, "final", content=message)
         return message
 
+    @staticmethod
+    def _maybe_attach_elapsed(
+        answer: str,
+        started_at: float,
+        attach: bool = True,
+    ) -> str:
+        """Append the wall-clock duration of this Q&A to the final answer."""
+        if not attach or not answer:
+            return answer
+        elapsed = time.time() - started_at
+        return f"{answer}\n\n⏱️ 本次回答耗时 {_format_elapsed(elapsed)}"
+
     def run(self, user_query: str) -> str:
+        started_at = time.time()
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_query},
         ]
-        return self._tool_loop(messages)
+        return self._maybe_attach_elapsed(self._tool_loop(messages), started_at)
 
     def run_with_history(
         self,
@@ -1370,19 +1383,25 @@ class SRNAgent:
         code_approval_callback: Optional[CodeApprovalCallback] = None,
         chat_id: str = "",
         resume: bool = False,
+        _attach_elapsed: bool = True,
     ) -> str:
+        started_at = time.time()
         messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
 
         if resume and chat_id:
             checkpoint = self._load_run_checkpoint(chat_id)
             if checkpoint and isinstance(checkpoint.get("messages"), list) and checkpoint["messages"]:
                 logger.info("Resuming session %s from checkpoint", chat_id)
-                return self._tool_loop(
-                    checkpoint["messages"],
-                    on_progress=on_progress,
-                    cancel_event=cancel_event,
-                    code_approval_callback=code_approval_callback,
-                    chat_id=chat_id,
+                return self._maybe_attach_elapsed(
+                    self._tool_loop(
+                        checkpoint["messages"],
+                        on_progress=on_progress,
+                        cancel_event=cancel_event,
+                        code_approval_callback=code_approval_callback,
+                        chat_id=chat_id,
+                    ),
+                    started_at,
+                    _attach_elapsed,
                 )
 
         for item in history:
@@ -1392,12 +1411,16 @@ class SRNAgent:
                 messages.append({"role": role, "content": content})
         if not any(m.get("role") == "user" for m in messages):
             raise ValueError("No user message in history")
-        return self._tool_loop(
-            messages,
-            on_progress=on_progress,
-            cancel_event=cancel_event,
-            code_approval_callback=code_approval_callback,
-            chat_id=chat_id,
+        return self._maybe_attach_elapsed(
+            self._tool_loop(
+                messages,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                code_approval_callback=code_approval_callback,
+                chat_id=chat_id,
+            ),
+            started_at,
+            _attach_elapsed,
         )
 
     def run_planned(
@@ -1414,19 +1437,23 @@ class SRNAgent:
         code_approval_callback: Optional[CodeApprovalCallback] = None,
     ) -> str:
         """Plan-and-Execute: planner splits work; each step gets its own tool-loop budget."""
+        started_at = time.time()
         orchestrator = PlanOrchestrator(
             self,
             chat_id=chat_id,
             save_plan=save_plan,
             load_plan=load_plan,
         )
-        return orchestrator.run(
-            history,
-            extra_context=extra_context,
-            resume=resume,
-            on_progress=on_progress,
-            cancel_event=cancel_event,
-            code_approval_callback=code_approval_callback,
+        return self._maybe_attach_elapsed(
+            orchestrator.run(
+                history,
+                extra_context=extra_context,
+                resume=resume,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                code_approval_callback=code_approval_callback,
+            ),
+            started_at,
         )
 
     def status(self) -> Dict[str, Any]:
