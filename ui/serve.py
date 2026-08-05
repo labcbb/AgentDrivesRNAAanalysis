@@ -412,14 +412,23 @@ class Handler(SimpleHTTPRequestHandler):
                 self.wfile.write(b"data: " + payload + b"\n\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            if cancel_on_disconnect and run_id:
+            # 断连 ≠ 用户要停止：只记录 sse_disconnect，不自动取消主任务。
+            # 前端已有显式停止路径（停止按钮 handleStop → cancelAgentRun；
+            # 发送新消息前也会先 cancel 旧 run）。自动取消会误杀长分析任务
+            # （曾因 branch chat 并行请求导致主会话流断开、Agent 循环被取消）。
+            if run_id:
                 try:
-                    from agent_bridge import cancel_run, record_sse_disconnect, resolve_chat_id_for_run
+                    from agent_bridge import (
+                        cancel_run,
+                        record_sse_disconnect,
+                        resolve_chat_id_for_run,
+                    )
 
                     chat_id = resolve_chat_id_for_run(run_id)
                     if chat_id:
                         record_sse_disconnect(chat_id, run_id=run_id)
-                    cancel_run(run_id, interrupt_kernel=False)
+                    if cancel_on_disconnect:
+                        cancel_run(run_id, interrupt_kernel=False)
                 except Exception:
                     pass
         except Exception as exc:  # noqa: BLE001
@@ -532,7 +541,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
 
         if path == "/api/agent/chat/stream":
-            self._write_sse_stream(iter_agent_chat_stream(body))
+            # 主任务流断连不自动取消（前端停止按钮 / 新消息会显式 cancel_run）
+            self._write_sse_stream(iter_agent_chat_stream(body), cancel_on_disconnect=False)
             return
 
         if path == "/api/supervisor/chat/stream":
