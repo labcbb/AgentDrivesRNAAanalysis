@@ -33,6 +33,13 @@ class ExecutionConfig:
     strict_env_validation: bool = False
     sandbox_fallback_policy: SandboxFallbackPolicy = SandboxFallbackPolicy.WARN_AND_FALLBACK
     workspace_dir: Optional[Path] = None
+    # Long-session context management.
+    max_context_tokens: int = 48000
+    keep_recent_messages: int = 12
+    max_tool_result_chars: int = 8000
+    # Interruption-safe resume.
+    enable_checkpoint: bool = True
+    checkpoint_dir: Optional[Path] = None
 
 
 class SandboxExecutionError(RuntimeError):

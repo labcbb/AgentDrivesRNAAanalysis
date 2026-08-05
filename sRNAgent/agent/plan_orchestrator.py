@@ -337,6 +337,25 @@ class PlanOrchestrator:
         if self._save_plan and self.chat_id:
             self._save_plan(self.chat_id, plan)
 
+    def _load_checkpoint(self) -> Optional[Dict[str, Any]]:
+        if not self.chat_id:
+            return None
+        return self.agent._load_run_checkpoint(self.chat_id)
+
+    def _save_step_checkpoint(
+        self,
+        plan: Dict[str, Any],
+        step_id: Optional[str],
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Persist plan + active step messages so a run can resume mid-step."""
+        if not self.chat_id:
+            return
+        payload: Dict[str, Any] = {"plan": plan, "step_id": step_id}
+        if messages is not None:
+            payload["messages"] = messages
+        self.agent._persist_checkpoint(payload, self.chat_id)
+
     def _emit(
         self,
         on_progress: Optional["ProgressCallback"],
@@ -495,18 +514,33 @@ class PlanOrchestrator:
         plan_goal: str,
         user_query: str,
         history: List[Dict[str, str]],
+        plan: Dict[str, Any],
+        resume_messages: Optional[List[Dict[str, Any]]] = None,
         on_progress: Optional["ProgressCallback"] = None,
         cancel_event: Optional[Any] = None,
         code_approval_callback: Optional["CodeApprovalCallback"] = None,
     ) -> str:
+        checkpoint_extra = {"plan": plan, "step_id": step.get("id")}
+
         # Single-step chat-like tasks: use normal conversation loop (no subtask framing).
         if step_total == 1 and not str(step.get("skill") or "").strip():
-            result = self.agent.run_with_history(
-                history,
-                on_progress=on_progress,
-                cancel_event=cancel_event,
-                code_approval_callback=code_approval_callback,
-            )
+            if resume_messages:
+                result = self.agent._tool_loop(
+                    resume_messages,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                    code_approval_callback=code_approval_callback,
+                    chat_id=self.chat_id,
+                    checkpoint_extra=checkpoint_extra,
+                )
+            else:
+                result = self.agent.run_with_history(
+                    history,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                    code_approval_callback=code_approval_callback,
+                    chat_id=self.chat_id,
+                )
             return self._ensure_user_facing_reply(
                 user_query,
                 result,
@@ -521,12 +555,15 @@ class PlanOrchestrator:
             step_total=step_total,
             plan_goal=plan_goal,
         )
-        messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": executor_system},
-            {"role": "user", "content": _build_step_user_message(
-                user_query=user_query, step=step, step_total=step_total
-            )},
-        ]
+        if resume_messages:
+            messages: List[Dict[str, Any]] = resume_messages
+        else:
+            messages = [
+                {"role": "system", "content": executor_system},
+                {"role": "user", "content": _build_step_user_message(
+                    user_query=user_query, step=step, step_total=step_total
+                )},
+            ]
         return self._ensure_user_facing_reply(
             user_query,
             self.agent._tool_loop(
@@ -534,6 +571,8 @@ class PlanOrchestrator:
                 on_progress=on_progress,
                 cancel_event=cancel_event,
                 code_approval_callback=code_approval_callback,
+                chat_id=self.chat_id,
+                checkpoint_extra=checkpoint_extra,
             ),
             on_progress=on_progress,
             cancel_event=cancel_event,
@@ -551,6 +590,7 @@ class PlanOrchestrator:
         history: List[Dict[str, str]],
         *,
         extra_context: str = "",
+        resume: bool = False,
         on_progress: Optional["ProgressCallback"] = None,
         cancel_event: Optional[Any] = None,
         code_approval_callback: Optional["CodeApprovalCallback"] = None,
@@ -558,6 +598,10 @@ class PlanOrchestrator:
         user_query = _extract_user_query(history)
         if not user_query:
             raise ValueError("No user message in history")
+
+        checkpoint: Optional[Dict[str, Any]] = None
+        if resume and self.chat_id:
+            checkpoint = self._load_checkpoint()
 
         # Greetings / short chat: skip planning, reply like normal agent.
         if _is_conversational_query(user_query):
@@ -567,6 +611,7 @@ class PlanOrchestrator:
                 on_progress=on_progress,
                 cancel_event=cancel_event,
                 code_approval_callback=code_approval_callback,
+                chat_id=self.chat_id,
             )
             result = self._ensure_user_facing_reply(
                 user_query,
@@ -577,20 +622,57 @@ class PlanOrchestrator:
             self._emit(on_progress, "final", content=result)
             return result
 
-        self._emit(on_progress, "status", message="正在制定执行计划…")
-        plan = self._create_plan(
-            user_query,
-            extra_context,
-            on_progress=on_progress,
-            cancel_event=cancel_event,
-        )
-        self._persist_plan(plan)
-        self._emit(
-            on_progress,
-            "plan_created",
-            plan=plan,
-            message=f"计划已生成：{len(plan.get('steps') or [])} 个步骤",
-        )
+        # Resume a checkpointed run that has no plan (single-step / non-plan mode):
+        # continue the interrupted message loop directly.
+        if (
+            resume
+            and checkpoint
+            and not checkpoint.get("plan")
+            and isinstance(checkpoint.get("messages"), list)
+            and checkpoint["messages"]
+        ):
+            self._emit(on_progress, "status", message="正在恢复上次运行…")
+            result = self.agent._tool_loop(
+                checkpoint["messages"],
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                code_approval_callback=code_approval_callback,
+                chat_id=self.chat_id,
+            )
+            result = self._ensure_user_facing_reply(
+                user_query,
+                result,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+            )
+            self._emit(on_progress, "final", content=result)
+            return result
+
+        # Resume with a persisted plan: reuse it instead of planning from scratch.
+        if resume and checkpoint and checkpoint.get("plan"):
+            plan = checkpoint["plan"]
+            self._emit(
+                on_progress,
+                "plan_restored",
+                plan=plan,
+                message=f"已恢复上次计划（{len(plan.get('steps') or [])} 个步骤）",
+            )
+        else:
+            self._emit(on_progress, "status", message="正在制定执行计划…")
+            plan = self._create_plan(
+                user_query,
+                extra_context,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+            )
+            self._persist_plan(plan)
+            self._save_step_checkpoint(plan, None)
+            self._emit(
+                on_progress,
+                "plan_created",
+                plan=plan,
+                message=f"计划已生成：{len(plan.get('steps') or [])} 个步骤",
+            )
 
         replan_attempts = 0
         steps_list = plan.get("steps") or []
@@ -616,6 +698,16 @@ class PlanOrchestrator:
                 message=f"正在执行步骤 {step_index}/{step_total}：{pending.get('title')}",
             )
 
+            resume_messages: Optional[List[Dict[str, Any]]] = None
+            if (
+                resume
+                and checkpoint
+                and checkpoint.get("step_id") == pending.get("id")
+                and isinstance(checkpoint.get("messages"), list)
+                and checkpoint["messages"]
+            ):
+                resume_messages = checkpoint["messages"]
+
             result = self._execute_step(
                 pending,
                 step_index=step_index,
@@ -623,6 +715,8 @@ class PlanOrchestrator:
                 plan_goal=str(plan.get("goal") or ""),
                 user_query=user_query,
                 history=history,
+                plan=plan,
+                resume_messages=resume_messages,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
                 code_approval_callback=code_approval_callback,
@@ -632,6 +726,7 @@ class PlanOrchestrator:
                 pending["status"] = STEP_FAILED
                 pending["result"] = result
                 self._persist_plan(plan)
+                self._save_step_checkpoint(plan, None)
                 self._emit(
                     on_progress,
                     "plan_step_failed",
@@ -665,6 +760,7 @@ class PlanOrchestrator:
                 steps_list = plan.get("steps") or []
                 step_total = len(steps_list)
                 self._persist_plan(plan)
+                self._save_step_checkpoint(plan, None)
                 self._emit(
                     on_progress,
                     "plan_revised",
@@ -676,6 +772,7 @@ class PlanOrchestrator:
             pending["status"] = STEP_DONE
             pending["result"] = result
             self._persist_plan(plan)
+            self._save_step_checkpoint(plan, None)
             self._emit(
                 on_progress,
                 "plan_step_done",

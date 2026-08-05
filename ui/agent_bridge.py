@@ -40,6 +40,7 @@ from session_store import (  # noqa: E402
     save_chat_record,
     save_kernel_state,
     session_artifacts,
+    session_dir,
 )
 from session_memory import build_session_memory_context, record_stream_event  # noqa: E402
 from session_errors import (
@@ -82,14 +83,17 @@ _SSE_HEARTBEAT_SEC = 10
 _KERNEL_DRAIN_MAX_SEC = 6 * 3600
 
 
-def _default_execution_config() -> ExecutionConfig:
-    return ExecutionConfig(
+def _default_execution_config(chat_id: str = "") -> ExecutionConfig:
+    cfg = ExecutionConfig(
         use_notebook=True,
         strict_kernel_validation=False,
         strict_env_validation=False,
         sandbox_fallback_policy=SandboxFallbackPolicy.WARN_AND_FALLBACK,
         timeout=EXECUTION_TIMEOUT_SEC,
     )
+    if chat_id:
+        cfg.checkpoint_dir = session_dir(chat_id) / "checkpoints"
+    return cfg
 
 
 def _resolve_chat_id(body: Dict[str, Any]) -> str:
@@ -575,7 +579,7 @@ def _build_agent(body: Dict[str, Any]) -> tuple[SRNAgent, Dict[str, Any]]:
         cwd=get_work_space(),
         max_turns=max_turns,
         extra_system_prompt=extra_system,
-        execution_config=_default_execution_config(),
+        execution_config=_default_execution_config(chat_id),
         execution_backend=get_chat_execution(SRNAGENT_PROJECT, chat_id),
     )
     return agent, agent_cfg
@@ -681,17 +685,21 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
     try:
         chat_id = _resolve_chat_id(body)
         use_plan_mode = _plan_mode_enabled(agent_cfg)
+        resume = bool(body.get("resume") or body.get("continueRun") or False)
         if use_plan_mode:
-            clear_plan(chat_id)
+            if not resume:
+                clear_plan(chat_id)
             memory_context = build_session_memory_context(chat_id)
             text = agent.run_planned(
                 messages,
                 extra_context=memory_context,
                 chat_id=chat_id,
                 save_plan=save_plan,
+                load_plan=load_plan,
+                resume=resume,
             )
         else:
-            text = agent.run_with_history(messages)
+            text = agent.run_with_history(messages, chat_id=chat_id, resume=resume)
     except AgentCancelledError:
         return {"ok": False, "error": "已停止", "cancelled": True}
     except Exception as exc:  # noqa: BLE001

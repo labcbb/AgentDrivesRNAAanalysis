@@ -12,6 +12,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .agent_config import ExecutionConfig, SandboxFallbackPolicy
 from .bootstrap import initialize_agent_runtime, initialize_registries
+from .checkpoint import clear_checkpoint, load_checkpoint, save_checkpoint
+from .context import (
+    bounded_tool_result,
+    compact_messages,
+    messages_tokens,
+    should_compact,
+)
 from .execution import ExecutionBackend, initialize_execution_backend
 from .llm_client import ChatClient, LLMConfig
 from .plan_orchestrator import PlanOrchestrator
@@ -867,6 +874,12 @@ class SRNAgent:
             )
         self.system_prompt = _build_system_prompt(skill_overview, extra_system_prompt)
 
+        self.max_context_tokens = int(getattr(exec_cfg, "max_context_tokens", 48000))
+        self.keep_recent_messages = int(getattr(exec_cfg, "keep_recent_messages", 12))
+        self.max_tool_result_chars = int(getattr(exec_cfg, "max_tool_result_chars", 8000))
+        self.enable_checkpoint = bool(getattr(exec_cfg, "enable_checkpoint", True))
+        self.checkpoint_dir = getattr(exec_cfg, "checkpoint_dir", None)
+
         env_name = self.execution.runtime.conda_env or "unknown"
         mode = "notebook" if self.execution.use_notebook else "in-process"
         logger.info(
@@ -972,6 +985,75 @@ class SRNAgent:
             return Path(self.cwd)
         except Exception:
             return None
+
+    def _checkpoint_base_dir(self) -> Optional[Path]:
+        """Directory for run checkpoints; None when checkpointing is disabled."""
+        if not self.enable_checkpoint:
+            return None
+        if self.checkpoint_dir is not None:
+            return Path(self.checkpoint_dir)
+        return Path(self.cwd) / ".srnagent" / "checkpoints"
+
+    def _persist_checkpoint(self, payload: Dict[str, Any], chat_id: str) -> None:
+        """Persist an arbitrary checkpoint payload for ``chat_id`` (best-effort)."""
+        if not chat_id:
+            return
+        base = self._checkpoint_base_dir()
+        if base is None:
+            return
+        try:
+            save_checkpoint(base, chat_id, payload)
+        except Exception:  # noqa: BLE001 — checkpointing must never break the run
+            logger.debug("checkpoint save failed", exc_info=True)
+
+    def _save_run_checkpoint(
+        self,
+        messages: List[Dict[str, Any]],
+        chat_id: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {"messages": messages}
+        if extra:
+            payload.update(extra)
+        self._persist_checkpoint(payload, chat_id)
+
+    def _load_run_checkpoint(
+        self,
+        chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not chat_id:
+            return None
+        base = self._checkpoint_base_dir()
+        if base is None:
+            return None
+        return load_checkpoint(base, chat_id)
+
+    def _compact_context(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        on_progress: Optional[ProgressCallback],
+    ) -> List[Dict[str, Any]]:
+        """Compress old turns when the transcript exceeds the context budget."""
+        if not should_compact(messages, self.max_context_tokens):
+            return messages
+        before = messages_tokens(messages)
+        messages = compact_messages(
+            messages,
+            llm=self.llm,
+            max_tokens=self.max_context_tokens,
+            keep_recent=self.keep_recent_messages,
+            on_compact=lambda summary: self._emit_progress(
+                on_progress,
+                "context_compacted",
+                summary=summary or "(fallback: dropped oldest turns)",
+            ),
+        )
+        after = messages_tokens(messages)
+        logger.info(
+            "Context compacted: %d → %d est. tokens", before, after
+        )
+        return messages
 
     @staticmethod
     def _progress_payload_from_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
@@ -1133,9 +1215,13 @@ class SRNAgent:
         on_progress: Optional[ProgressCallback] = None,
         cancel_event: Optional[Any] = None,
         code_approval_callback: Optional[CodeApprovalCallback] = None,
+        chat_id: str = "",
+        checkpoint_extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         for turn in range(self.max_turns):
             self._check_cancelled(cancel_event)
+
+            messages = self._compact_context(messages, on_progress=on_progress)
 
             self._emit_progress(on_progress, "status", message="正在请求 LLM…")
             completion = self._llm_complete_cancellable(
@@ -1189,6 +1275,9 @@ class SRNAgent:
 
                     if call.name == "finish":
                         message = str(call.arguments.get("message", "Task completed."))
+                        self._save_run_checkpoint(
+                            messages, chat_id, checkpoint_extra
+                        )
                         self._emit_progress(
                             on_progress,
                             "final",
@@ -1223,6 +1312,8 @@ class SRNAgent:
                     else:
                         result = self.dispatch_tool(call.name, call.arguments)
 
+                    result = bounded_tool_result(result, self.max_tool_result_chars)
+
                     if call.name == "execute_code":
                         self._emit_progress(
                             on_progress,
@@ -1239,10 +1330,12 @@ class SRNAgent:
                             "content": result,
                         }
                     )
+                self._save_run_checkpoint(messages, chat_id, checkpoint_extra)
                 continue
 
             answer = _resolve_answer_text(completion)
             if answer:
+                self._save_run_checkpoint(messages, chat_id, checkpoint_extra)
                 self._emit_progress(
                     on_progress,
                     "final",
@@ -1270,8 +1363,23 @@ class SRNAgent:
         on_progress: Optional[ProgressCallback] = None,
         cancel_event: Optional[Any] = None,
         code_approval_callback: Optional[CodeApprovalCallback] = None,
+        chat_id: str = "",
+        resume: bool = False,
     ) -> str:
         messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+
+        if resume and chat_id:
+            checkpoint = self._load_run_checkpoint(chat_id)
+            if checkpoint and isinstance(checkpoint.get("messages"), list) and checkpoint["messages"]:
+                logger.info("Resuming session %s from checkpoint", chat_id)
+                return self._tool_loop(
+                    checkpoint["messages"],
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                    code_approval_callback=code_approval_callback,
+                    chat_id=chat_id,
+                )
+
         for item in history:
             role = item.get("role")
             content = str(item.get("content") or "").strip()
@@ -1284,6 +1392,7 @@ class SRNAgent:
             on_progress=on_progress,
             cancel_event=cancel_event,
             code_approval_callback=code_approval_callback,
+            chat_id=chat_id,
         )
 
     def run_planned(
@@ -1294,6 +1403,7 @@ class SRNAgent:
         chat_id: str = "",
         save_plan: Optional[Any] = None,
         load_plan: Optional[Any] = None,
+        resume: bool = False,
         on_progress: Optional[ProgressCallback] = None,
         cancel_event: Optional[Any] = None,
         code_approval_callback: Optional[CodeApprovalCallback] = None,
@@ -1308,6 +1418,7 @@ class SRNAgent:
         return orchestrator.run(
             history,
             extra_context=extra_context,
+            resume=resume,
             on_progress=on_progress,
             cancel_event=cancel_event,
             code_approval_callback=code_approval_callback,
