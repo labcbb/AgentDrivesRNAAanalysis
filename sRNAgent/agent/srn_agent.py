@@ -1447,10 +1447,18 @@ class SRNAgent:
         code_approval_callback: Optional[CodeApprovalCallback] = None,
         chat_id: str = "",
         resume: bool = False,
+        extra_context: str = "",
         _attach_elapsed: bool = True,
     ) -> str:
         started_at = time.time()
         messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        # 把会话级持久记忆（之前做过什么、产物在哪、用户决策）注入 system，
+        # 让普通对话模式（run_with_history）不再失忆 —— 之前只有 plan 模式有
+        if extra_context:
+            messages[0] = {
+                "role": "system",
+                "content": f"{self.system_prompt}\n\n## 之前的工作记忆\n{extra_context}",
+            }
 
         if resume and chat_id:
             checkpoint = self._load_run_checkpoint(chat_id)

@@ -42,7 +42,7 @@ from session_store import (  # noqa: E402
     session_artifacts,
     session_dir,
 )
-from session_memory import build_session_memory_context, record_stream_event  # noqa: E402
+from session_memory import append_work_log, build_session_memory_context, record_stream_event  # noqa: E402
 from session_errors import (
     clear_run_context,
     record_session_error,
@@ -753,6 +753,58 @@ def _normalize_approval_mode(body: Dict[str, Any]) -> str:
     return "manual"
 
 
+def _append_work_log_event(chat_id: str, event: Dict[str, Any], run_id: str) -> None:
+    """Append a meaningful subset of on_progress events to work_log.jsonl.
+
+    Heartbeat events (code_execution_progress) are skipped to avoid filling the
+    log; we only record run / step boundaries and tool completions so a
+    restarted agent can read the last 15 entries via build_session_memory_context
+    and pick up where the previous run left off.
+    """
+    if not chat_id:
+        return
+    etype = str(event.get("type") or "")
+    kind: Optional[str] = None
+    label = str(event.get("summary") or event.get("message") or "").strip()
+    paths: List[str] = []
+    note = ""
+
+    if etype == "run_start":
+        kind = "run_start"
+    elif etype == "plan_step_done":
+        kind = "step_done"
+        label = label or str(event.get("title") or "")
+    elif etype == "plan_step_failed":
+        kind = "step_failed"
+        note = str(event.get("result") or "")[:240]
+    elif etype == "tool_result" and event.get("name") == "execute_code":
+        kind = "tool_done"
+        note = str(event.get("content") or "")[:240]
+    elif etype == "done":
+        kind = "run_done"
+        label = str(event.get("text") or "")[:200]
+    elif etype in {"cancelled", "error", "agent_error"}:
+        kind = "error"
+        note = str(event.get("message") or "")[:240]
+    elif etype == "run_report_ready":
+        kind = "report_ready"
+        label = str(event.get("reportSummary") or label)
+
+    if kind is None:
+        return
+    try:
+        append_work_log(
+            chat_id,
+            kind=kind,
+            label=label,
+            paths=paths,
+            note=note,
+            run_id=run_id,
+        )
+    except Exception:
+        pass
+
+
 def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     messages: List[Dict[str, str]] = body.get("messages") or []
     if not messages:
@@ -829,6 +881,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                 persist_event["content"] = full
             record_stream_event_error(chat_id, persist_event)
             append_ledger_event(chat_id, event, run_id=run_id)
+            _append_work_log_event(chat_id, event, run_id)
         except Exception:
             pass
         _publish(event)
@@ -930,10 +983,13 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                     code_approval_callback=request_code_approval,
                 )
             else:
+                # 普通对话模式也注入会话级持久记忆（之前做过什么、产物在哪），
+                # 避免 run_with_history 路径"失忆"
                 text = agent.run_with_history(
                     messages,
                     chat_id=chat_id,
                     resume=resume,
+                    extra_context=build_session_memory_context(chat_id),
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                     code_approval_callback=request_code_approval,

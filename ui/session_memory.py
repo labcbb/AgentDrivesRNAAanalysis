@@ -13,9 +13,11 @@ from session_store import _read_json, _write_json, ensure_session_dir, sanitize_
 from work_space import get_work_space
 
 _MEMORY_FILE = "session_memory.json"
+_WORK_LOG_FILE = "work_log.jsonl"
 _LOCK = threading.RLock()
 _MAX_STEPS = 48
 _MAX_ARTIFACTS = 64
+_MAX_WORK_LOG_LINES = 200
 
 _ARTIFACT_RE = re.compile(
     r"(?:[\w./-]+/)?[\w.-]+\.(?:fastq(?:\.gz)?|fa(?:\.gz)?|gtf(?:\.gz)?|tsv|csv|bam|bai|dict)(?:\b|$)",
@@ -245,4 +247,107 @@ def build_session_memory_context(chat_id: str) -> str:
         lines.append("### 工作区关键文件")
         lines.append(manifest)
 
+    work_log_text = _format_work_log(read_work_log(chat_id, limit=15))
+    if work_log_text:
+        lines.append("")
+        lines.append("### 最近工作日志（重启服务后 agent 会从这里读）")
+        lines.append(work_log_text)
+
     return "\n".join(lines).strip()
+
+
+def _work_log_path(chat_id: str) -> Path:
+    chat_id = sanitize_chat_id(chat_id)
+    return ensure_session_dir(chat_id) / _WORK_LOG_FILE
+
+
+def append_work_log(
+    chat_id: str,
+    *,
+    kind: str,
+    label: str = "",
+    paths: Optional[List[str]] = None,
+    note: str = "",
+    run_id: str = "",
+) -> None:
+    """Append a structured event to the per-chat work log.
+
+    The log is JSONL (`{chat_id}/work_log.jsonl`) and is read back into the
+    agent's system prompt on the next run via ``build_session_memory_context``,
+    so after a service restart the next agent invocation can see exactly what
+    was done in previous runs and pick up without re-asking.
+    """
+    if not chat_id:
+        return
+    entry = {
+        "at": _utc_now(),
+        "kind": str(kind or "event"),
+        "label": str(label or "")[:240],
+        "paths": [str(p) for p in (paths or [])][:10],
+        "note": str(note or "")[:400],
+        "runId": str(run_id or ""),
+    }
+    path = _work_log_path(chat_id)
+    with _LOCK:
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            _trim_work_log(path)
+        except OSError:
+            pass
+
+
+def read_work_log(chat_id: str, *, limit: int = 20) -> List[Dict[str, Any]]:
+    if not chat_id:
+        return []
+    path = _work_log_path(chat_id)
+    if not path.exists():
+        return []
+    entries: List[Dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw in handle:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entries.append(json.loads(raw))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return []
+    return entries[-limit:]
+
+
+def _trim_work_log(path: Path) -> None:
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        if len(lines) <= _MAX_WORK_LOG_LINES:
+            return
+        kept = lines[-_MAX_WORK_LOG_LINES:]
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.writelines(kept)
+    except OSError:
+        pass
+
+
+def _format_work_log(entries: List[Dict[str, Any]]) -> str:
+    if not entries:
+        return ""
+    lines = []
+    for entry in entries:
+        ts = str(entry.get("at") or "")
+        kind = str(entry.get("kind") or "event")
+        label = str(entry.get("label") or "").strip()
+        paths = entry.get("paths") or []
+        if ts and len(ts) > 19:
+            ts = ts[:19]
+        bits = [f"- {ts} {kind}"]
+        if label:
+            bits.append(label)
+        line = " — ".join(bits)
+        if paths:
+            line += " | " + ", ".join(str(p) for p in paths[:3])
+        lines.append(line)
+    return "\n".join(lines)

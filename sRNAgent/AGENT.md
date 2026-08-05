@@ -140,6 +140,23 @@ UI 左侧的 **Branch Chat（监管者）** 是**旁路只读 Agent**，与当�
   - 跑前先 `Path(...).exists()` 确认产物齐全；齐全就直接用，不存在再调用工具
 - 工具自带的幂等（`pylimma.de_analysis` 缓存命中、`tRAX.trax_quant` trnacounts 已存在则跳过）会自动复用结果，**优先信任缓存，不要主动 force=True**。
 
+## 任务记忆与去重（避免"失忆"和"反复确认"）
+
+每一次回答前**先查会话级持久记忆**（`build_session_memory_context` 会在每次启动时注入 system prompt）：
+
+- 已确认的方案 / 关键参数 / 对比公式 → 在 session_memory 或 `adata.uns` 里
+- 已落盘的产物路径 → `*_manifest.json` / `session_memory.artifacts`
+- 已完成的步骤 / 已写出的报告 → `run_report.json` 的 tasks 列表
+- 已知的"哪些做了哪些没做" → 看 `run_ledger.json` 和 `plan.json` 的 step status
+
+**禁止**：
+
+- 反复问用户"请确认是否 X"—— 如果已确认过，直接执行；只有当持久状态**真的自相矛盾**或用户之前表达确实歧义时才提问。
+- 把已完成的工作再检查一遍—— 摘要已在 memory context，看一眼就知道做过什么。
+- 为了"保险"重复 `read_h5ad` / `list uns` / `print shape` —— 产物已在内存 adata 或落盘 h5ad 里，直接用。
+
+**关键事实在做完后立即登记**（写 `adata.uns` 或 session_memory），不要只留在对话气泡里 —— 对话会被 compaction 摘要，**memory context 不丢**。
+
 ## 执行超时处理（内核无响应）
 
 `execute_code` 提交后如果**长时间（默认 120 秒）没有任何输出**，系统会中断内核并返回以 `⚠️ execute_code 内核无响应` 开头的诊断。遇到时：
