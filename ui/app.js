@@ -110,7 +110,14 @@ function isLiveFollowing(chatId = activeChatId) {
 }
 
 function isActiveChatSending() {
-  return isChatStreaming(activeChatId) || isLiveFollowing(activeChatId);
+  return (
+    isChatStreaming(activeChatId)
+    || isLiveFollowing(activeChatId)
+    // 刷新页面后 chatStreams 已清空，但 agent 可能仍在后端运行
+    // （resumeBackgroundRunIfNeeded 已建后台监视）—— 仍视为"运行中"，
+    // 这样刷新后发消息会排队而不是启动新 run 取消旧 run
+    || backgroundWatches.has(activeChatId)
+  );
 }
 
 function getChatStream(chatId) {
