@@ -122,7 +122,12 @@ def _truncate_result(text: str, limit: int = 600) -> str:
 
 
 def _extract_analysis_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    text = "\n".join(str(item.get("content") or "") for item in messages if item.get("content"))
+    safe_messages = (item for item in messages if isinstance(item, dict))
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in safe_messages
+        if item.get("content")
+    )
     design_match = _ANALYSIS_DESIGN_RE.search(text)
     feasible_match = _ANALYSIS_PAIRED_FEASIBLE_RE.search(text)
     design = str(design_match.group(1) if design_match else "").strip().lower()
@@ -139,7 +144,12 @@ def _extract_analysis_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _extract_deliverables_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    text = "\n".join(str(item.get("content") or "") for item in messages if item.get("content"))
+    safe_messages = (item for item in messages if isinstance(item, dict))
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in safe_messages
+        if item.get("content")
+    )
     html_match = _HTML_REPORT_REQUESTED_RE.search(text)
     html_requested = str(html_match.group(1) if html_match else "").strip().lower() == "true"
     return {
@@ -148,7 +158,12 @@ def _extract_deliverables_policy(messages: List[Dict[str, Any]]) -> Dict[str, An
 
 
 def _extract_requirements_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
-    text = "\n".join(str(item.get("content") or "") for item in messages if item.get("content"))
+    safe_messages = (item for item in messages if isinstance(item, dict))
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in safe_messages
+        if item.get("content")
+    )
     flags: Dict[str, Any] = {"items": []}
     for key, value in _REQUIREMENTS_FLAG_RE.findall(text):
         flags[str(key).strip()] = str(value).strip().lower() == "true"
@@ -159,7 +174,12 @@ def _extract_requirements_policy(messages: List[Dict[str, Any]]) -> Dict[str, An
 
 
 def _extract_current_subtask(messages: List[Dict[str, Any]]) -> Dict[str, str]:
-    text = "\n".join(str(item.get("content") or "") for item in messages if item.get("content"))
+    safe_messages = (item for item in messages if isinstance(item, dict))
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in safe_messages
+        if item.get("content")
+    )
     title_matches = _CURRENT_STEP_TITLE_RE.findall(text)
     goal_matches = _CURRENT_STEP_GOAL_RE.findall(text)
     title = str(title_matches[-1] if title_matches else "").strip()

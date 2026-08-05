@@ -1078,11 +1078,13 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         except AgentCancelledError:
             on_progress({"type": "cancelled", "message": "已停止生成"})
         except Exception as exc:  # noqa: BLE001
+            import traceback as _tb
             record_session_error(
                 chat_id,
                 kind="agent_error",
                 summary="Agent 执行异常终止",
-                detail=str(exc),
+                # 包含完整 traceback，让 session_errors 能定位崩溃的具体行
+                detail=f"{exc}\n{_tb.format_exc()}",
                 run_id=run_id,
                 source="agent_worker",
             )
