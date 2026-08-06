@@ -937,13 +937,12 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             except Exception:
                 pass
         try:
-            publish_live_event(chat_id, payload)
+            payload = publish_live_event(chat_id, payload)
         except Exception:
             pass
         return payload
 
     def on_progress(event: Dict[str, Any]) -> None:
-        event_queue.put(event)
         try:
             update_run_context(chat_id, event)
             record_stream_event(chat_id, event)
@@ -958,7 +957,10 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             _append_work_log_event(chat_id, event, run_id)
         except Exception:
             pass
-        _publish(event)
+        # Queue the same sequenced payload sent to live followers. Without the
+        # sequence, a browser that reloads cannot resume the direct stream
+        # after the last event it has already rendered.
+        event_queue.put(_publish(event))
 
     def request_code_approval(request_id: str, code: str, description: str) -> bool:
         if approval_mode == "auto":
@@ -1126,13 +1128,15 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             cleanup_run(run_id)
 
     thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-
+    # Publish the sequence root before the worker can emit progress frames.
+    # This makes `_seq` monotonic in the direct stream as well as the replay
+    # stream, so a reconnect checkpoint cannot skip an earlier event.
     yield _publish({"type": "run_start", "runId": run_id, "chatId": chat_id, "approvalMode": approval_mode})
     try:
         update_run_context(chat_id, {"type": "run_start", "runId": run_id})
     except Exception:
         pass
+    thread.start()
 
     worker_finished = False
     drain_started_at: Optional[float] = None

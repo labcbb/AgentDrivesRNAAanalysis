@@ -1,48 +1,22 @@
 # sRNAgent Agent Guide
 
-## 核心规则：只维护一个 adata，全程留痕
+## 数据架构：单模态单 adata，多模态才用 MuData
 
-全流程只维护**一个 AnnData 对象**。所有 `sa.fastq.*`、`sa.alignment.*`、`sa.quant.*`、`sa.diff.*` 工具都操作并返回**同一个 adata**，每一步的产物与元数据都写回这个 adata（`obs` / `uns` / `X` / `var`），在 adata 中留下痕迹。
+不要把整个项目塞进一个 adata。每个 RNA 模态（miRNA / piRNA / tRNA / tRF）各自持独立的 AnnData；只有真正要做跨模态联合分析时，才升级到 MuData。
 
-**因此，检查分析过程 = 直接加载 adata 即可**：`adata.obs` 看样本级别结果，`adata.uns` 看步骤元数据与中间结果，`adata.X` 看表达矩阵。不需要去翻日志或重新推断中间文件，一切状态都在 adata 里。
+- **单模态（默认）**：全流程一个 adata 贯穿；工具按 obs / uns / X / var 留痕
+- **多模态**：每个模态一个独立 adata（各自走各自的 quant 流程），外层 MuData 聚合；工具默认对 `mod["<name>"]` 操作
+- 禁止把不同模态 counts 合并到同一个 adata.X、用 `var["rna_type"]` 隐式表达多模态、单模态硬上 MuData
+- 选型：只一种 RNA → AnnData；≥2 种且需联合分析 → 每种一个 adata + 外层 MuData
 
 ## MuData 兼容规则：外层容器可用，但执行内核仍是 srna AnnData
 
-当前 tool / skill 仍然围绕 **sRNA 模态的 AnnData** 设计；如果上层传入的是 `MuData`，默认一律取 `mdata.mod["srna"]` 作为执行对象，工具运行完成后再写回这个模态。
+tool / skill 围绕 sRNA 模态的 AnnData 设计；若上层传入 MuData，默认取 `mdata.mod["srna"]` 作为执行对象，运行完成后再写回这个模态。
 
-- 允许：`AnnData` 直接作为输入
-- 允许：`MuData` 作为外层容器输入，默认操作 `mod="srna"`
-- 暂不支持：同一个 tool / skill 在一次调用里跨多个模态联合执行
-- 若用户显式指定其他模态，可通过 `mod=...` 选择；未指定时默认 `srna`
-
-```python
-import anndata as ad
-import pandas as pd
-
-# 初始化一次
-adata = ad.AnnData(obs=pd.DataFrame(index=["S1", "S2"]))
-
-# 沿流程传递同一个 adata，不断扩展 obs/uns/X，每步都留痕
-adata = sa.fastq.fastq_dl(adata, ...)      # → obs["fastq_path"], uns["output_dir"]
-adata = sa.fastq.cutadapt(adata, ...)      # → obs["trimmed_path"]
-adata = sa.fastq.fastqc(adata, ...)        # → obs["fastqc_html"]
-adata = sa.alignment.bowtie(adata, ...)    # → obs["bam_path"], uns["genome_index"]
-adata = sa.quant.quantify_mirna(adata, ...) # → obs["collapsed_path"], adata.X
-
-# 检查分析过程：直接打印这个 adata 的所有痕迹
-print(adata.obs.columns)  # 每个样本经历了哪些步骤、产物路径在哪
-print(list(adata.uns.keys()))  # 每一步的参数、版本、中间结果
-```
-
-**禁止**：
-- ❌ 每个工具创建新的 AnnData 对象
-- ❌ 忘记接收返回值（工具是 in-place 修改，但必须用返回值覆盖）
-- ❌ 把步骤结果只写到日志/临时文件，而不写回 adata（不留痕）
-
-```python
-adata = sa.fastq.cutadapt(adata, ...)   # ✅ 必须接收返回值
-sa.fastq.cutadapt(adata, ...)           # ❌ 修改会丢失！
-```
+- 允许：`AnnData` 直接输入
+- 允许：`MuData` 作为外层容器，默认操作 `mod="srna"`
+- 暂不支持：单次调用跨多个 mod 联合执行
+- 显式指定其他 mod 可通过 `mod=...`，未指定则默认 `srna`
 
 ## 留痕规范：每步必须写回 adata
 

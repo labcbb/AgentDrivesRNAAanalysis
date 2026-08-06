@@ -229,6 +229,7 @@ const DEVICE_ID_KEY = "srnagent-device-id";
 const DEVICE_ACTIVE_KEY = "srnagent-device-active-chat";
 const AUTO_APPROVE_KEY = "srnagent-auto-approve-code";
 const APPROVAL_MODE_KEY = "srnagent-approval-mode";
+const LIVE_EVENT_CHECKPOINT_KEY_PREFIX = "srnagent-live-event-checkpoint:";
 const MAX_STORED_CHATS = 40;
 
 /** "server" = catalog + per-chat RW via serve.py; "local" = offline localStorage fallback */
@@ -248,6 +249,50 @@ let supervisorAbortController = null;
 let supervisorImeEnterStroke = false;
 /** "code" | "branch" — left panel beside the chat. */
 let leftPanelMode = "code";
+
+function getLiveEventCheckpoint(chatId) {
+  if (!chatId) return null;
+  try {
+    const raw = sessionStorage.getItem(`${LIVE_EVENT_CHECKPOINT_KEY_PREFIX}${chatId}`);
+    const value = raw ? JSON.parse(raw) : null;
+    const runId = String(value?.runId || "").trim();
+    const seq = Number(value?.seq);
+    return runId && Number.isFinite(seq) && seq > 0 ? { runId, seq } : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberLiveEventCheckpoint(chatId, runId, seq) {
+  const normalizedRunId = String(runId || "").trim();
+  const normalizedSeq = Number(seq);
+  if (!chatId || !normalizedRunId || !Number.isFinite(normalizedSeq) || normalizedSeq <= 0) return;
+  try {
+    const current = getLiveEventCheckpoint(chatId);
+    const nextSeq = current?.runId === normalizedRunId
+      ? Math.max(current.seq, normalizedSeq)
+      : normalizedSeq;
+    sessionStorage.setItem(
+      `${LIVE_EVENT_CHECKPOINT_KEY_PREFIX}${chatId}`,
+      JSON.stringify({ runId: normalizedRunId, seq: nextSeq }),
+    );
+  } catch {
+    // Session storage can be unavailable in private/restricted browser contexts.
+  }
+}
+
+function recordLiveEventCheckpoint(chatId, assistantEntry, event) {
+  if (!assistantEntry) return;
+  const seq = Number(event?._seq);
+  const runId = String(event?.runId || "").trim();
+  if (!runId || !Number.isFinite(seq) || seq <= 0) return;
+  if (assistantEntry.liveEventRunId !== runId) {
+    assistantEntry.liveEventRunId = runId;
+    assistantEntry.liveEventSeq = 0;
+  }
+  assistantEntry.liveEventSeq = Math.max(Number(assistantEntry.liveEventSeq) || 0, seq);
+  rememberLiveEventCheckpoint(chatId, runId, assistantEntry.liveEventSeq);
+}
 
 const categoryLabels = {
   normalization: "Normalization",
@@ -702,6 +747,8 @@ function normalizeMessage(item) {
     if (Number.isFinite(storedLiveEventSeq) && storedLiveEventSeq > 0) {
       message.liveEventSeq = storedLiveEventSeq;
     }
+    const storedLiveEventRunId = String(item?.liveEventRunId || "").trim();
+    if (storedLiveEventRunId) message.liveEventRunId = storedLiveEventRunId;
   }
   if (role === "assistant" && Array.isArray(item?.executionLog)) {
     message.executionLog = item.executionLog.map((entry) => ({
@@ -1441,6 +1488,13 @@ function applyLiveFollowEvent(chatId, event) {
   }
 
   const eventSeq = Number(event?._seq);
+  const eventRunId = String(event?.runId || "").trim();
+  // Sequence numbers restart for every Agent run. Do not apply a checkpoint
+  // from an older run to this run's replay buffer.
+  if (eventRunId && assistantEntry.liveEventRunId !== eventRunId) {
+    assistantEntry.liveEventRunId = eventRunId;
+    assistantEntry.liveEventSeq = 0;
+  }
   const seenSeq = Number(assistantEntry?.liveEventSeq || 0);
   if (Number.isFinite(eventSeq) && eventSeq > 0 && eventSeq <= seenSeq) {
     return;
@@ -1448,7 +1502,7 @@ function applyLiveFollowEvent(chatId, event) {
 
   const markLiveEventSeen = () => {
     if (!(Number.isFinite(eventSeq) && eventSeq > 0) || !assistantEntry) return;
-    assistantEntry.liveEventSeq = Math.max(Number(assistantEntry.liveEventSeq) || 0, eventSeq);
+    recordLiveEventCheckpoint(chatId, assistantEntry, event);
   };
 
   const isVisible = chatId === activeChatId;
@@ -1487,6 +1541,13 @@ function applyLiveFollowEvent(chatId, event) {
     }
   }
 
+  // A page reload reconnects through the replay endpoint. Persist the replay
+  // checkpoint even for status-only frames, otherwise every reload replays
+  // the same tool events and counts them as new Thinking rounds again.
+  if (Number.isFinite(eventSeq) && eventSeq > 0) {
+    persistChatMessages(chatId, messages);
+  }
+
   if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "stream_end") {
     const stream = chatStreams.get(chatId);
     if (stream?.isFollower) {
@@ -1510,12 +1571,25 @@ async function attachLiveEventStream(chatId, status = null) {
   if (!snap?.ok) return;
   if (!(snap.hasActiveRun || snap.kernelBusy || snap.liveAvailable)) return;
 
+  const chat = getChatRecord(chatId);
+  const latestAssistant = [...(chat?.messages || [])]
+    .reverse()
+    .find((item) => item?.role === "assistant");
+  const liveRunId = String(snap.runId || "").trim();
+  const persistedSeq =
+    latestAssistant?.liveEventRunId === liveRunId
+      ? Math.max(0, Number(latestAssistant.liveEventSeq) || 0)
+      : 0;
+  const localCheckpoint = getLiveEventCheckpoint(chatId);
+  const localSeq = localCheckpoint?.runId === liveRunId ? localCheckpoint.seq : 0;
+  const afterSeq = Math.max(persistedSeq, localSeq);
+
   const abortController = new AbortController();
   liveFollows.set(chatId, {
     abortController,
-    runId: String(snap.runId || ""),
+    runId: liveRunId,
     codeExecutionId: null,
-    lastSeq: 0,
+    lastSeq: afterSeq,
   });
 
   if (chatId === activeChatId) {
@@ -1534,7 +1608,7 @@ async function attachLiveEventStream(chatId, status = null) {
     try {
       await window.agentLiveEventStream({
         chatId,
-        afterSeq: 0,
+        afterSeq,
         signal: abortController.signal,
         onEvent: (event) => applyLiveFollowEvent(chatId, event),
       });
@@ -3854,6 +3928,10 @@ async function handleSend() {
       onEvent: (event) => {
         if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
         touchStreamActivity();
+        // Direct streams and reload-follow streams share the same server
+        // sequence. Keep a browser-local checkpoint immediately so a reload
+        // never replays already-rendered Thinking events as new rounds.
+        recordLiveEventCheckpoint(streamChatId, assistantEntry, event);
         const isVisible = streamChatId === activeChatId;
         if (event.type === "run_start") {
           if (isVisible) {

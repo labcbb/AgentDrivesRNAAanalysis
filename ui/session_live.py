@@ -136,17 +136,18 @@ def start_live_bus(chat_id: str, run_id: str) -> None:
         _BUSES[chat_id] = bus
 
 
-def publish_live_event(chat_id: str, event: Dict[str, Any]) -> None:
+def publish_live_event(chat_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
     chat_id = sanitize_chat_id(chat_id)
     if not chat_id or not event:
-        return
+        return dict(event or {})
     with _LOCK:
         bus = _BUSES.get(chat_id)
     if bus is None or bus.closed:
-        return
-    bus.publish(event)
-    if str(event.get("type") or "") in _TERMINAL_TYPES:
+        return dict(event)
+    payload = bus.publish(event)
+    if str(payload.get("type") or "") in _TERMINAL_TYPES:
         close_live_bus(chat_id, run_id=bus.run_id, final_event=None)
+    return payload
 
 
 def close_live_bus(
