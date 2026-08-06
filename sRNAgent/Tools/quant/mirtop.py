@@ -473,10 +473,20 @@ def mirtop_quant(
 
         def _monitor_progress() -> None:
             while not stop_progress.wait(15):
-                done = len(
-                    [p for p in out_dir.glob("*.gff") if p.name != "mirtop.gff"]
-                )
-                print(f"[mirtop] progress: {done}/{total}", flush=True)
+                written = {
+                    p.name
+                    for p in out_dir.glob("*.gff")
+                    if p.name != "mirtop.gff"
+                }
+                done = [
+                    sample
+                    for sample in sample_names
+                    if f"{Path(bam_paths[sample]).stem}.gff" in written
+                ]
+                print(f"[mirtop] progress: {len(done)}/{total}", flush=True)
+                remaining = [sample for sample in sample_names if sample not in done]
+                if remaining:
+                    print(f"inflight: {','.join(remaining)}", flush=True)
 
         monitor = threading.Thread(target=_monitor_progress, daemon=True)
         monitor.start()
