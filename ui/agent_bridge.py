@@ -555,15 +555,6 @@ def _trim_context_block(text: str, *, max_tokens: int) -> str:
     return truncate_text(value, max_chars).strip()
 
 
-def _latest_user_message(messages: List[Dict[str, str]]) -> str:
-    for item in reversed(messages or []):
-        if str(item.get("role") or "") == "user":
-            content = str(item.get("content") or "").strip()
-            if content:
-                return content
-    return ""
-
-
 def _build_run_context(chat_id: str, *, user_query: str = "") -> str:
     blocks: List[str] = []
     memory_context = build_session_memory_context(chat_id, user_query=user_query) if chat_id else ""
@@ -692,7 +683,7 @@ def agent_status() -> Dict[str, Any]:
 
 
 def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
-    messages: List[Dict[str, str]] = body.get("messages") or []
+    messages = _normalize_message_list(body.get("messages"))
     if not messages:
         return {"ok": False, "error": "messages 不能为空"}
 
@@ -785,16 +776,33 @@ _RESUME_KEYWORDS = (
 )
 
 
-def _latest_user_message(body: Dict[str, Any]) -> str:
-    """Return the most recent user message text from the request body."""
-    history = body.get("history") if isinstance(body.get("history"), list) else []
+def _normalize_message_list(messages):
+    if not isinstance(messages, list):
+        return []
+    out = []
+    for item in messages:
+        if isinstance(item, dict):
+            out.append({str(k): v for k, v in item.items() if isinstance(k, str)})
+    return out
+
+
+def _latest_user_message(source):
+    """Return the latest user message text from either a messages list or a body dict."""
+    history = []
+    if isinstance(source, list):
+        history = source
+    elif isinstance(source, dict):
+        history = source.get("history") if isinstance(source.get("history"), list) else []
     for item in reversed(history):
         if not isinstance(item, dict):
             continue
         if str(item.get("role") or "") == "user":
             return str(item.get("content") or "").strip()
-    # Fallback to a flat user query field.
-    return str(body.get("query") or "").strip()
+    if isinstance(source, dict):
+        return str(source.get("query") or "").strip()
+    return ""
+
+
 
 
 def _auto_detect_resume(body: Dict[str, Any], chat_id: str) -> bool:
@@ -868,7 +876,7 @@ def _append_work_log_event(chat_id: str, event: Dict[str, Any], run_id: str) -> 
 
 
 def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
-    messages: List[Dict[str, str]] = body.get("messages") or []
+    messages = _normalize_message_list(body.get("messages"))
     if not messages:
         yield {"type": "error", "message": "messages 不能为空"}
         return
