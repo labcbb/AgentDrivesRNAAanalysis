@@ -48,7 +48,7 @@ adata_iso = sa.quant.mirtop(
     gff="ref/hsa.gff3",
     hairpin="ref/hairpin_hsa.fa",
     species="hsa",
-    granularity="miRNA",   # variant | miRNA | hairpin
+    granularity="variant",   # 默认不聚合：每个 isomiR 一个特征（要成熟体汇总才用 "miRNA"）
     output_dir="mirtop_out",
 )
 
@@ -101,7 +101,7 @@ sa.quant.mirtop(
     output_dir="mirtop_out",
     bam_col="bam_path",
     species="hsa",         # --sps 物种三位代码
-    granularity="miRNA",   # variant | miRNA | hairpin
+    granularity="variant",   # 默认不聚合：每个 isomiR 一个特征（要成熟体汇总才用 "miRNA"）
     normalize=True,        # 写 layers["logcpm"]
     create_index=True,     # 缺 .bai 时自动建
     rna_type="isoMiR",

@@ -140,7 +140,8 @@ adata_iso = sa.quant.mirtop(
     gff="ref/hsa.gff3",            # 前体 GFF3（--gtf）
     hairpin="ref/hairpin_hsa.fa",  # hairpin 前体 FASTA（--hairpin）
     species="hsa",                 # 物种三位代码（--sps）
-    granularity="miRNA",           # variant | miRNA | hairpin
+    granularity="variant",         # 默认 variant：不聚合，每个 isomiR 一个特征
+                                   # 需要成熟体水平汇总时才显式传 "miRNA"
     output_dir="mirtop_out",
     normalize=True,                # 额外写 layers["logcpm"]
 )
@@ -170,7 +171,7 @@ adata_iso = sa.quant.mirtop(
     gff="ref/hsa.gff3",
     hairpin="ref/hairpin_hsa.fa",
     species="hsa",
-    granularity="variant",   # 想看每个 isomiR 变异时用 variant
+    granularity="variant",   # 默认值：不聚合，每个 isomiR 变异一行
     output_dir="mirtop_out",
 )
 ```
@@ -188,8 +189,8 @@ print(adata_iso.uns["mirtop_result"]["stats_log"])  # 各样本变异类型分�
 adata_iso.write("isomir_counts.h5ad")
 ```
 
-- `granularity="miRNA"`：`var_names` 是成熟体名（如 `hsa-let-7a-5p`），同一 miRNA 的变异求和。
-- `granularity="variant"`：`var_names` 是 isomiR UID（如 `hsa-let-7a-5p|0,0,0,0,0,0`），每个变异一行。
+- **默认 `granularity="variant"`（不聚合）**：`var_names` 是 isomiR UID（如 `hsa-let-7a-5p|0,0,0,0,0,0`），每个变异一行，保留完整变异信息。
+- **需要成熟体水平汇总时**才显式传 `granularity="miRNA"`：`var_names` 是成熟体名（如 `hsa-let-7a-5p`），同一 miRNA 的变异求和。
 - `adata.uns["mirtop_result"]["stats_log"]` 含 mirtop stats 的变异类型分布（iso_5p / iso_3p / iso_add3p / iso_snp …），用于判断测序质量与加尾修饰偏好。
 
 ## Troubleshooting

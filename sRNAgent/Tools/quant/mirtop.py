@@ -331,7 +331,7 @@ def _aggregate_by_granularity(
             '    hairpin="ref/hairpin_hsa.fa",\n'
             '    species="hsa",\n'
             '    output_dir="mirtop_out",\n'
-            '    granularity="miRNA",\n'
+            '    # 默认 granularity="variant"：每个 isomiR 一个特征，不聚合\n'
             ')'
         ),
     ],
@@ -355,7 +355,7 @@ def mirtop_quant(
     *,
     bam_col: str = "bam_path",
     species: str = "hsa",
-    granularity: str = "miRNA",
+    granularity: str = "variant",
     normalize: bool = True,
     create_index: bool = True,
     rna_type: str = "isoMiR",
@@ -398,9 +398,10 @@ def mirtop_quant(
         Three-letter miRBase species code (``"hsa"``, ``"mmu"``, ...).
         Passed to ``mirtop gff --sps``.
     granularity
-        Aggregation level for counts: ``"variant"`` (each isomiR UID),
-        ``"miRNA"`` (sum over variants sharing a mature miRNA name), or
-        ``"hairpin"``.
+        Aggregation level for counts. Default ``"variant"`` — **no
+        aggregation**: every isomiR UID is its own feature. ``"miRNA"``
+        sums over variants sharing a mature miRNA name; ``"hairpin"`` is
+        not implemented.
     normalize
         When True (default), store ``log2(CPM + 1)`` in
         ``adata.layers['logcpm']``.
