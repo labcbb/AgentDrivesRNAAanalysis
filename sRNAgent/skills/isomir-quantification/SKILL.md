@@ -190,7 +190,8 @@ adata_iso.write("isomir_counts.h5ad")
 ```
 
 - **默认 `granularity="variant"`（不聚合）**：`var_names` 是 isomiR UID（如 `hsa-let-7a-5p|0,0,0,0,0,0`），每个变异一行，保留完整变异信息。
-- **需要成熟体水平汇总时**才显式传 `granularity="miRNA"`：`var_names` 是成熟体名（如 `hsa-let-7a-5p`），同一 miRNA 的变异求和。
+- **`adata.var` 携带 isomiR 类型信息**（variant 粒度）：`variant_type`（如 `iso_5p` / `iso_3p` / `iso_add3p` / `iso_snp` 或组合）、`reads`（该 isomiR 总读数）、`iso_5p` / `iso_3p` / `iso_add3p` / `iso_snp`（各变异类型计数）、`mirna_id`（成熟体名）。
+- **需要成熟体水平汇总时**才显式传 `granularity="miRNA"`：`var_names` 是成熟体名（如 `hsa-let-7a-5p`），同一 miRNA 的变异求和；此时 `variant_type` 为空、`iso_*` 按成熟体求和。
 - `adata.uns["mirtop_result"]["stats_log"]` 含 mirtop stats 的变异类型分布（iso_5p / iso_3p / iso_add3p / iso_snp …），用于判断测序质量与加尾修饰偏好。
 
 ## Troubleshooting

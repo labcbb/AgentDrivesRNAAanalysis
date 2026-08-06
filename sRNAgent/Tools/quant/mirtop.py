@@ -226,6 +226,11 @@ def _parse_mirtop_counts(
     mirna_series
         ``miRNA`` column values indexed by UID, or None when absent
         (used for miRNA-level aggregation).
+    meta_df
+        Per-feature metadata (``Read``, ``miRNA``, ``Variant``,
+        ``iso_5p``, ``iso_3p``, ``iso_add3p``, ``iso_snp``) indexed by
+        UID, or None when absent. ``Variant`` holds the isomiR variant
+        type, e.g. ``iso_5p`` / ``iso_3p;iso_add3p``.
     """
     df = pd.read_csv(counts_path, sep="\t")
     id_col = next(
@@ -263,7 +268,13 @@ def _parse_mirtop_counts(
     mirna_series = df[mirna_col].copy() if mirna_col else None
     if mirna_series is not None:
         mirna_series.index = df[id_col].astype(str)
-    return sample_df, id_col, mirna_series
+
+    meta_cols = [col for col in _MIRTOP_META_COLS if col in df.columns]
+    meta_df: Optional[pd.DataFrame] = None
+    if meta_cols:
+        meta_df = df[meta_cols].copy()
+        meta_df.index = df[id_col].astype(str)
+    return sample_df, id_col, mirna_series, meta_df
 
 
 def _aggregate_by_granularity(
@@ -342,7 +353,10 @@ def _aggregate_by_granularity(
     ],
     produces={
         "obs": ["mirtop_gff", "mirtop_dir"],
-        "var": ["mirna_id", "rna_type", "variant_type"],
+        "var": [
+            "mirna_id", "rna_type", "variant_type", "reads",
+            "iso_5p", "iso_3p", "iso_add3p", "iso_snp",
+        ],
         "layers": ["counts", "logcpm"],
         "uns": ["mirtop_result"],
     },
@@ -425,6 +439,11 @@ def mirtop_quant(
         - ``adata.layers['logcpm']`` -- log2(CPM+1) (if ``normalize``)
         - ``adata.var['mirna_id']`` -- feature IDs
         - ``adata.var['rna_type']`` -- ``"isoMiR"``
+        - ``adata.var['variant_type']`` -- isomiR variant type per feature
+          (``iso_5p`` / ``iso_3p`` / ``iso_add3p`` / ``iso_snp`` or a
+          combination; empty at aggregated granularities)
+        - ``adata.var['reads']`` + ``iso_*`` columns -- per-feature total
+          reads and per-variant-type counts (variant granularity)
         - ``adata.uns['mirtop_result']`` -- output paths and stats log
     """
     if not isinstance(adata, AnnData):
@@ -538,7 +557,7 @@ def mirtop_quant(
 
     # Parse the combined counts TSV.
     counts_tsv = _resolve_counts_tsv(out_dir)
-    sample_df, id_col, mirna_series = _parse_mirtop_counts(counts_tsv, sample_names)
+    sample_df, id_col, mirna_series, meta_df = _parse_mirtop_counts(counts_tsv, sample_names)
 
     if sample_df.shape[0] == 0:
         print(
@@ -561,9 +580,39 @@ def mirtop_quant(
     aggregated = aggregated[sample_names]
     matrix = aggregated.T.to_numpy(dtype=np.float64)
 
+    # Build var. At variant granularity (default) each feature is an isomiR
+    # UID, so the per-feature metadata from the counts TSV (isomiR variant
+    # type, reads, per-type counts) is carried into adata.var.
     var = pd.DataFrame(index=aggregated.index)
-    var["mirna_id"] = [str(idx) for idx in aggregated.index]
-    var["variant_type"] = granularity
+    if granularity == "variant" and meta_df is not None:
+        meta = meta_df.reindex(aggregated.index)
+        if "miRNA" in meta.columns:
+            var["mirna_id"] = meta["miRNA"].astype(str)
+        else:
+            var["mirna_id"] = [str(idx) for idx in aggregated.index]
+        if "Variant" in meta.columns:
+            var["variant_type"] = meta["Variant"].astype(str)
+        if "Read" in meta.columns:
+            var["reads"] = pd.to_numeric(meta["Read"], errors="coerce").fillna(0)
+        for col in ("iso_5p", "iso_3p", "iso_add3p", "iso_snp"):
+            if col in meta.columns:
+                var[col] = pd.to_numeric(meta[col], errors="coerce").fillna(0)
+    else:
+        # miRNA/hairpin granularity: features are aggregated, so there is
+        # no single variant type per feature; per-type counts are summed.
+        var["mirna_id"] = [str(idx) for idx in aggregated.index]
+        var["variant_type"] = ""
+        if meta_df is not None and mirna_series is not None:
+            type_cols = [
+                col for col in ("iso_5p", "iso_3p", "iso_add3p", "iso_snp")
+                if col in meta_df.columns
+            ]
+            if type_cols:
+                summed = meta_df[type_cols].groupby(
+                    mirna_series.reindex(meta_df.index)
+                ).sum(numeric_only=True)
+                for col in type_cols:
+                    var[col] = summed[col].reindex(aggregated.index).fillna(0)
     var["id_column"] = id_col
 
     adata = adata[sample_names].copy()

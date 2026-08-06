@@ -145,9 +145,11 @@ mirtop stats -o mirtop_out/ mirtop_out/mirtop.gff               # → mirtop_sta
 ```python
 adata_iso.X / adata_iso.layers["counts"]   # counts 矩阵（samples × isomiRs）
 adata_iso.layers["logcpm"]                 # log2(CPM+1)（normalize=True）
-adata_iso.var["mirna_id"]                  # isomiR 特征 ID（UID 或 miRNA 名）
+adata_iso.var["mirna_id"]                  # 成熟体名（如 hsa-let-7a-5p）
+adata_iso.var["variant_type"]              # isomiR 变异类型：iso_5p / iso_3p / iso_add3p / iso_snp（或组合；miRNA 粒度为空）
+adata_iso.var["reads"]                     # 该 isomiR 总读数（variant 粒度）
+adata_iso.var["iso_5p"/"iso_3p"]           # 各变异类型计数（variant 粒度逐特征；miRNA 粒度按成熟体求和）
 adata_iso.var["rna_type"]                  # "isoMiR"
-adata_iso.var["variant_type"]              # granularity
 adata_iso.obs["mirtop_gff"]                # 每样本 GFF
 adata_iso.obs["mirtop_dir"]                # 输出目录
 adata_iso.uns["mirtop_result"]             # 输出路径 + stats_log（变异类型分布）
