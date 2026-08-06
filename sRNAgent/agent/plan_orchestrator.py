@@ -342,6 +342,13 @@ def _step_modality(step: Dict[str, Any]) -> str:
     return "general"
 
 
+def _step_identity(step: Dict[str, Any]) -> str:
+    """Stable matching key for re-plans; positional plan IDs are not stable."""
+    skill = str(step.get("skill") or "").strip().lower()
+    title = re.sub(r"\s+", " ", str(step.get("title") or step.get("goal") or "").strip().lower())
+    return "|".join((skill, _step_modality(step), title))
+
+
 def _requires_srna_and_fragmentomics(user_query: str, steps: List[Dict[str, Any]]) -> bool:
     step_text = "\n".join(
         " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
@@ -769,7 +776,7 @@ def _ensure_step(
     goal: str,
     skill: str,
 ) -> int:
-    if any(str(item.get("skill") or "").strip().lower() == skill.lower() for item in expanded):
+    if skill and any(str(item.get("skill") or "").strip().lower() == skill.lower() for item in expanded):
         return next_id
     expanded.append(_make_plan_step(
         step_id=str(next_id),
@@ -795,7 +802,12 @@ def _expand_plan_prerequisites(
     has_genome_index = _context_has_genome_index(extra_context)
     has_counts = _context_has_counts(extra_context)
     has_group_info = _context_has_group_info(extra_context)
-    has_planned_isomir_quantification = any(_is_quantification_step(step) for step in steps)
+    has_planned_isomir_quantification = any(
+        _is_quantification_step(step) and _step_modality(step) == "isomir"
+        for step in steps
+    )
+    has_fragment_count_validation = False
+    has_isomir_count_validation = False
 
     for step in steps:
         skill_slug = str(step.get("skill") or "").strip().lower()
@@ -899,7 +911,10 @@ def _expand_plan_prerequisites(
         elif skill_slug == "differential-analysis":
             modality = _step_modality(step)
             if modality == "fragmentomics":
-                if not has_counts:
+                if (
+                    not _context_has_counts_for_modality(extra_context, "fragmentomics")
+                    and not has_fragment_count_validation
+                ):
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
@@ -910,7 +925,7 @@ def _expand_plan_prerequisites(
                         ),
                         skill="",
                     )
-                    has_counts = True
+                    has_fragment_count_validation = True
                 if not has_group_info:
                     step_copy = _make_plan_step(
                         step_id=str(next_id),
@@ -933,6 +948,22 @@ def _expand_plan_prerequisites(
                 ))
                 next_id += 1
                 continue
+            if modality == "isomir":
+                if (
+                    not _context_has_counts_for_modality(extra_context, "isomir")
+                    and not has_isomir_count_validation
+                ):
+                    next_id = _ensure_step(
+                        expanded,
+                        next_id=next_id,
+                        title="核查 isomiR 定量矩阵",
+                        goal=(
+                            "读取独立 isomir AnnData，确认 mirtop 已写入 layers['counts'] / X，"
+                            "样本、isomiR 特征与分组可用于差异分析；不读取 srna AnnData 作为 isomiR counts。"
+                        ),
+                        skill="",
+                    )
+                    has_isomir_count_validation = True
             if not has_counts and not (modality == "isomir" and has_planned_isomir_quantification):
                 if not has_bam:
                     if not has_trimmed_fastq and has_raw_fastq:
@@ -1502,21 +1533,23 @@ class PlanOrchestrator:
             deliverables=deliverables,
         )
 
-        # Preserve done results from old plan when replanner omits them
-        old_by_id = {str(s.get("id")): s for s in (plan.get("steps") or [])}
+        # Prerequisite insertion and workflow ordering can change positional
+        # IDs.  Match logical steps by skill/modality/title so a completed
+        # result cannot be attached to a different re-planned step.
+        old_by_identity = {
+            _step_identity(step): step
+            for step in (plan.get("steps") or [])
+            if isinstance(step, dict)
+        }
+        raw_by_identity = {
+            _step_identity(step): step
+            for step in (raw.get("steps") or [])
+            if isinstance(step, dict)
+        }
         for step in new_steps:
-            old = old_by_id.get(str(step.get("id")))
-            replanner_status = str(
-                next(
-                    (
-                        item.get("status")
-                        for item in (raw.get("steps") or [])
-                        if isinstance(item, dict)
-                        and str(item.get("id") or "") == str(step.get("id"))
-                    ),
-                    "",
-                )
-            ).strip()
+            identity = _step_identity(step)
+            old = old_by_identity.get(identity)
+            replanner_status = str((raw_by_identity.get(identity) or {}).get("status") or "").strip()
             if replanner_status in {STEP_DONE, STEP_FAILED, STEP_SKIPPED, STEP_PENDING, STEP_RUNNING}:
                 step["status"] = replanner_status
             elif old and old.get("status") == STEP_DONE:
