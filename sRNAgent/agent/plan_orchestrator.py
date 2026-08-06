@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import re
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from .tools import list_available_skills, resolve_skill_query
@@ -28,6 +29,16 @@ _PIPELINE_KEYWORDS_RE = re.compile(
     re.I,
 )
 _ACTION_KEYWORDS_RE = re.compile(r"下载|比对|比对|定量|质控|运行|执行|处理|分析|align|download|quant|trim", re.I)
+_READ_ONLY_QUERY_RE = re.compile(
+    r"总结|汇总|查看|查询|读取|结果是什么|有没有跑过|是否完成|数目分布|数量分布|特征分布|"
+    r"summari[sz]e|inspect|review|distribution|how many|what were the results",
+    re.I,
+)
+_MUTATING_QUERY_RE = re.compile(
+    r"下载|重新|重跑|重算|运行|执行|生成|创建|处理|安装|比对|定量|质控|"
+    r"download|rerun|recompute|run|generate|create|align|quant|trim",
+    re.I,
+)
 _INTERNAL_REPORT_RE = re.compile(
     r"已向用户|已向用户发送|已向.*发送|等待.{0,8}下一步|等待用户|"
     r"已发送问候|已介绍|介绍.*功能.*等待|"
@@ -63,9 +74,12 @@ _PAIRED_INFEASIBLE_RE = re.compile(
     re.I,
 )
 _MIRNA_RE = re.compile(r"\bmirna\b|miRNA|mirdeep", re.I)
+_TRNA_RE = re.compile(r"\btrna\b|tRNA|tRF|tRAX", re.I)
+_ISOMIR_RE = re.compile(r"\biso[- ]?mir\b|isomiR|mirtop", re.I)
 _FRAGMENTOMICS_RE = re.compile(r"fragmentomics|fragomics|fragment-analysis|片段组学|FSD|FSC|RCD|EDM|BPM", re.I)
 _UNIFIED_RE = re.compile(r"统一做|统一跑|都跑|一起跑|两组学|两种组学|miRNA\s*\+\s*fragmentomics", re.I)
 _HTML_REPORT_RE = re.compile(r"html\s*报告|html report|report\.html|生成.*html|写.*html|报告", re.I)
+_DE_SUMMARY_RE = re.compile(r"汇总|summary|切片|输出.*结果|结果.*输出|top\s*(?:de|差异|feature)", re.I)
 _MUDATA_RE = re.compile(r"\bmudata\b|MuData|h5mu|放在\s*mudata|放到\s*mudata|返回\s*mudata", re.I)
 _WHOLE_GENOME_BAM_RE = re.compile(r"全基因组.*bam|whole[-\s]*genome\s+bam|genome[-\s]*aligned\s+bam", re.I)
 _REQUIREMENT_CUE_RE = re.compile(
@@ -81,6 +95,45 @@ def _extract_user_query(history: List[Dict[str, str]]) -> str:
             if content:
                 return content
     return ""
+
+
+def _format_recent_history(
+    history: Optional[List[Dict[str, Any]]],
+    *,
+    max_messages: int = 8,
+    max_chars: int = 6000,
+) -> str:
+    """Compact recent dialogue for planner/executor context.
+
+    The plan creator previously received only the latest user sentence and
+    session memory. That loses conversational references such as "在刚才
+    定量结果基础上继续" when the durable memory contains only file paths.
+    Keep a bounded transcript so the model can resolve those references.
+    """
+    if not history:
+        return ""
+    lines: List[str] = []
+    used = 0
+    for item in history[-max_messages:]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = re.sub(r"\s+", " ", str(item.get("content") or "")).strip()
+        if not content:
+            continue
+        if len(content) > 1100:
+            content = f"{content[:700]} … {content[-300:]}"
+        line = f"{role}: {content}"
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        if len(line) > remaining:
+            line = line[:remaining]
+        lines.append(line)
+        used += len(line) + 1
+    return "\n".join(lines)
 
 
 def _is_conversational_query(query: str) -> bool:
@@ -99,6 +152,14 @@ def _is_conversational_query(query: str) -> bool:
     if len(q) <= 48 and ("?" in q or "？" in q):
         return True
     return False
+
+
+def _is_read_only_query(query: str) -> bool:
+    """Return True for result lookups that must not create a pipeline plan."""
+    q = (query or "").strip()
+    if not q or _MUTATING_QUERY_RE.search(q):
+        return False
+    return bool(_READ_ONLY_QUERY_RE.search(q))
 
 
 def _looks_like_internal_report(text: str) -> bool:
@@ -220,6 +281,25 @@ def _context_has_counts(extra_context: str) -> bool:
     return bool(_COUNTS_RE.search(extra_context or ""))
 
 
+def _context_has_counts_for_modality(extra_context: str, modality: str) -> bool:
+    """Require count evidence for the same modality, not merely any AnnData."""
+    text = str(extra_context or "")
+    normalized = str(modality or "").strip().lower()
+    if normalized == "fragmentomics":
+        return bool(re.search(
+            r"(?:fragmentomics|fragomics).{0,240}(?:\.h5ad\b|raw counts|layers\[['\"]counts['\"]\]|counts? matrix|count_matrix)",
+            text,
+            re.I | re.S,
+        ))
+    if normalized == "isomir":
+        return bool(re.search(
+            r"(?:iso[- ]?mir|mirtop).{0,240}(?:\.h5ad\b|raw counts|layers\[['\"]counts['\"]\]|counts? matrix|count_matrix)",
+            text,
+            re.I | re.S,
+        ))
+    return _context_has_counts(text)
+
+
 def _context_has_logcpm(extra_context: str) -> bool:
     return bool(_LOGCPM_RE.search(extra_context or ""))
 
@@ -255,9 +335,75 @@ def _step_modality(step: Dict[str, Any]) -> str:
     )
     if _FRAGMENTOMICS_RE.search(text):
         return "fragmentomics"
-    if _MIRNA_RE.search(text):
-        return "miRNA"
+    if _ISOMIR_RE.search(text):
+        return "isomir"
+    if _MIRNA_RE.search(text) or _TRNA_RE.search(text):
+        return "srna"
     return "general"
+
+
+def _requires_srna_and_fragmentomics(user_query: str, steps: List[Dict[str, Any]]) -> bool:
+    step_text = "\n".join(
+        " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
+        for step in steps
+    )
+    combined = f"{user_query}\n{step_text}"
+    return bool(
+        (_MIRNA_RE.search(combined) or _TRNA_RE.search(combined))
+        and _FRAGMENTOMICS_RE.search(combined)
+    )
+
+
+def _apply_modality_boundaries(
+    goal: str,
+    steps: List[Dict[str, Any]],
+    *,
+    user_query: str,
+) -> tuple[str, List[Dict[str, Any]]]:
+    """Enforce the current one-AnnData-per-modality analysis boundary."""
+    normalized_goal = str(goal or user_query).strip()
+    has_srna_and_fragmentomics = _requires_srna_and_fragmentomics(user_query, steps)
+    if has_srna_and_fragmentomics:
+        normalized_goal = re.sub(
+            r"miRNA\s*[、,，和与+]+\s*tRNA\s*[、,，和与+]+\s*片段组学\s*(三类|三种|三模态|3 类|3 种|3 模态)",
+            "miRNA 与 tRNA（同属 srna）及片段组学两种模态",
+            normalized_goal,
+            flags=re.I,
+        )
+        normalized_goal = re.sub(r"三模态|3\s*模态", "两种模态", normalized_goal, flags=re.I)
+        normalized_goal = re.sub(
+            r"各自独立的?\s*AnnData",
+            "srna 与 fragmentomics 的独立 AnnData",
+            normalized_goal,
+            flags=re.I,
+        )
+        if "srna" not in normalized_goal.lower() or "两种模态" not in normalized_goal:
+            normalized_goal = (
+                f"{normalized_goal}（miRNA 与 tRNA 共用 srna AnnData；"
+                "片段组学使用独立 fragmentomics AnnData）"
+            )
+
+    normalized_goal = re.sub(r"\s*(?:→|->)?\s*MuData\b", "", normalized_goal, flags=re.I)
+    normalized_goal = re.sub(r"\s*(?:→|->)?\s*h5mu\b", "", normalized_goal, flags=re.I)
+
+    bounded: List[Dict[str, Any]] = []
+    for step in steps:
+        updated = dict(step)
+        modality = _step_modality(updated)
+        step_text = " ".join(str(updated.get(key) or "") for key in ("title", "goal", "skill"))
+        # The current workflow never creates a joint MuData container. A
+        # planner-generated packaging step is redundant and must not survive.
+        if _MUDATA_RE.search(step_text) and re.search(r"封装|打包|包装|联合|整合|h5mu", step_text, re.I):
+            continue
+        step_goal = str(updated.get("goal") or "").strip()
+        step_goal = re.sub(r"(?:MuData|h5mu)[^；;。]*", "独立 fragmentomics AnnData", step_goal, flags=re.I)
+        updated["goal"] = step_goal
+        if modality == "srna" and "srna AnnData" not in step_goal:
+            updated["goal"] = f"{step_goal}；miRNA 与 tRNA/tRF 结果共用 srna AnnData。".strip("；")
+        elif modality == "fragmentomics" and "fragmentomics AnnData" not in step_goal:
+            updated["goal"] = f"{step_goal}；结果写入独立 fragmentomics AnnData。".strip("；")
+        bounded.append(updated)
+    return normalized_goal, bounded
 
 
 def _replace_paired_with_unpaired(text: str) -> str:
@@ -321,7 +467,11 @@ def _resolve_analysis_policy(
     if _PAIRED_INFEASIBLE_RE.search(combined):
         paired_feasible = False
 
-    if explicit_paired and paired_feasible is False:
+    is_de_request = bool(_DE_STEP_RE.search(str(user_query or "")))
+    if not is_de_request:
+        design = ""
+        source = "not_applicable"
+    elif explicit_paired and paired_feasible is False:
         design = "needs_confirmation"
         source = "explicit_paired_but_infeasible"
     elif explicit_paired:
@@ -336,10 +486,10 @@ def _resolve_analysis_policy(
 
     modalities = _infer_modalities_from_steps(steps)
     if not modalities and _UNIFIED_RE.search(combined):
-        modalities = ["miRNA", "fragmentomics"]
+        modalities = ["srna", "fragmentomics"]
     elif not modalities:
-        if _MIRNA_RE.search(combined):
-            modalities.append("miRNA")
+        if _MIRNA_RE.search(combined) or _TRNA_RE.search(combined):
+            modalities.append("srna")
         if _FRAGMENTOMICS_RE.search(combined):
             modalities.append("fragmentomics")
 
@@ -425,10 +575,10 @@ def _resolve_deliverables_policy(
     extra_context: str,
     steps: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    combined = "\n".join(
-        part for part in (str(user_query or "").strip(), str(extra_context or "").strip()) if part
-    )
-    html_report_requested = bool(_HTML_REPORT_RE.search(combined))
+    # Workspace/session context may contain existing artifacts such as
+    # multiqc_report.html. Those are evidence of prior work, not a request to
+    # generate another report. Only the current user message can authorize it.
+    html_report_requested = bool(_HTML_REPORT_RE.search(str(user_query or "")))
     has_report_step = any(
         _HTML_REPORT_RE.search(
             " ".join(str(step.get(key) or "") for key in ("title", "goal", "result"))
@@ -441,13 +591,33 @@ def _resolve_deliverables_policy(
     }
 
 
+def _strip_unrequested_html_report(goal: str, *, requested: bool) -> str:
+    """Keep an old report request from leaking into a new task's plan title."""
+    text = str(goal or "").strip()
+    if requested or not text:
+        return text
+    text = re.sub(
+        r"(?:[，,、]\s*|\s+(?:and|with)\s+)?(?:并)?(?:生成|创建|输出|写出)?\s*(?:一个|一份|可交付的?)?\s*(?:HTML|html)\s*(?:报告|report)\b",
+        "",
+        text,
+        flags=re.I,
+    )
+    return re.sub(r"\s{2,}", " ", text).strip(" ，,、；;")
+
+
 def _apply_deliverables_policy(
     steps: List[Dict[str, Any]],
     *,
     deliverables: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
     if not bool(deliverables.get("html_report_requested")):
-        return steps
+        # Do not let the planner manufacture an unrequested HTML report step.
+        return [
+            step for step in steps
+            if not _HTML_REPORT_RE.search(
+                " ".join(str(step.get(key) or "") for key in ("title", "goal", "result"))
+            )
+        ]
     if bool(deliverables.get("has_report_step")):
         return steps
 
@@ -465,6 +635,49 @@ def _apply_deliverables_policy(
     appended.append(report_step)
     deliverables["has_report_step"] = True
     return appended
+
+
+def _is_quantification_step(step: Dict[str, Any]) -> bool:
+    skill = str(step.get("skill") or "").strip().lower()
+    text = " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
+    return skill in {"isomir-quantification", "fragment-analysis"} or bool(
+        _ISOMIR_RE.search(text) and re.search(r"定量|quant", text, re.I)
+    ) or bool(
+        _FRAGMENTOMICS_RE.search(text) and re.search(r"定量|quant|提取|extract", text, re.I)
+    )
+
+
+def _is_de_input_validation_step(step: Dict[str, Any]) -> bool:
+    text = " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
+    return bool(re.search(r"核查.*(?:定量矩阵|counts?|count_matrix)|确认.*(?:样本)?分组", text, re.I))
+
+
+def _order_de_workflow_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Enforce prerequisites -> quantification -> validation -> DE -> report."""
+    if not any(_is_de_step(step) for step in steps):
+        return steps
+
+    prerequisites: List[Dict[str, Any]] = []
+    quantification: List[Dict[str, Any]] = []
+    validation: List[Dict[str, Any]] = []
+    de_steps: List[Dict[str, Any]] = []
+    summaries: List[Dict[str, Any]] = []
+    reports: List[Dict[str, Any]] = []
+    for step in steps:
+        text = " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
+        if _is_de_step(step):
+            de_steps.append(step)
+        elif _is_quantification_step(step):
+            quantification.append(step)
+        elif _is_de_input_validation_step(step):
+            validation.append(step)
+        elif _HTML_REPORT_RE.search(text):
+            reports.append(step)
+        elif _DE_SUMMARY_RE.search(text):
+            summaries.append(step)
+        else:
+            prerequisites.append(step)
+    return [*prerequisites, *quantification, *validation, *de_steps, *summaries, *reports]
 
 
 def _normalise_requirement_text(text: str) -> str:
@@ -510,12 +723,17 @@ def _resolve_requirements_policy(
     items = _extract_requirement_items_from_user_query(user_query)
     seen = {item for item in items}
 
-    html_report_requested = bool((deliverables or {}).get("html_report_requested")) or bool(_HTML_REPORT_RE.search(combined))
-    mudata_required = bool(_MUDATA_RE.search(combined))
+    html_report_requested = bool((deliverables or {}).get("html_report_requested")) or bool(
+        _HTML_REPORT_RE.search(str(user_query or ""))
+    )
+    # Existing session notes may mention an old MuData plan. They are not a
+    # new user requirement, and the current workflow intentionally stays on
+    # independent AnnData objects.
+    mudata_required = bool(_MUDATA_RE.search(str(user_query or "")))
     whole_genome_bam_required = bool(_WHOLE_GENOME_BAM_RE.search(combined))
     default_unpaired = str((analysis or {}).get("design") or "").strip().lower() == "unpaired"
     if not default_unpaired and not bool(_PAIRED_RE.search(user_query or "")):
-        if _UNPAIRED_RE.search(combined) or _DE_STEP_RE.search(combined):
+        if _UNPAIRED_RE.search(str(user_query or "")) or _DE_STEP_RE.search(str(user_query or "")):
             default_unpaired = True
 
     derived_items = []
@@ -577,6 +795,7 @@ def _expand_plan_prerequisites(
     has_genome_index = _context_has_genome_index(extra_context)
     has_counts = _context_has_counts(extra_context)
     has_group_info = _context_has_group_info(extra_context)
+    has_planned_isomir_quantification = any(_is_quantification_step(step) for step in steps)
 
     for step in steps:
         skill_slug = str(step.get("skill") or "").strip().lower()
@@ -678,7 +897,43 @@ def _expand_plan_prerequisites(
                 next_id += 0
                 has_genome_fasta = True
         elif skill_slug == "differential-analysis":
-            if not has_counts:
+            modality = _step_modality(step)
+            if modality == "fragmentomics":
+                if not has_counts:
+                    next_id = _ensure_step(
+                        expanded,
+                        next_id=next_id,
+                        title="核查 fragmentomics 定量矩阵",
+                        goal=(
+                            "读取独立 fragmentomics AnnData，确认 layers['counts'] / X 为 raw counts、"
+                            "样本与 feature 对齐；不运行 small-RNA 定量，也不修改 srna AnnData。"
+                        ),
+                        skill="",
+                    )
+                    has_counts = True
+                if not has_group_info:
+                    step_copy = _make_plan_step(
+                        step_id=str(next_id),
+                        title="确认 fragmentomics 样本分组信息",
+                        goal="检查 fragmentomics_adata.obs 的 group/Condition/treatment 列，向用户确认后再运行差异分析。",
+                        skill="",
+                        auto_inserted=True,
+                    )
+                    expanded.append(step_copy)
+                    next_id += 1
+                    has_group_info = True
+                expanded.append(_make_plan_step(
+                    step_id=str(next_id),
+                    title=str(step.get("title") or "fragmentomics 差异分析（limma-voom）"),
+                    goal=str(step.get("goal") or "使用独立 fragmentomics AnnData 的 raw counts 运行 limma-voom 差异分析。"),
+                    skill=str(step.get("skill") or "differential-analysis"),
+                    status=str(step.get("status") or STEP_PENDING),
+                    result=str(step.get("result") or ""),
+                    auto_inserted=bool(step.get("autoInserted")),
+                ))
+                next_id += 1
+                continue
+            if not has_counts and not (modality == "isomir" and has_planned_isomir_quantification):
                 if not has_bam:
                     if not has_trimmed_fastq and has_raw_fastq:
                         next_id = _ensure_step(
@@ -744,6 +999,11 @@ def _expand_plan_prerequisites(
                     skill="fastq-qc",
                 )
                 has_trimmed_fastq = True
+        elif skill_slug == "isomir-quantification":
+            # mirtop creates the dedicated isomiR AnnData and its raw counts;
+            # a generic small-RNA feature-count step is neither required nor
+            # biologically equivalent for variant-level isomiR analysis.
+            has_counts = True
 
         if skill_slug not in {
             "alignment-srna",
@@ -752,6 +1012,7 @@ def _expand_plan_prerequisites(
             "fragment-analysis",
             "differential-analysis",
             "mirdeep2-mirna",
+            "isomir-quantification",
         }:
             expanded.append(_make_plan_step(
                 step_id=str(next_id),
@@ -821,7 +1082,14 @@ def _build_planner_system_prompt(skill_overview: str) -> str:
         "7. For differential analysis, default to unpaired unless the user explicitly asks for paired.\n"
         "8. If session context says paired is not feasible, do NOT plan paired DE steps.\n"
         "9. Do not keep paired and unpaired DE branches simultaneously unless the user explicitly asks to compare both.\n"
-        "10. If the user asks for an HTML report, keep an explicit final step that writes a real .html artifact.\n\n"
+        "10. If the user asks for an HTML report, keep an explicit final step that writes a real .html artifact.\n"
+        "11. miRNA and tRNA/tRF are one `srna` modality and must share one srna AnnData. "
+        "They are not two modalities. A request for miRNA + tRNA + fragmentomics therefore has exactly "
+        "two independent AnnData outputs: srna and fragmentomics. Do not propose MuData or joint analysis.\n"
+        "12. If the latest request refers to earlier work ('continue', 'on this basis', '刚才的结果'), "
+        "use the recent conversation and session context to identify completed prerequisites. "
+        "Plan only the new requested work; never recreate completed QC, alignment, or quantification steps "
+        "unless the relevant artifact is missing.\n\n"
         "## Registered skills\n"
         f"{skills_block}\n"
         f"{constitution_block}"
@@ -852,6 +1120,7 @@ def _build_executor_system_prompt(
     deliverables: Optional[Dict[str, Any]] = None,
     requirements: Optional[Dict[str, Any]] = None,
     skill_prompt: str = "",
+    conversation_context: str = "",
 ) -> str:
     skill_hint = ""
     if step.get("skill"):
@@ -906,6 +1175,14 @@ def _build_executor_system_prompt(
         requirements_block += (
             "Hard rule: do not ignore, overwrite, or silently drop these user requirements during replanning or execution.\n"
         )
+    conversation_block = ""
+    if conversation_context:
+        conversation_block = (
+            "\n## Recent conversation context\n"
+            "Use this context to resolve references to earlier completed work. "
+            "Do not repeat a completed operation unless the current request explicitly asks to rerun it.\n"
+            f"{conversation_context}\n"
+        )
     step_block = (
         f"\n## Current subtask ({step_index}/{step_total})\n"
         f"Title: {step.get('title') or 'Subtask'}\n"
@@ -919,7 +1196,7 @@ def _build_executor_system_prompt(
         "'Task completed', 'Step done').\n"
         "- The Jupyter kernel state (e.g. adata) persists across steps.\n"
     )
-    return f"{agent_system_prompt}\n{skill_block}{analysis_block}{deliverables_block}{requirements_block}{step_block}"
+    return f"{agent_system_prompt}\n{skill_block}{analysis_block}{deliverables_block}{requirements_block}{conversation_block}{step_block}"
 
 
 def _build_step_user_message(
@@ -1037,6 +1314,27 @@ class PlanOrchestrator:
             return None
         return self.agent._load_run_checkpoint(self.chat_id)
 
+    def _load_persisted_plan(self) -> Optional[Dict[str, Any]]:
+        """Return the UI's durable plan when a process crash lost its checkpoint."""
+        if not self.chat_id or self._load_plan is None:
+            return None
+        try:
+            plan = self._load_plan(self.chat_id)
+        except Exception:  # noqa: BLE001 - plan persistence must not block a run
+            return None
+        return plan if isinstance(plan, dict) and isinstance(plan.get("steps"), list) else None
+
+    @staticmethod
+    def _prepare_restored_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+        """Make an interrupted plan executable without changing its agreed scope."""
+        restored = deepcopy(plan)
+        for step in restored.get("steps") or []:
+            if isinstance(step, dict) and step.get("status") == STEP_RUNNING:
+                # No process is still executing after a resume request.  Treat
+                # its interrupted step as the next pending unit of work.
+                step["status"] = STEP_PENDING
+        return restored
+
     def _save_step_checkpoint(
         self,
         plan: Dict[str, Any],
@@ -1064,15 +1362,23 @@ class PlanOrchestrator:
         user_query: str,
         extra_context: str,
         *,
+        history: Optional[List[Dict[str, Any]]] = None,
         on_progress: Optional["ProgressCallback"] = None,
         cancel_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        recent_history = _format_recent_history(history)
+        conversation_block = (
+            f"\nRecent conversation (use to resolve references to earlier work):\n{recent_history}\n"
+            if recent_history
+            else ""
+        )
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": _build_planner_system_prompt(self.skill_overview)},
             {
                 "role": "user",
                 "content": (
                     f"User request:\n{user_query}\n\n"
+                    f"{conversation_block}"
                     f"Session context:\n{extra_context or '(none)'}"
                 ),
             },
@@ -1086,6 +1392,9 @@ class PlanOrchestrator:
         )
         raw = _parse_plan_json(str(completion.content or ""))
         steps = _normalize_steps(raw.get("steps"), goal=user_query)
+        plan_goal, steps = _apply_modality_boundaries(
+            str(raw.get("goal") or user_query), steps, user_query=user_query,
+        )
         steps = _expand_plan_prerequisites(
             steps,
             extra_context=extra_context,
@@ -1094,6 +1403,11 @@ class PlanOrchestrator:
         steps = _apply_analysis_policy(steps, analysis=analysis)
         deliverables = _resolve_deliverables_policy(user_query, extra_context, steps)
         steps = _apply_deliverables_policy(steps, deliverables=deliverables)
+        steps = _order_de_workflow_steps(steps)
+        plan_goal = _strip_unrequested_html_report(
+            plan_goal,
+            requested=bool(deliverables.get("html_report_requested")),
+        )
         analysis["modalities"] = _infer_modalities_from_steps(steps) or list(analysis.get("modalities") or [])
         requirements = _resolve_requirements_policy(
             user_query,
@@ -1102,7 +1416,7 @@ class PlanOrchestrator:
             deliverables=deliverables,
         )
         plan = {
-            "goal": str(raw.get("goal") or user_query).strip(),
+            "goal": plan_goal,
             "steps": steps,
             "analysis": analysis,
             "deliverables": deliverables,
@@ -1119,10 +1433,17 @@ class PlanOrchestrator:
         extra_context: str,
         failed_step: Optional[Dict[str, Any]] = None,
         failure_reason: str = "",
+        history: Optional[List[Dict[str, Any]]] = None,
         on_progress: Optional["ProgressCallback"] = None,
         cancel_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         current_plan_text = _format_plan_for_planner(plan)
+        recent_history = _format_recent_history(history)
+        conversation_block = (
+            f"\n\nRecent conversation:\n{recent_history}"
+            if recent_history
+            else ""
+        )
         failure_block = ""
         if failed_step:
             failure_block = (
@@ -1138,6 +1459,7 @@ class PlanOrchestrator:
                 "content": (
                     f"User request:\n{user_query}\n\n"
                     f"Session context:\n{extra_context or '(none)'}\n\n"
+                    f"{conversation_block}"
                     f"Current plan:\n{current_plan_text}"
                     f"{failure_block}\n\n"
                     "Revise the plan. Output full updated JSON."
@@ -1154,6 +1476,11 @@ class PlanOrchestrator:
         )
         raw = _parse_plan_json(str(completion.content or ""))
         new_steps = _normalize_steps(raw.get("steps"), goal=plan.get("goal") or user_query)
+        replanned_goal, new_steps = _apply_modality_boundaries(
+            str(raw.get("goal") or plan.get("goal") or user_query),
+            new_steps,
+            user_query=user_query,
+        )
         new_steps = _expand_plan_prerequisites(
             new_steps,
             extra_context=extra_context,
@@ -1162,6 +1489,11 @@ class PlanOrchestrator:
         new_steps = _apply_analysis_policy(new_steps, analysis=analysis)
         deliverables = _resolve_deliverables_policy(user_query, extra_context, new_steps)
         new_steps = _apply_deliverables_policy(new_steps, deliverables=deliverables)
+        new_steps = _order_de_workflow_steps(new_steps)
+        replanned_goal = _strip_unrequested_html_report(
+            replanned_goal,
+            requested=bool(deliverables.get("html_report_requested")),
+        )
         analysis["modalities"] = _infer_modalities_from_steps(new_steps) or list(analysis.get("modalities") or [])
         requirements = _resolve_requirements_policy(
             user_query,
@@ -1195,7 +1527,7 @@ class PlanOrchestrator:
                 step["result"] = old.get("result") or step.get("result") or ""
 
         revised = {
-            "goal": str(raw.get("goal") or plan.get("goal") or user_query).strip(),
+            "goal": replanned_goal,
             "steps": new_steps,
             "analysis": analysis,
             "deliverables": deliverables,
@@ -1253,6 +1585,21 @@ class PlanOrchestrator:
         code_approval_callback: Optional["CodeApprovalCallback"] = None,
     ) -> str:
         checkpoint_extra = {"plan": plan, "step_id": step.get("id")}
+
+        def scoped_progress(event: Dict[str, Any]) -> None:
+            """Keep LLM turn IDs unique across independently executed plan steps."""
+            if on_progress is None:
+                return
+            payload = dict(event or {})
+            payload.setdefault("planStepIndex", step_index)
+            try:
+                turn = int(payload.get("turn") or 0)
+            except (TypeError, ValueError):
+                turn = 0
+            if turn > 0:
+                payload["roundId"] = f"step-{step_index}:turn-{turn}"
+            on_progress(payload)
+
         bound_skill = None
         skill_prompt = ""
         if str(step.get("skill") or "").strip():
@@ -1265,7 +1612,7 @@ class PlanOrchestrator:
             if resume_messages:
                 result = self.agent._tool_loop(
                     resume_messages,
-                    on_progress=on_progress,
+                    on_progress=scoped_progress,
                     cancel_event=cancel_event,
                     code_approval_callback=code_approval_callback,
                     chat_id=self.chat_id,
@@ -1274,7 +1621,7 @@ class PlanOrchestrator:
             else:
                 result = self.agent.run_with_history(
                     history,
-                    on_progress=on_progress,
+                    on_progress=scoped_progress,
                     cancel_event=cancel_event,
                     code_approval_callback=code_approval_callback,
                     chat_id=self.chat_id,
@@ -1283,7 +1630,7 @@ class PlanOrchestrator:
             return self._ensure_user_facing_reply(
                 user_query,
                 result,
-                on_progress=on_progress,
+                on_progress=scoped_progress,
                 cancel_event=cancel_event,
             )
 
@@ -1297,6 +1644,7 @@ class PlanOrchestrator:
             deliverables=plan.get("deliverables") if isinstance(plan, dict) else None,
             requirements=plan.get("requirements") if isinstance(plan, dict) else None,
             skill_prompt=skill_prompt,
+            conversation_context=_format_recent_history(history),
         )
         if resume_messages:
             messages: List[Dict[str, Any]] = resume_messages
@@ -1311,7 +1659,7 @@ class PlanOrchestrator:
             user_query,
             self.agent._tool_loop(
                 messages,
-                on_progress=on_progress,
+                on_progress=scoped_progress,
                 cancel_event=cancel_event,
                 code_approval_callback=code_approval_callback,
                 chat_id=self.chat_id,
@@ -1366,6 +1714,30 @@ class PlanOrchestrator:
             self._emit(on_progress, "final", content=result)
             return result
 
+        # Result lookups should use the existing adata/manifest/output files
+        # directly. Planning them as a new pipeline causes prerequisite
+        # expansion (QC, reference preparation, reports) and makes a simple
+        # summary appear to restart the previous analysis.
+        if _is_read_only_query(user_query):
+            self._emit(on_progress, "status", message="正在读取已有结果…")
+            result = self.agent.run_with_history(
+                history,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                code_approval_callback=code_approval_callback,
+                chat_id=self.chat_id,
+                _attach_elapsed=False,
+                extra_context=extra_context,
+            )
+            result = self._ensure_user_facing_reply(
+                user_query,
+                result,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+            )
+            self._emit(on_progress, "final", content=result)
+            return result
+
         # Resume a checkpointed run that has no plan (single-step / non-plan mode):
         # continue the interrupted message loop directly.
         if (
@@ -1392,24 +1764,20 @@ class PlanOrchestrator:
             self._emit(on_progress, "final", content=result)
             return result
 
-        # Resume with a persisted plan: reuse it instead of planning from scratch.
-        if resume and checkpoint and checkpoint.get("plan"):
-            plan = checkpoint["plan"]
-            if isinstance(plan, dict):
-                resumed_steps = list(plan.get("steps") or [])
-                analysis = _resolve_analysis_policy(user_query, extra_context, resumed_steps)
-                plan["steps"] = _apply_analysis_policy(resumed_steps, analysis=analysis)
-                deliverables = _resolve_deliverables_policy(user_query, extra_context, plan.get("steps") or [])
-                plan["steps"] = _apply_deliverables_policy(plan.get("steps") or [], deliverables=deliverables)
-                analysis["modalities"] = _infer_modalities_from_steps(plan.get("steps") or []) or list(analysis.get("modalities") or [])
-                plan["analysis"] = analysis
-                plan["deliverables"] = deliverables
-                plan["requirements"] = _resolve_requirements_policy(
-                    user_query,
-                    extra_context,
-                    analysis=analysis,
-                    deliverables=deliverables,
-                )
+        # Resume with the checkpointed plan whenever possible.  A SIGSEGV can
+        # kill the process between writing plan.json and its checkpoint; in
+        # that case plan.json is still the authoritative record of the user's
+        # unfinished request.  Do not reapply policies based on a bare
+        # "continue": doing so can remove an earlier explicit HTML report
+        # requirement and overwrite the plan with a new, unrelated one.
+        restored_plan = None
+        if resume and checkpoint and isinstance(checkpoint.get("plan"), dict):
+            restored_plan = checkpoint["plan"]
+        elif resume:
+            restored_plan = self._load_persisted_plan()
+
+        if restored_plan is not None:
+            plan = self._prepare_restored_plan(restored_plan)
             self._emit(
                 on_progress,
                 "plan_restored",
@@ -1421,6 +1789,7 @@ class PlanOrchestrator:
             plan = self._create_plan(
                 user_query,
                 extra_context,
+                history=history,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
             )
@@ -1513,6 +1882,7 @@ class PlanOrchestrator:
                     extra_context=extra_context,
                     failed_step=pending,
                     failure_reason=result,
+                    history=history,
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                 )
@@ -1548,6 +1918,11 @@ class PlanOrchestrator:
             on_progress=on_progress,
             cancel_event=cancel_event,
         )
+        # A completed plan is durable history, not resumable execution state.
+        # Keep its result in session memory / run ledger, but remove the
+        # checkpoint so a later "继续" request is interpreted as a new
+        # follow-up instead of replaying the finished plan.
+        self.agent._clear_run_checkpoint(self.chat_id)
         self._emit(on_progress, "plan_complete", plan=plan, message=summary)
         self._emit(on_progress, "final", content=summary)
         return summary

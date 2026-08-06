@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
 import sys
@@ -603,6 +604,9 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    # Native extensions can terminate the interpreter without a Python
+    # traceback. Keep all thread stacks in stderr/captured service logs.
+    faulthandler.enable(all_threads=True)
     parser = argparse.ArgumentParser(description="sRNAgent UI server")
     parser.add_argument("--host", type=str, default=HOST,
                         help="Bind address (default: 0.0.0.0). Use 127.0.0.1 for localhost only")

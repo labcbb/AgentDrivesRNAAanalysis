@@ -45,7 +45,7 @@ result = sa.fragment.fragomics(adata, output_dir="fragmentomics_out", jobs=8)
 # - BAM aligned against transcriptome / miRNA / piRNA / local reference databases
 ```
 
-## Inspect returned object type
+## Use the independent fragmentomics result
 
 ```python
 result = sa.fragment.fragomics(
@@ -53,21 +53,8 @@ result = sa.fragment.fragomics(
     genome_fasta="ref/GRCh38.primary_assembly.genome.fa",
 )
 
-type(result)
-```
-
-- If `adata` already had sRNA expression, `result` should be handled as `MuData`
-- Otherwise, `result` is `AnnData`
-
-## Access fragmentomics modality from MuData
-
-```python
-mdata = sa.fragment.fragomics(
-    adata,
-    genome_fasta="ref/GRCh38.primary_assembly.genome.fa",
-)
-
-frag = mdata.mod["fragmentomics"]
+# Compatibility extraction only; do not perform cross-modal analysis.
+frag = result.mod["fragmentomics"] if hasattr(result, "mod") else result
 frag.layers["counts"]
 frag.layers["CPM"]
 frag.var[["type", "feature"]].head()
@@ -100,10 +87,8 @@ bpm = frag[:, frag.var["type"].isin(["BPM_START", "BPM_END"])]
 ## Save outputs
 
 ```python
-if hasattr(result, "mod"):
-    result.write("srna_fragmentomics.h5mu")
-else:
-    result.write("fragmentomics_only.h5ad")
+frag = result.mod["fragmentomics"] if hasattr(result, "mod") else result
+frag.write("fragmentomics.h5ad")
 ```
 
 ## Safe handling rule
@@ -112,11 +97,10 @@ else:
 # always capture the return value:
 result = sa.fragment.fragomics(...)
 
-# do not assume it is always AnnData
+# Extract the fragmentomics result and keep it as a separate AnnData.
 if hasattr(result, "mod"):
     frag = result.mod["fragmentomics"]
-    result.write("srna_fragmentomics.h5mu")
 else:
     frag = result
-    result.write("fragmentomics_only.h5ad")
+frag.write("fragmentomics.h5ad")
 ```

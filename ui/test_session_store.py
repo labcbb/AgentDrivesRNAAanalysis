@@ -10,11 +10,65 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from session_memory import append_work_log, build_session_memory_context, load_session_memory, record_stream_event, remember_user_query  # noqa: E402
 from session_plan import save_plan  # noqa: E402
-from session_store import ensure_session_dir, is_orphan_session, save_chat_record  # noqa: E402
+from session_store import ensure_session_dir, is_orphan_session, load_chat_record, save_chat_record  # noqa: E402
 from work_space import configure_work_space  # noqa: E402
 
 
 CHAT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+
+
+def test_chat_persistence_canonicalizes_replayed_thinking_steps():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        repeated = {
+            "kind": "tool",
+            "title": "execute_code — 检查输入",
+            "body": "",
+        }
+        plan_old = {"kind": "plan", "title": "计划 (0/2)", "body": "○ A\n○ B"}
+        plan_new = {"kind": "plan", "title": "计划 (1/2)", "body": "✓ A\n▶ B"}
+        saved = save_chat_record(
+            CHAT_ID,
+            {
+                "messages": [{
+                    "role": "assistant",
+                    "thinkingSteps": [repeated, repeated, plan_old, plan_new, repeated],
+                    "thinkingRoundCount": 999,
+                }],
+            },
+        )
+        steps = saved["messages"][0]["thinkingSteps"]
+        assert len(steps) == 2
+        assert saved["messages"][0]["thinkingRoundCount"] == 1
+        assert all(step.get("id") for step in steps)
+        loaded = load_chat_record(CHAT_ID)
+        assert len(loaded["messages"][0]["thinkingSteps"]) == 2
+
+
+def test_chat_persistence_counts_legacy_tool_decisions_after_reload():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        run_id = "run-123"
+        call_one = "call_111"
+        call_two = "call_222"
+        saved = save_chat_record(
+            CHAT_ID,
+            {
+                "messages": [{
+                    "role": "assistant",
+                    "thinkingSteps": [
+                        {"kind": "tool", "id": f"execution:{run_id}:{call_one}:tool", "turn": 1},
+                        {"kind": "result", "id": f"execution:{run_id}:{call_one}:result", "turn": 1},
+                        {"kind": "tool", "id": f"execution:{run_id}:{call_two}:tool", "turn": 1},
+                        {"kind": "plan", "id": "current-plan"},
+                    ],
+                }],
+            },
+        )
+        message = saved["messages"][0]
+        assert message["thinkingRoundCount"] == 2
+        assert all("roundId" in step for step in message["thinkingSteps"])
+        assert message["thinkingSteps"][0]["roundId"] == message["thinkingSteps"][1]["roundId"]
 
 
 def test_session_memory_extracts_facts_and_artifacts():
@@ -63,6 +117,28 @@ def test_execute_code_memory_detail_is_compacted():
         assert "random verbose line" not in str(step.get("detail") or "")
         assert "jobs=8" in str(step.get("detail") or "")
         assert "fragmentomics_raw.tsv" in str(step.get("detail") or "")
+
+
+def test_execute_code_memory_keeps_fragmentomics_feature_distribution():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        record_stream_event(
+            CHAT_ID,
+            {
+                "type": "tool_result",
+                "name": "execute_code",
+                "summary": "片段组学特征统计完成",
+                "content": "FSD 10\nFSC 4\nRCD 8\n",
+                "fullContent": (
+                    "feature_type,count\n"
+                    "FSD,10\nFSC,4\nRCD,8\nEDM_5P,12\nBPM_START,6\n"
+                ),
+            },
+        )
+        step = (load_session_memory(CHAT_ID).get("steps") or [])[-1]
+        detail = str(step.get("detail") or "")
+        assert "FSD,10" in detail
+        assert "BPM_START,6" in detail
 
 
 def test_is_orphan_session_keeps_memory_and_work_log():
@@ -137,7 +213,7 @@ def test_session_memory_records_structured_analysis_from_plan_event():
                         "design": "unpaired",
                         "source": "explicit_unpaired",
                         "paired_feasible": False,
-                        "modalities": ["miRNA", "fragmentomics"],
+                        "modalities": ["srna", "fragmentomics"],
                         "reason": "用户已明确要求非配对，且当前 paired 不可行。",
                     },
                     "steps": [],
@@ -148,12 +224,12 @@ def test_session_memory_records_structured_analysis_from_plan_event():
         analysis = memory.get("analysis") or {}
         assert analysis.get("design") == "unpaired"
         assert analysis.get("paired_feasible") is False
-        assert analysis.get("modalities") == ["miRNA", "fragmentomics"]
+        assert analysis.get("modalities") == ["srna", "fragmentomics"]
 
         context = build_session_memory_context(CHAT_ID)
         assert "### 高优先级分析设计" in context
         assert "analysis.design = unpaired" in context
-        assert "analysis.modalities = [miRNA, fragmentomics]" in context
+        assert "analysis.modalities = [srna, fragmentomics]" in context
         assert "analysis.paired_feasible = false" in context
 
 
@@ -292,6 +368,22 @@ def test_remember_user_query_persists_high_priority_requirements_before_plan():
         assert any("MuData" in item or "mudata" in item.lower() for item in (requirements.get("items") or []))
 
 
+def test_new_request_clears_previous_report_requirement():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        remember_user_query(CHAT_ID, "对 fragmentomics 做差异分析并生成 HTML 报告")
+        remember_user_query(
+            CHAT_ID,
+            "完成 isomiR 的定量和差异分析",
+            reset_request_scope=True,
+        )
+
+        memory = load_session_memory(CHAT_ID)
+        assert memory.get("deliverables") == {}
+        assert memory.get("requirements", {}).get("html_report_requested") is not True
+        assert memory.get("requirements", {}).get("default_unpaired") is True
+
+
 def test_cross_session_handoff_prefers_more_relevant_previous_session():
     chat_a = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
     chat_b = "ffffffff-ffff-4fff-8fff-ffffffffffff"
@@ -345,6 +437,20 @@ def test_cross_session_handoff_prefers_more_relevant_previous_session():
         assert "完成片段组学并写出 h5mu" in context
         assert "片段组学结果必须放在 MuData 下" in context
         assert "完成 miRNA 差异分析" not in context
+
+
+def test_completed_plan_is_not_presented_as_unfinished_context():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        save_plan(
+            CHAT_ID,
+            {
+                "goal": "完成片段组学定量",
+                "steps": [{"id": "1", "title": "运行 fragmentomics", "status": "done"}],
+            },
+        )
+        context = build_session_memory_context(CHAT_ID, user_query="继续在刚才的片段组学结果上做总结")
+        assert "当前未完成计划" not in context
 
 
 if __name__ == "__main__":

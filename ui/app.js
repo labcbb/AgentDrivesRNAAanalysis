@@ -731,16 +731,23 @@ function normalizeMessage(item) {
       title: String(step?.title || ""),
       body: step?.body ? String(step.body) : "",
       data: step?.data && typeof step.data === "object" ? step.data : null,
+      roundId: String(step?.roundId || ""),
     }));
-    const lastPlanStep = normalizedSteps.filter((step) => step.kind === "plan").at(-1) || null;
-    message.thinkingSteps = normalizedSteps.filter((step) => {
-      if (step.kind !== "plan") return true;
-      return step === lastPlanStep;
+    const seenStepKeys = new Set();
+    const uniqueNonPlanSteps = normalizedSteps.filter((step) => {
+      if (step.kind === "plan") return false;
+      const key = thinkingStepFingerprint(step);
+      if (seenStepKeys.has(key)) return false;
+      seenStepKeys.add(key);
+      return true;
     });
-    const storedRoundCount = Number(item?.thinkingRoundCount);
-    message.thinkingRoundCount = Number.isFinite(storedRoundCount) && storedRoundCount > 0
-      ? storedRoundCount
-      : normalizedSteps.length;
+    const lastPlanStep = normalizedSteps.filter((step) => step.kind === "plan").at(-1) || null;
+    message.thinkingSteps = lastPlanStep
+      ? [lastPlanStep, ...uniqueNonPlanSteps]
+      : uniqueNonPlanSteps;
+    // Recompute instead of trusting the persisted counter. Older sessions
+    // could contain replayed id-less steps whose counter grew on every reload.
+    message.thinkingRoundCount = countUniqueThinkingSteps(message.thinkingSteps);
   }
   if (role === "assistant") {
     const storedLiveEventSeq = Number(item?.liveEventSeq);
@@ -903,7 +910,59 @@ function ensureActiveChatRecord() {
   return chat;
 }
 
-function recordThinkingStep(step, options = {}) {
+function thinkingStepFingerprint(step) {
+  if (String(step?.kind || "").trim() === "plan") return "kind:plan";
+  const id = String(step?.id || "").trim();
+  if (id) return `id:${id}`;
+  let data = "";
+  try {
+    data = step?.data && typeof step.data === "object" ? JSON.stringify(step.data) : "";
+  } catch {
+    data = "";
+  }
+  return [step?.kind || "tool", step?.title || "", step?.body || "", data].join("|");
+}
+
+function thinkingRoundId(step) {
+  const explicit = String(step?.roundId || "").trim();
+  if (explicit) return explicit;
+  const turn = Number(step?.turn);
+  return Number.isFinite(turn) && turn > 0 ? `turn:${turn}` : "";
+}
+
+function legacyThinkingRoundId(step) {
+  if (String(step?.kind || "") !== "tool" && String(step?.kind || "") !== "result") return "";
+  const id = String(step?.id || "");
+  const execution = id.match(/^execution:([^:]+):(call_[^:]+):/);
+  if (execution) return `legacy:${execution[1]}:${execution[2]}`;
+  const tool = id.match(/^stream:([^:]+):tool:(\d+)$/);
+  return tool ? `legacy:${tool[1]}:tool:${tool[2]}` : "";
+}
+
+function stableThinkingRoundId(step) {
+  const recorded = thinkingRoundId(step);
+  // Old clients stored a per-plan `turn` value, which restarts at one and is
+  // therefore not a durable count. Prefer the tool-call identity whenever it
+  // is available so live rendering and a later reload use the same value.
+  if (recorded && !recorded.startsWith("turn:")) return recorded;
+  return legacyThinkingRoundId(step) || recorded;
+}
+
+function thinkingRoundStats(steps) {
+  if (!Array.isArray(steps)) return { count: 0, exact: false };
+  const recorded = steps.map(thinkingRoundId).filter(Boolean);
+  const trusted = recorded.filter((id) => !id.startsWith("legacy:") && !id.startsWith("turn:"));
+  if (trusted.length) return { count: new Set(trusted).size, exact: true };
+  const legacy = steps.map(legacyThinkingRoundId).filter(Boolean);
+  if (legacy.length) return { count: new Set(legacy).size, exact: false };
+  return { count: new Set(recorded).size, exact: false };
+}
+
+function countUniqueThinkingSteps(steps) {
+  return thinkingRoundStats(steps).count;
+}
+
+function recordThinkingStep(step) {
   const chat = ensureActiveChatRecord();
   const entry = chatHistory[chatHistory.length - 1];
   if (!entry || entry.role !== "assistant") return;
@@ -914,25 +973,31 @@ function recordThinkingStep(step, options = {}) {
     title: step.title || "",
     body: step.body || "",
     data: step.data && typeof step.data === "object" ? step.data : null,
+    roundId: stableThinkingRoundId(step),
   };
-  let existed = false;
-  if (nextStep.id) {
-    const index = entry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id);
-    if (index >= 0) {
-      existed = true;
-      entry.thinkingSteps[index] = nextStep;
-    } else {
-      entry.thinkingSteps.push(nextStep);
-    }
+  const nextFingerprint = thinkingStepFingerprint(nextStep);
+  let index = nextStep.id
+    ? entry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id)
+    : -1;
+  if (index < 0 && nextStep.kind === "plan") {
+    index = entry.thinkingSteps.findIndex((item) => String(item?.kind || "") === "plan");
+  }
+  // Older persisted events did not have stream IDs. Match their content once
+  // so a replay upgrades the existing step instead of appending another one.
+  if (index < 0) {
+    index = entry.thinkingSteps.findIndex((item) => (
+      !String(item?.id || "").trim()
+      && thinkingStepFingerprint(item) === nextFingerprint
+    ));
+  }
+  if (index >= 0) {
+    entry.thinkingSteps[index] = nextStep;
   } else {
     entry.thinkingSteps.push(nextStep);
   }
-  const defaultRoundIncrement = existed ? 0 : 1;
-  const roundIncrement = Number(options.roundIncrement ?? defaultRoundIncrement);
-  if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
-    const current = Number(entry.thinkingRoundCount) || 0;
-    entry.thinkingRoundCount = Math.max(0, current + roundIncrement);
-  }
+  // The counter is derived from the deduplicated step list, so replay order
+  // cannot mutate it.
+  entry.thinkingRoundCount = countUniqueThinkingSteps(entry.thinkingSteps);
   persistActiveChat();
 }
 
@@ -990,6 +1055,7 @@ function isPlaceholderAssistantContent(content) {
     || text.includes("可继续对话")
     || text.includes("内核仍在执行")
     || text.includes("请稍候")
+    || /^步骤\s*\d+\/\d+\s*[：:]/.test(text)
     || /^步骤\s*\d+\/\d+\s*完成/.test(text)
     || /^全部\s*\d+\s*个步骤已完成/.test(text)
     || text === "任务运行中…"
@@ -1098,6 +1164,62 @@ function buildInterruptedStatusMessage(status) {
   return parts.join(" · ");
 }
 
+function interruptedPlanSnapshot(plan) {
+  if (!plan || !Array.isArray(plan.steps)) return null;
+  return {
+    ...plan,
+    steps: plan.steps.map((step) => (
+      String(step?.status || "") === "running"
+        ? { ...step, status: "interrupted" }
+        : step
+    )),
+  };
+}
+
+function planSnapshotFromThinking(assistantEntry) {
+  const planStep = (assistantEntry?.thinkingSteps || []).find(
+    (step) => String(step?.kind || "") === "plan" && Array.isArray(step?.data?.steps),
+  );
+  if (!planStep) return null;
+  return {
+    goal: String(planStep.title || "").replace(/（已(?:更新|完成)）$/, ""),
+    steps: planStep.data.steps,
+  };
+}
+
+function renderInterruptedPlan(target, assistantEntry, plan) {
+  const interrupted = interruptedPlanSnapshot(plan);
+  if (!interrupted?.steps?.length) return;
+  const step = {
+    id: "current-plan",
+    kind: "plan",
+    title: resolvePlanSnapshotTitle(interrupted.goal, "plan_interrupted"),
+    data: buildThinkingPlanData(interrupted, "plan_interrupted"),
+    body: interrupted.steps.map((item) => {
+      const mark = item.status === "done" ? "✓" : item.status === "interrupted" ? "!" : item.status === "failed" ? "✗" : "○";
+      return `${mark} ${item.title || item.goal || item.id}`;
+    }).join("\n"),
+  };
+  if (assistantEntry) appendThinkingStepToEntry(assistantEntry, step);
+  if (target) appendThinkingStep(target, step, { persist: false });
+}
+
+function renderPlanSnapshot(target, assistantEntry, plan) {
+  if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) return;
+  const step = {
+    id: "current-plan",
+    kind: "plan",
+    title: resolvePlanSnapshotTitle(plan.goal, "plan_complete"),
+    data: buildThinkingPlanData(plan, "plan_complete"),
+    body: plan.steps.map((item) => {
+      const mark = item.status === "done" ? "✓" : item.status === "running" ? "▶" : item.status === "failed" ? "✗" : "○";
+      return `${mark} ${item.title || item.goal || item.id}`;
+    }).join("\n"),
+  };
+  if (assistantEntry) appendThinkingStepToEntry(assistantEntry, step);
+  if (target) appendThinkingStep(target, step, { persist: false });
+}
+
 /** Clear stuck CODE/plan UI without rewriting a good assistant reply. */
 function cleanupDanglingTaskUi(chatId) {
   markRunningExecutionsStopped();
@@ -1131,6 +1253,18 @@ function reconcileStaleTaskUi(chatId, status, options = {}) {
   // Soft cleanup path: plan already settled or caller only wants to clear CODE flags.
   if (!isStaleTaskState(status)) {
     if (isPlanSettled(status) || status?.staleCodePanel || status?.codePanelRunning) {
+      const planResult = isPlanSettled(status) ? extractPlanFinalResult(status) : "";
+      if (planResult && assistantEntry && canOverwriteAssistantContent(assistantEntry, planResult)) {
+        freezeAssistantFinalText(assistantEntry, planResult);
+        if (chatId === activeChatId) {
+          const target = resolvePendingGroup(pending) || getLastAssistantGroup();
+          updateMessageGroup(target, planResult);
+        }
+      }
+      if (chatId === activeChatId && status?.plan?.steps?.length) {
+        const target = resolvePendingGroup(pending) || getLastAssistantGroup();
+        renderPlanSnapshot(target, assistantEntry, status.plan);
+      }
       cleanupDanglingTaskUi(chatId);
       if (persist && chatId) persistChatMessages(chatId, chatHistory);
       return false;
@@ -1158,6 +1292,7 @@ function reconcileStaleTaskUi(chatId, status, options = {}) {
   }
   if (chatId === activeChatId) {
     const target = resolvePendingGroup(pending) || getLastAssistantGroup();
+    renderInterruptedPlan(target, assistantEntry, status?.plan);
     if (target) {
       const textEl = target.querySelector(".chat-text");
       if (textEl) {
@@ -1191,10 +1326,11 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
     codeInner.appendChild(card);
   }
 
-  const stage = status?.planSummary
+  const stage = status?.codeStage
+    || status?.planSummary
     || (status?.runningStepTitle ? `执行：${status.runningStepTitle}` : "")
     || (status?.kernelBusy ? "内核执行中" : "等待中");
-  const title = status?.hasActiveRun ? "Agent 运行中" : "后台代码运行中";
+  const title = status?.codeActive ? "代码运行中" : (status?.hasActiveRun ? "Agent 运行中" : "后台代码运行中");
   const hint = status?.backgroundActive
     ? "流式连接已断开，正在轮询后端状态。请勿重复发送消息以免打断任务。"
     : "长任务执行中，界面将自动刷新进度。";
@@ -1202,10 +1338,19 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
     (item) => item.type === "execution" && item.id === BACKGROUND_EXECUTION_ID,
   );
   const watch = backgroundWatches.get(status?.chatId || activeChatId);
-  const startedAt = Number(existing?.startedAt)
+  const serverStartedAt = Number(status?.codeStartedAt);
+  const serverElapsedSec = Number(status?.codeElapsedSec);
+  const startedAt = (Number.isFinite(serverStartedAt) && serverStartedAt > 0 ? serverStartedAt * 1000 : 0)
+    || (Number.isFinite(serverElapsedSec) && serverElapsedSec >= 0 ? Date.now() - serverElapsedSec * 1000 : 0)
+    || Number(existing?.startedAt)
     || Number(watch?.startedAt)
     || Date.now();
-  const elapsedSec = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const elapsedSec = Number.isFinite(serverElapsedSec) && serverElapsedSec >= 0
+    ? serverElapsedSec
+    : Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const elapsedLabel = status?.codeElapsedLabel || formatElapsedLabel(elapsedSec);
+  const description = status?.codeDescription || status?.codeSummary || status?.plan?.goal || "";
+  const highlights = Array.isArray(status?.codeHighlights) ? status.codeHighlights : [];
 
   applyExecutionCardState(
     card,
@@ -1213,11 +1358,12 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
       type: "execution",
       id: BACKGROUND_EXECUTION_ID,
       title,
-      description: status?.plan?.goal || "",
+      description,
       stage,
+      highlights,
       startedAt,
       elapsedSec,
-      elapsedLabel: formatElapsedLabel(elapsedSec),
+      elapsedLabel,
       done: false,
       stopped: false,
       hint,
@@ -1228,11 +1374,12 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
     type: "execution",
     id: BACKGROUND_EXECUTION_ID,
     title,
-    description: status?.plan?.goal || "",
+    description,
     stage,
+    highlights,
     startedAt,
     elapsedSec,
-    elapsedLabel: formatElapsedLabel(elapsedSec),
+    elapsedLabel,
     done: false,
     stopped: false,
     hint,
@@ -1308,6 +1455,9 @@ function syncRunStatusToUI(chatId, status, options = {}) {
           id: "current-plan",
           kind: "plan",
           title: planTitle,
+          // Status polling replaces the existing plan card after a reload.
+          // Keep the structured snapshot so its counters match the step list.
+          data: buildThinkingPlanData(status.plan),
           body: status.plan.steps
             .map((s) => {
               const mark =
@@ -1342,6 +1492,21 @@ async function pollBackgroundRunStatus(chatId) {
   if (!watch) return;
 
   const status = await fetchRunStatus(chatId);
+  if (!status) {
+    const offlinePlan = planSnapshotFromThinking(watch.assistantEntry);
+    const offlineStatus = {
+      ok: true,
+      plan: offlinePlan,
+      planSummary: "服务连接已断开，运行状态无法确认",
+      stalePlanStep: Boolean(offlinePlan?.steps?.some((step) => step?.status === "running")),
+    };
+    reconcileStaleTaskUi(chatId, offlineStatus, {
+      pending: watch.pending,
+      assistantEntry: watch.assistantEntry,
+      forceMessage: true,
+    });
+    return;
+  }
   if (isStaleTaskState(status)) {
     reconcileStaleTaskUi(chatId, status, {
       pending: watch.pending,
@@ -1393,12 +1558,31 @@ function startBackgroundRunWatch(chatId, { pending = null, assistantEntry = null
 async function resumeBackgroundRunIfNeeded(chatId) {
   if (!chatId || isChatStreaming(chatId)) return;
   const status = await fetchRunStatus(chatId);
+  if (!status) {
+    const lastAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant");
+    const offlinePlan = planSnapshotFromThinking(lastAssistant);
+    if (offlinePlan?.steps?.some((step) => step?.status === "running")) {
+      reconcileStaleTaskUi(chatId, {
+        ok: true,
+        plan: offlinePlan,
+        planSummary: "服务连接已断开，运行状态无法确认",
+        stalePlanStep: true,
+      }, { assistantEntry: lastAssistant || null, forceMessage: true });
+    }
+    return;
+  }
   if (isStaleTaskState(status)) {
     const lastAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant");
     reconcileStaleTaskUi(chatId, status, { assistantEntry: lastAssistant || null });
     return;
   }
-  if (!isTaskLikelyActive(status, chatId)) return;
+  if (!isTaskLikelyActive(status, chatId)) {
+    // A finished plan may still have a persisted running CODE card. Reuse the
+    // soft cleanup path so a page reload cannot resurrect that stale card.
+    const lastAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant");
+    reconcileStaleTaskUi(chatId, status, { assistantEntry: lastAssistant || null });
+    return;
+  }
 
   const lastAssistant = (chatId === activeChatId
     ? [...chatHistory]
@@ -1833,7 +2017,8 @@ function renderChatThread() {
     const group = appendMessage(item.role, item.role === "assistant" ? assistantContentForDisplay(item) || fallback : (item.content || fallback));
     if (item.role === "assistant" && Array.isArray(item.thinkingSteps) && item.thinkingSteps.length) {
       item.thinkingSteps.forEach((step) => appendThinkingStep(group, step, { persist: false }));
-      setThinkingRoundCount(group, item.thinkingRoundCount || item.thinkingSteps.length);
+      const roundStats = thinkingRoundStats(item.thinkingSteps);
+      setThinkingRoundCount(group, roundStats.count, { exact: roundStats.exact });
       updateThinkingSummaryCount(getThinkingStepsEl(group));
       const thinkingEl = group.querySelector(".chat-thinking");
       if (thinkingEl) thinkingEl.open = false;
@@ -2178,6 +2363,7 @@ function resolvePlanSnapshotTitle(goal, eventType = "") {
 function summarizePlanStepStatus(status) {
   if (status === "done") return { mark: "✓", label: "已完成" };
   if (status === "running") return { mark: "▶", label: "进行中" };
+  if (status === "interrupted") return { mark: "!", label: "已中断" };
   if (status === "failed") return { mark: "✗", label: "失败" };
   return { mark: "○", label: "待执行" };
 }
@@ -2186,8 +2372,9 @@ function buildThinkingPlanData(plan, eventType = "", message = "") {
   const steps = Array.isArray(plan?.steps) ? plan.steps : [];
   const done = steps.filter((step) => step?.status === "done").length;
   const running = steps.filter((step) => step?.status === "running").length;
+  const interrupted = steps.filter((step) => step?.status === "interrupted").length;
   const failed = steps.filter((step) => step?.status === "failed").length;
-  const pending = Math.max(0, steps.length - done - running - failed);
+  const pending = Math.max(0, steps.length - done - running - interrupted - failed);
   const autoInserted = steps.filter((step) => step?.autoInserted);
   return {
     eventType: String(eventType || ""),
@@ -2195,6 +2382,7 @@ function buildThinkingPlanData(plan, eventType = "", message = "") {
     total: steps.length,
     done,
     running,
+    interrupted,
     failed,
     pending,
     autoInsertedCount: autoInserted.length,
@@ -2208,11 +2396,27 @@ function buildThinkingPlanData(plan, eventType = "", message = "") {
   };
 }
 
-function setThinkingRoundCount(group, roundCount) {
+function setThinkingRoundCount(group, roundCount, { exact = true } = {}) {
   const panel = group?.querySelector(".chat-thinking");
   if (!panel) return;
   const value = Number(roundCount);
   panel.dataset.roundCount = Number.isFinite(value) && value > 0 ? String(value) : "0";
+  panel.dataset.roundExact = exact ? "true" : "false";
+}
+
+function thinkingDomRoundStats(stepsEl) {
+  if (!stepsEl) return { count: 0, exact: false };
+  const roundIds = [];
+  stepsEl.querySelectorAll(".chat-thinking__step").forEach((item) => {
+    if (item.dataset.roundId) roundIds.push(item.dataset.roundId);
+  });
+  const trusted = roundIds.filter((id) => !id.startsWith("legacy:") && !id.startsWith("turn:"));
+  if (trusted.length) return { count: new Set(trusted).size, exact: true };
+  return { count: new Set(roundIds).size, exact: false };
+}
+
+function countUniqueThinkingDomSteps(stepsEl) {
+  return thinkingDomRoundStats(stepsEl).count;
 }
 
 function updateThinkingSummaryCount(stepsEl) {
@@ -2220,9 +2424,12 @@ function updateThinkingSummaryCount(stepsEl) {
   const panel = stepsEl.closest(".chat-thinking");
   const summaryEl = panel?.querySelector(".chat-thinking__summary");
   if (summaryEl) {
-    const roundCount = Number(panel?.dataset.roundCount || 0);
-    const suffix = roundCount > 0 ? `，累计 ${roundCount} 轮` : "";
-    summaryEl.textContent = `Thinking (${stepsEl.children.length}${suffix})`;
+    const live = thinkingDomRoundStats(stepsEl);
+    const roundCount = live.count || Number(panel?.dataset.roundCount || 0);
+    const exact = live.count > 0 ? live.exact : panel?.dataset.roundExact === "true";
+    summaryEl.textContent = roundCount > 0
+      ? (exact ? `Thinking (${roundCount} 轮)` : `Thinking (${roundCount} 次工具决策)`)
+      : "Thinking";
   }
 }
 
@@ -2240,6 +2447,7 @@ function renderPlanThinkingStep(item, step) {
     ["待执行", Number(data.pending) || 0],
   ];
   if ((Number(data.failed) || 0) > 0) statItems.push(["失败", Number(data.failed) || 0]);
+  if ((Number(data.interrupted) || 0) > 0) statItems.push(["中断", Number(data.interrupted) || 0]);
   if (autoInsertedCount > 0) statItems.push(["自动补全", autoInsertedCount]);
 
   statItems.forEach(([label, value]) => {
@@ -2306,23 +2514,71 @@ function renderPlanThinkingStep(item, step) {
   }
 }
 
+function streamThinkingStepId(event, kind) {
+  const runId = String(event?.runId || "").trim();
+  const seq = Number(event?._seq);
+  if (!runId || !Number.isFinite(seq) || seq <= 0) return "";
+  return `stream:${runId}:${kind}:${seq}`;
+}
+
+function eventThinkingRoundId(event) {
+  const scoped = String(event?.roundId || "").trim();
+  if (scoped) return scoped;
+  // Servers released before roundId support reset `turn` at every plan step,
+  // so it cannot be used as a stable persisted count. Use the durable tool
+  // call identity instead and label it as a tool-decision count in the UI.
+  const runId = String(event?.runId || "").trim();
+  const toolCallId = String(event?.toolCallId || "").trim();
+  if (runId && /^call_/.test(toolCallId)) return `legacy:${runId}:${toolCallId}`;
+  if (runId && event?.type === "tool_call" && Number.isFinite(Number(event?._seq))) {
+    return `legacy:${runId}:tool:${Number(event._seq)}`;
+  }
+  return "";
+}
+
+function executionThinkingStepId(event, kind) {
+  const runId = String(event?.runId || "").trim();
+  const toolCallId = String(event?.toolCallId || "").trim();
+  if (runId && toolCallId) return `execution:${runId}:${toolCallId}:${kind}`;
+  // Servers started before toolCallId support can still update progress using
+  // the code description rather than creating a Thinking step per event.
+  const label = String(event?.summary || event?.description || "").trim();
+  if (runId && label) return `execution:${runId}:${kind}:${label}`;
+  return streamThinkingStepId(event, kind);
+}
+
 function appendThinkingStep(group, step, options = {}) {
   ensureThinkingPanel(group);
   const stepsEl = getThinkingStepsEl(group);
   if (!stepsEl) return;
 
+  step = { ...step, roundId: stableThinkingRoundId(step) };
   const stepId = String(step?.id || "").trim();
-  let item = stepId ? stepsEl.querySelector(`.chat-thinking__step[data-step-id="${CSS.escape(stepId)}"]`) : null;
-  const existed = Boolean(item);
+  const stepKey = thinkingStepFingerprint(step);
+  let item = stepId
+    ? stepsEl.querySelector(`.chat-thinking__step[data-step-id="${CSS.escape(stepId)}"]`)
+    : null;
+  if (!item && step.kind === "plan") {
+    item = stepsEl.querySelector(".chat-thinking__step--plan");
+  }
+  if (!item) {
+    item = [...stepsEl.querySelectorAll(".chat-thinking__step")].find((candidate) => (
+      !candidate.dataset.stepId && candidate.dataset.stepKey === stepKey
+    )) || null;
+  }
   if (!item) {
     item = document.createElement("div");
     item.className = `chat-thinking__step chat-thinking__step--${step.kind}`;
-    if (stepId) item.dataset.stepId = stepId;
     stepsEl.appendChild(item);
   } else {
     item.className = `chat-thinking__step chat-thinking__step--${step.kind}`;
     item.innerHTML = "";
   }
+  if (stepId) item.dataset.stepId = stepId;
+  item.dataset.stepKey = stepKey;
+  const roundId = step.roundId;
+  if (roundId) item.dataset.roundId = roundId;
+  else delete item.dataset.roundId;
 
   const title = document.createElement("div");
   title.className = "chat-thinking__step-title";
@@ -2338,18 +2594,22 @@ function appendThinkingStep(group, step, options = {}) {
     item.appendChild(body);
   }
 
-  const defaultRoundIncrement = options.persist !== false ? (existed ? 0 : 1) : 0;
-  const roundIncrement = Number(options.roundIncrement ?? defaultRoundIncrement);
-  if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
-    const panel = stepsEl.closest(".chat-thinking");
-    const currentRounds = Number(panel?.dataset.roundCount || 0) || 0;
-    if (panel) panel.dataset.roundCount = String(Math.max(0, currentRounds + roundIncrement));
+  const panel = stepsEl.closest(".chat-thinking");
+  if (panel) {
+    const live = thinkingDomRoundStats(stepsEl);
+    if (live.count > 0) {
+      panel.dataset.roundCount = String(live.count);
+      panel.dataset.roundExact = live.exact ? "true" : "false";
+    } else if (!panel.dataset.roundCount) {
+      panel.dataset.roundCount = "0";
+      panel.dataset.roundExact = "false";
+    }
   }
   updateThinkingSummaryCount(stepsEl);
   scrollThreadToBottom();
 
   if (options.persist !== false) {
-    recordThinkingStep(step, { roundIncrement });
+    recordThinkingStep(step);
   }
 }
 
@@ -2466,7 +2726,15 @@ function markRunningExecutionsStopped() {
 
 function getExecutionCard(executionId) {
   if (!executionId) return null;
-  return getCodePanelInner()?.querySelector(`[data-execution-id="${executionId}"]`) || null;
+  return getCodePanelInner()?.querySelector(
+    `[data-execution-id="${CSS.escape(String(executionId))}"]`,
+  ) || null;
+}
+
+function executionIdForEvent(event) {
+  const runId = String(event?.runId || "").trim();
+  const toolCallId = String(event?.toolCallId || "").trim();
+  return runId && toolCallId ? `execution:${runId}:${toolCallId}` : "";
 }
 
 function findRunningExecutionArtifact(chat = getActiveChatRecord()) {
@@ -2558,40 +2826,14 @@ function compactCodePanelForRender(codePanel) {
   });
 }
 
-async function fetchReplayChunks(chatId) {
-  if (!chatId || !window.llmIsLocalServer?.()) return [];
-  try {
-    const base = window.llmProxyBase || "";
-    const response = await fetch(`${base}/api/sessions/replay?chatId=${encodeURIComponent(chatId)}`);
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || !data.ok) return [];
-    return Array.isArray(data.chunks) ? data.chunks.filter(Boolean) : [];
-  } catch {
-    return [];
-  }
-}
-
 async function hydrateExecutionCodes() {
   const chat = getActiveChatRecord();
   if (!chat?.codePanel || !activeChatId) return;
 
-  const executions = chat.codePanel.filter((item) => item.type === "execution");
-  const missing = executions.filter((item) => !item.code);
-  if (!missing.length) return;
-
-  const chunks = await fetchReplayChunks(activeChatId);
-  if (!chunks.length) return;
-
-  let changed = false;
-  executions.forEach((item, index) => {
-    if (!item.code && chunks[index]) {
-      item.code = chunks[index];
-      changed = true;
-      const card = getExecutionCard(item.id);
-      if (card) applyExecutionCardState(card, item);
-    }
-  });
-  if (changed) persistActiveChat();
+  // replay.py stores only an ordered list of code cells. Older execution cards
+  // have no tool-call ID, so assigning chunks by array index can display a
+  // different cell than the thinking entry. New cards persist their code from
+  // the correlated code_execution_started event; leave legacy blanks blank.
 }
 
 function createExecutionCardElement(executionId, { showStop = false } = {}) {
@@ -2663,7 +2905,7 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
     : [
       artifact.elapsedLabel ? `已运行 ${artifact.elapsedLabel}` : "",
       runningCount != null ? `并行任务 ${runningCount}` : "",
-      artifact.done ? "当前进度 已完成" : artifact.stopped ? "当前进度 已终止" : "当前进度 等待首个状态",
+      artifact.stopped ? "当前进度 已终止" : artifact.done ? "当前进度 已完成" : "当前进度 等待首个状态",
     ].filter(Boolean).join(" · ");
   const stageLabelEl = card.querySelector(".code-execution-progress__stage-label");
   const stageEl = card.querySelector(".code-execution-progress__stage");
@@ -2720,7 +2962,10 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
   const hasProgress =
     (isActiveDownload && isDownloadProgressArtifact(artifact) && (hasPct || hasBytes))
     || batchProgressTotal > 0;
-  const hideOutput = isActiveDownload && hasProgress;
+  // Batch quantification (e.g. tRAX) reports sample progress rather than
+  // download bytes. Do not leave its card saying "等待输出" once a stage or
+  // sample counter is available.
+  const hideOutput = hasProgress;
 
   if (highlights.length && !hideOutput) {
     emptyEl.hidden = true;
@@ -2733,6 +2978,11 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
     });
   } else {
     emptyEl.hidden = Boolean(artifact.done || artifact.stopped || hideOutput);
+    if (!emptyEl.hidden) {
+      emptyEl.textContent = artifact.stage
+        ? `当前状态：${artifact.stage}`
+        : "等待任务输出…";
+    }
     listEl.hidden = true;
   }
 
@@ -3120,7 +3370,7 @@ function updateCodeExecutionProgress(group, event) {
   if (event.type === "code_execution_started") {
     markRunningExecutionsStopped();
     removeBackgroundExecutionCard();
-    activeCodeExecutionId = createId();
+    activeCodeExecutionId = executionIdForEvent(event) || createId();
     const stream = chatStreams.get(activeChatId);
     if (stream) stream.codeExecutionId = activeCodeExecutionId;
   }
@@ -3224,8 +3474,8 @@ function updateCodeExecutionProgress(group, event) {
   }
 }
 
-function finishCodeExecutionProgress(_group) {
-  const executionId = activeCodeExecutionId;
+function finishCodeExecutionProgress(_group, event = {}) {
+  const executionId = executionIdForEvent(event) || activeCodeExecutionId;
   const card = executionId ? getExecutionCard(executionId) : null;
   if (!card) return;
 
@@ -3248,9 +3498,9 @@ function finishCodeExecutionProgress(_group) {
 
   applyExecutionCardState(card, artifact);
   recordCodeArtifact(artifact);
-  activeCodeExecutionId = null;
+  if (executionId === activeCodeExecutionId) activeCodeExecutionId = null;
   const stream = chatStreams.get(activeChatId);
-  if (stream) stream.codeExecutionId = null;
+  if (stream && stream.codeExecutionId === executionId) stream.codeExecutionId = null;
 
   scrollCodePanelToBottom();
   scrollThreadToBottom();
@@ -3365,7 +3615,7 @@ function recordBackgroundCodeProgress(streamChatId, event) {
       }
       return item;
     });
-    stream.codeExecutionId = createId();
+    stream.codeExecutionId = executionIdForEvent(event) || createId();
   }
 
   const executionId = stream.codeExecutionId;
@@ -3380,9 +3630,9 @@ function recordBackgroundCodeProgress(streamChatId, event) {
   recordCodeArtifactForChat(streamChatId, artifact);
 }
 
-function finishBackgroundCodeProgress(streamChatId) {
+function finishBackgroundCodeProgress(streamChatId, event = {}) {
   const stream = chatStreams.get(streamChatId);
-  const executionId = stream?.codeExecutionId;
+  const executionId = executionIdForEvent(event) || stream?.codeExecutionId;
   if (!streamChatId || !executionId) return;
   const chat = ensureChatRecord(streamChatId);
   const existing = chat?.codePanel?.find(
@@ -3402,10 +3652,10 @@ function finishBackgroundCodeProgress(streamChatId) {
       hint: "",
     }),
   );
-  stream.codeExecutionId = null;
+  if (stream.codeExecutionId === executionId) stream.codeExecutionId = null;
 }
 
-function appendThinkingStepToEntry(assistantEntry, step, options = {}) {
+function appendThinkingStepToEntry(assistantEntry, step) {
   if (!assistantEntry) return;
   if (!Array.isArray(assistantEntry.thinkingSteps)) assistantEntry.thinkingSteps = [];
   const nextStep = {
@@ -3414,25 +3664,27 @@ function appendThinkingStepToEntry(assistantEntry, step, options = {}) {
     title: step.title || "",
     body: step.body || "",
     data: step.data && typeof step.data === "object" ? step.data : null,
+    roundId: stableThinkingRoundId(step),
   };
-  let existed = false;
-  if (nextStep.id) {
-    const index = assistantEntry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id);
-    if (index >= 0) {
-      existed = true;
-      assistantEntry.thinkingSteps[index] = nextStep;
-    } else {
-      assistantEntry.thinkingSteps.push(nextStep);
-    }
+  const nextFingerprint = thinkingStepFingerprint(nextStep);
+  let index = nextStep.id
+    ? assistantEntry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id)
+    : -1;
+  if (index < 0 && nextStep.kind === "plan") {
+    index = assistantEntry.thinkingSteps.findIndex((item) => String(item?.kind || "") === "plan");
+  }
+  if (index < 0) {
+    index = assistantEntry.thinkingSteps.findIndex((item) => (
+      !String(item?.id || "").trim()
+      && thinkingStepFingerprint(item) === nextFingerprint
+    ));
+  }
+  if (index >= 0) {
+    assistantEntry.thinkingSteps[index] = nextStep;
   } else {
     assistantEntry.thinkingSteps.push(nextStep);
   }
-  const defaultRoundIncrement = existed ? 0 : 1;
-  const roundIncrement = Number(options.roundIncrement ?? defaultRoundIncrement);
-  if (Number.isFinite(roundIncrement) && roundIncrement !== 0) {
-    const current = Number(assistantEntry.thinkingRoundCount) || 0;
-    assistantEntry.thinkingRoundCount = Math.max(0, current + roundIncrement);
-  }
+  assistantEntry.thinkingRoundCount = countUniqueThinkingSteps(assistantEntry.thinkingSteps);
 }
 
 function handleAgentStreamEventBackground(streamChatId, streamMessages, assistantEntry, event) {
@@ -3482,6 +3734,13 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
   }
   if (event.type === "code_execution_started" || event.type === "code_execution_progress") {
     recordBackgroundCodeProgress(streamChatId, event);
+    appendThinkingStepToEntry(assistantEntry, {
+      id: executionThinkingStepId(event, "tool"),
+      kind: "tool",
+      title: event.summary || "代码执行中",
+      body: event.stage || "运行中",
+      roundId: eventThinkingRoundId(event),
+    });
     return;
   }
   if (event.type === "done" && event.text) {
@@ -3500,8 +3759,12 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
       { chatId: streamChatId, messages: streamMessages },
     );
     appendThinkingStepToEntry(assistantEntry, {
+      id: event.name === "execute_code"
+        ? executionThinkingStepId(event, "tool")
+        : streamThinkingStepId(event, "tool"),
       kind: "tool",
-      title: event.name === "execute_code" ? "开始执行代码" : (event.summary || event.name),
+      title: event.summary || event.name,
+      roundId: eventThinkingRoundId(event),
     });
     return;
   }
@@ -3516,10 +3779,12 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     );
     if (event.name === "execute_code") {
       appendThinkingStepToEntry(assistantEntry, {
+        id: executionThinkingStepId(event, "result"),
         kind: "result",
-        title: "代码执行完成",
+        title: `${event.summary || "代码"}：完成`,
+        roundId: eventThinkingRoundId(event),
       });
-      finishBackgroundCodeProgress(streamChatId);
+      finishBackgroundCodeProgress(streamChatId, event);
       if (streamChatId === activeChatId) {
         window.KernelPanel?.refresh?.({ force: true });
       }
@@ -3616,7 +3881,12 @@ function handleAgentStreamEvent(group, event) {
           .join("\n"),
       });
     } else if (msg) {
-      appendThinkingStep(group, { kind: "plan", title: "计划", body: msg });
+      appendThinkingStep(group, {
+        id: streamThinkingStepId(event, "plan"),
+        kind: "plan",
+        title: "计划",
+        body: msg,
+      });
     }
     scrollThreadToBottom();
     return;
@@ -3649,14 +3919,25 @@ function handleAgentStreamEvent(group, event) {
       summary: "",
     });
     appendThinkingStep(group, {
+      id: event.name === "execute_code"
+        ? executionThinkingStepId(event, "tool")
+        : streamThinkingStepId(event, "tool"),
       kind: "tool",
-      title: event.name === "execute_code" ? "开始执行代码" : (event.summary || event.name),
+      title: event.summary || event.name,
+      roundId: eventThinkingRoundId(event),
     });
     return;
   }
 
   if (event.type === "code_execution_started" || event.type === "code_execution_progress") {
     updateCodeExecutionProgress(group, event);
+    appendThinkingStep(group, {
+      id: executionThinkingStepId(event, "tool"),
+      kind: "tool",
+      title: event.summary || "代码执行中",
+      body: event.stage || "运行中",
+      roundId: eventThinkingRoundId(event),
+    });
     return;
   }
 
@@ -3670,10 +3951,12 @@ function handleAgentStreamEvent(group, event) {
       summary: executionSummary,
     });
     if (event.name === "execute_code") {
-      finishCodeExecutionProgress(group);
+      finishCodeExecutionProgress(group, event);
       appendThinkingStep(group, {
+        id: executionThinkingStepId(event, "result"),
         kind: "result",
-        title: "代码执行完成",
+        title: `${event.summary || "代码"}：完成`,
+        roundId: eventThinkingRoundId(event),
       });
     }
     return;
@@ -3859,6 +4142,11 @@ async function handleSend() {
       void (async () => {
         const status = await fetchRunStatus(streamChatId);
         if (isTaskLikelyActive(status, streamChatId)) {
+          if (status.codeActive === false && !status.kernelBusy && status.codePanelRunning) {
+            // The agent may be planning or waiting on the LLM, but no code is
+            // executing. Do not keep an old code card counting elapsed time.
+            markRunningExecutionsStopped();
+          }
           syncRunStatusToUI(streamChatId, status || { ok: true, codePanelRunning: true }, {
             pending,
             assistantEntry,
@@ -3866,10 +4154,18 @@ async function handleSend() {
           });
           return;
         }
-        // Agent/内核已空闲：收尾轮询期间创建的「Agent 运行中」背景卡片，避免聊天结束后仍显示运行中
-        if (streamChatId === activeChatId) {
-          finishBackgroundExecutionCard();
-        }
+        const offlinePlan = planSnapshotFromThinking(assistantEntry);
+        reconcileStaleTaskUi(streamChatId, status || {
+          ok: true,
+          plan: offlinePlan,
+          planSummary: "服务连接已断开，运行状态无法确认",
+          stalePlanStep: Boolean(offlinePlan?.steps?.some((step) => step?.status === "running")),
+          staleCodePanel: true,
+        }, {
+          pending,
+          assistantEntry,
+          forceMessage: true,
+        });
       })();
     }, STREAM_STATUS_POLL_MS);
   };
@@ -3971,6 +4267,7 @@ async function handleSend() {
           if (event.type === "supervisor_approval") {
             const reason = event.reason || event.action || "监管者已评估";
             appendThinkingStep(target, {
+              id: streamThinkingStepId(event, "supervisor"),
               kind: "result",
               title: `监管者审批：${event.action || "?"}`,
               body: `${event.level || ""} · ${reason}`,
@@ -3983,6 +4280,7 @@ async function handleSend() {
           if (event.type === "run_report_ready") {
             const taskHint = event.taskLabel ? `${event.taskLabel}：` : "";
             appendThinkingStep(target, {
+              id: streamThinkingStepId(event, "report"),
               kind: "result",
               title: "运行报告已追加",
               body: `${taskHint}${event.reportSummary || "可在左侧 Report 页查看"}`,
@@ -4033,9 +4331,19 @@ async function handleSend() {
               const target = resolvePendingGroup(pending);
               updateMessageGroup(target, message);
               ensureThinkingPanel(target);
-              appendThinkingStep(target, { kind: "result", title: "错误", body: message });
+              appendThinkingStep(target, {
+                id: streamThinkingStepId(event, "error"),
+                kind: "result",
+                title: "错误",
+                body: message,
+              });
             } else {
-              appendThinkingStepToEntry(assistantEntry, { kind: "result", title: "错误", body: message });
+              appendThinkingStepToEntry(assistantEntry, {
+                id: streamThinkingStepId(event, "error"),
+                kind: "result",
+                title: "错误",
+                body: message,
+              });
             }
             persistChatMessages(streamChatId, streamMessages);
             answered = true;

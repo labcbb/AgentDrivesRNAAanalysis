@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 from anndata import AnnData
 
 from ..._registry import register_function
@@ -17,6 +18,13 @@ from ..._utils import run_cli_cmd
 
 FASTQ_SUFFIXES = (".fastq.gz", ".fq.gz", ".fastq", ".fq")
 TRAX_FRAGMENT_SUFFIXES = ("wholecounts", "fiveprime", "threeprime", "other")
+
+
+def _dense_counts(matrix) -> np.ndarray:
+    """Convert dense or sparse AnnData matrices without object-array coercion."""
+    if sp.issparse(matrix):
+        matrix = matrix.toarray()
+    return np.asarray(matrix, dtype=np.float64)
 
 
 def _infer_rna_type(var: pd.DataFrame) -> str:
@@ -44,7 +52,7 @@ def store_count_matrix(
     Existing features with the same ``rna_type`` are replaced. Features with a
     different ``rna_type`` are retained and the new features are appended.
     """
-    counts = np.asarray(matrix, dtype=np.float64)
+    counts = _dense_counts(matrix)
     if counts.ndim != 2:
         raise ValueError("matrix must be 2-dimensional")
     if counts.shape[0] != adata.n_obs:
@@ -64,9 +72,9 @@ def store_count_matrix(
         combined_var = new_var
     else:
         old_counts = (
-            np.asarray(adata.layers[counts_layer], dtype=np.float64)
+            _dense_counts(adata.layers[counts_layer])
             if counts_layer in adata.layers
-            else np.asarray(adata.X, dtype=np.float64)
+            else _dense_counts(adata.X)
         )
         old_var = adata.var.copy()
         if "rna_type" not in old_var.columns:

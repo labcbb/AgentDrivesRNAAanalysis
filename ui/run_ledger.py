@@ -84,6 +84,9 @@ def append_ledger_event(
         "description",
         "stage",
         "kind",
+        "turn",
+        "roundId",
+        "toolCallId",
     ):
         if event.get(key) not in (None, ""):
             entry[key] = event.get(key)

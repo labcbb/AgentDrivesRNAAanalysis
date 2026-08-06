@@ -178,7 +178,7 @@ AGENT_TOOL_SCHEMAS = [
         "function": {
             "name": "execute_code",
             "description": (
-                "Execute Python in the active Jupyter kernel for the sRNAgent conda env. "
+                "Execute Python in the active sRNAgent execution session. "
                 "Namespace includes `import sRNAgent as sa`. "
                 "Prefer sa.fastq.* functions discovered via search_functions."
             ),

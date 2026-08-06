@@ -10,7 +10,7 @@ description: "Filter lowly expressed miRNAs and run limma-voom differential expr
 
 This skill covers differential expression analysis for miRNA-seq data using limma-voom (pylimma):
 
-> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+> 模态边界：当前 skill 只操作传入的单个模态 AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
 > 统计设计约束：**默认使用非配对（unpaired）设计**。只有当用户明确要求配对（paired），且数据确实存在可用配对关系时，才允许切换到配对设计。
 
 | Step | Tool | Function | Purpose |
@@ -46,7 +46,7 @@ adata.uns["de_params"]   ← 对比元信息
 > 2. **主动向用户展示当前的分组情况**，让用户确认是否正确。
 > 3. 如果用户尚未设置分组，询问用户希望如何分组。
 > 4. 如果用户不确定分组来源，可以询问用户是否有样本信息表（CSV/Excel），或从 SRA/GEO 元数据获取（参见附录）。
-> 5. **必须单独确认统计设计是 `unpaired` 还是 `paired`。默认是 `unpaired`；只有用户明确指定 `paired` 才能切换。**
+> 5. **无需单独确认统计设计。用户未明确指定时，直接使用 `unpaired`；只有用户明确指定 `paired` 才能切换。**
 > 6. 如果发现当前数据并不支持 paired（例如 `paired_feasible=false`、没有真实一一对应配对关系），**必须终止 paired 路线**，不得自动切回 paired，也不得把 paired/unpaired 两套都跑一遍。
 > 7. 如果存在多个候选检验方案或设计冲突，**先 ask user**，不要默认两套都跑。
 

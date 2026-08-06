@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 
 from session_errors import build_session_errors_context
 from session_plan import load_plan, plan_progress_summary
-from session_store import _read_json, _write_json, ensure_session_dir, sanitize_chat_id
+from session_store import _read_json, _write_json, ensure_session_dir, list_chat_records, sanitize_chat_id
 from work_space import get_work_space
 
 _MEMORY_FILE = "session_memory.json"
@@ -46,6 +46,11 @@ _IMPORTANT_DIRS = (
     "counts",
     "qc",
     "trimmed",
+    "fragmentomics",
+    "fragmentomics_out",
+    "isomir",
+    "rna",
+    "de_results",
 )
 _FACT_PATTERNS = (
     re.compile(r"(adapter|接头).{0,40}(确认|使用|设为|设置为|为)\s*[:：]?\s*([^\n，。;；]{1,120})", re.I),
@@ -65,6 +70,20 @@ _REQUIREMENT_CUE_RE = re.compile(
     re.I,
 )
 _KEYWORD_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}|[\u4e00-\u9fff]{2,}")
+_RESULT_SIGNAL_RE = re.compile(
+    r"(?:FSD|FSC|RCD|EDM(?:[_-](?:5P|3P))?|BPM(?:[_-](?:START|END))?|"
+    r"fragmentomics|fragomics|feature[_ -]?type|count|counts|rows?|columns?|"
+    r"n[_ -]?(?:obs|vars)|shape|total|summary|结果|特征|数量|数目|分布)",
+    re.I,
+)
+_CONTINUATION_QUERY_RE = re.compile(
+    r"继续|接着|刚才|前面|上一(?:个|轮|次)?|上次|之前|在此基础|基于.*结果|resume|continue|previous",
+    re.I,
+)
+_HANDOFF_STOPWORDS = {
+    "继续", "接着", "刚才", "前面", "上一", "上次", "之前", "一个", "对话", "任务", "结果", "基础",
+    "总结", "查看", "查询", "分析", "做", "进行", "处理",
+}
 
 
 def _memory_path(chat_id: str) -> Path:
@@ -264,13 +283,18 @@ def _compact_execute_code_detail(detail: str) -> str:
             keep = True
         elif line.lower().startswith(("result:", "output:", "saved:", "wrote ", "written ")):
             keep = True
+        # Keep compact numeric/table lines such as ``FSD 123`` or
+        # ``feature_type,count``. These are often the only durable record of
+        # a fragmentomics summary and were previously discarded as noise.
+        elif _RESULT_SIGNAL_RE.search(line) and re.search(r"[-+]?\d+(?:\.\d+)?", line):
+            keep = True
         if not keep:
             continue
         if line in seen:
             continue
         seen.add(line)
         lines.append(line)
-        if len(lines) >= 6:
+        if len(lines) >= 12:
             break
     return "\n".join(lines)[:240]
 
@@ -314,13 +338,27 @@ def _extract_requirement_flags_from_query(text: str) -> Dict[str, Any]:
     }
 
 
-def remember_user_query(chat_id: str, user_query: str) -> None:
+def remember_user_query(
+    chat_id: str,
+    user_query: str,
+    *,
+    reset_request_scope: bool = False,
+) -> None:
     query = str(user_query or "").strip()
     if not chat_id or not query:
         return
     with _LOCK:
         memory = load_session_memory(chat_id)
         changed = False
+
+        # HTML reports, analysis design, and modality requirements belong to
+        # one user request.  Keep them for an explicit continuation, but do
+        # not inject an old report request into a distinct new analysis.
+        if reset_request_scope:
+            for key in ("analysis", "deliverables", "requirements"):
+                if memory.get(key):
+                    memory[key] = {}
+                    changed = True
 
         facts = list(memory.get("facts") or [])
         for item in _extract_facts(query):
@@ -374,7 +412,10 @@ def record_stream_event(chat_id: str, event: Dict[str, Any]) -> None:
     if event_type == "tool_result":
         name = str(event.get("name") or "")
         summary = str(event.get("summary") or name or "tool_result")
-        detail = str(event.get("content") or "")
+        # execute_code emits a UI-sized ``content`` preview plus a bounded
+        # head+tail ``fullContent``. Persist the latter so follow-up turns can
+        # recover paths and compact result tables instead of rerunning code.
+        detail = str(event.get("fullContent") or event.get("content") or "")
         if name == "execute_code":
             compact = _compact_execute_code_detail(detail)
             if compact:
@@ -458,6 +499,8 @@ def build_workspace_manifest(*, max_files: int = 36) -> str:
         "**/*run-info*.tsv",
         "**/*.fa.gz",
         "**/*.h5ad",
+        "**/*.h5mu",
+        "**/*.tsv",
         "**/*.html",
         "**/*.pdf",
         "**/*.png",
@@ -550,6 +593,133 @@ def _format_active_plan_context(chat_id: str) -> str:
     return "\n".join(lines)
 
 
+def _handoff_tokens(text: str) -> List[str]:
+    tokens: List[str] = []
+    for token in _KEYWORD_TOKEN_RE.findall(str(text or "").lower()):
+        token = token.strip("._- ")
+        if re.fullmatch(r"[\u4e00-\u9fff]+", token):
+            for stopword in sorted(_HANDOFF_STOPWORDS, key=len, reverse=True):
+                token = token.replace(stopword, "")
+            token = token.strip("的了与和及在对中")
+        if len(token) < 2 or token in _HANDOFF_STOPWORDS:
+            continue
+        if token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def _format_related_session_handoff(chat_id: str, user_query: str) -> str:
+    """Find one relevant older chat for explicit continuation requests.
+
+    A new chat has no local ``plan.json`` or memory file, so relying only on
+    the current chat made "continue the previous fragmentomics work" look like
+    a brand-new pipeline. This is deliberately limited to continuation-shaped
+    queries and returns one best match to avoid polluting normal conversations.
+    """
+    query = str(user_query or "").strip()
+    if not query or not _CONTINUATION_QUERY_RE.search(query):
+        return ""
+    try:
+        current_id = sanitize_chat_id(chat_id)
+        records = list_chat_records()
+    except Exception:
+        return ""
+
+    query_lower = query.lower()
+    query_tokens = _handoff_tokens(query)
+    candidates: List[tuple[float, Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]] = []
+    for record in records:
+        if not isinstance(record, dict) or str(record.get("id") or "") == current_id:
+            continue
+        record_id = str(record.get("id") or "").strip()
+        if not record_id:
+            continue
+        try:
+            plan = load_plan(record_id)
+        except Exception:
+            plan = None
+        memory = load_session_memory(record_id)
+        messages = record.get("messages") if isinstance(record.get("messages"), list) else []
+        message_text = " ".join(
+            str(item.get("content") or "")
+            for item in messages[-8:]
+            if isinstance(item, dict)
+        )
+        plan_text = " ".join(
+            [
+                str((plan or {}).get("goal") or ""),
+                " ".join(
+                    str(step.get("title") or step.get("goal") or "")
+                    for step in ((plan or {}).get("steps") or [])
+                    if isinstance(step, dict)
+                ),
+                " ".join(str(item) for item in ((plan or {}).get("requirements") or {}).get("items", [])),
+            ]
+        )
+        searchable = " ".join(
+            [str(record.get("title") or ""), message_text, plan_text, " ".join(memory.get("facts") or [])]
+        ).lower()
+        candidate_tokens = _handoff_tokens(searchable)
+        overlap = sum(
+            1
+            for token in query_tokens
+            if token in searchable or any(token in other or other in token for other in candidate_tokens)
+        )
+        # A generic "continue" still means the most recently updated prior
+        # chat; topic overlap wins whenever the query provides one.
+        if not overlap and query_tokens:
+            continue
+        try:
+            updated = float(record.get("updatedAt") or 0)
+        except (TypeError, ValueError):
+            updated = 0.0
+        score = overlap * 1000.0 + updated / 1_000_000_000_000.0
+        if query_lower and query_lower in searchable:
+            score += 500.0
+        candidates.append((score, record, plan, memory))
+
+    if not candidates:
+        return ""
+    _, record, plan, memory = max(candidates, key=lambda item: item[0])
+    goal = str((plan or {}).get("goal") or record.get("title") or "").strip()
+    if not goal:
+        return ""
+
+    lines = ["### 最近相关会话继承"]
+    lines.append(f"- 来源会话：{record.get('title') or record.get('id')}")
+    lines.append(f"- 上一会话目标：{goal}")
+    requirements = (plan or {}).get("requirements") if isinstance(plan, dict) else {}
+    requirements = requirements if isinstance(requirements, dict) else {}
+    if requirements.get("mudata_required") is True:
+        lines.append("- previous.requirements.mudata_required = true")
+    if requirements.get("whole_genome_bam_required") is True:
+        lines.append("- previous.requirements.whole_genome_bam_required = true")
+    for item in requirements.get("items") or []:
+        text = str(item).strip()
+        if text:
+            lines.append(f"- previous.requirement: {text}")
+    unfinished = [
+        step for step in ((plan or {}).get("steps") or [])
+        if isinstance(step, dict) and str(step.get("status") or "pending").lower() != "done"
+    ]
+    if unfinished:
+        lines.append(f"- 上一会话仍有未完成计划：{len(unfinished)} 个步骤")
+        for step in unfinished[:4]:
+            title = str(step.get("title") or step.get("goal") or step.get("id") or "未命名步骤").strip()
+            lines.append(f"  - {title}")
+    artifacts = [str(item).strip() for item in (memory.get("artifacts") or []) if str(item).strip()]
+    if artifacts:
+        lines.append("- 上一会话已知产物：" + ", ".join(artifacts[-8:]))
+    recent_steps = [
+        str(step.get("summary") or "").strip()
+        for step in (memory.get("steps") or [])[-5:]
+        if isinstance(step, dict) and str(step.get("summary") or "").strip()
+    ]
+    if recent_steps:
+        lines.append("- 上一会话最近记录：" + "；".join(recent_steps[-3:]))
+    return "\n".join(lines)
+
+
 def build_session_memory_context(chat_id: str, *, user_query: str = "") -> str:
     if not chat_id:
         return ""
@@ -571,8 +741,9 @@ def build_session_memory_context(chat_id: str, *, user_query: str = "") -> str:
     if not requirements and isinstance(plan, dict) and isinstance(plan.get("requirements"), dict):
         requirements = dict(plan.get("requirements") or {})
     active_plan_context = _format_active_plan_context(chat_id)
+    related_session_context = _format_related_session_handoff(chat_id, user_query)
 
-    if not steps and not artifacts and not facts and not analysis and not deliverables and not requirements and not manifest and not errors_context and not active_plan_context:
+    if not steps and not artifacts and not facts and not analysis and not deliverables and not requirements and not manifest and not errors_context and not active_plan_context and not related_session_context:
         return ""
 
     lines = [
@@ -635,6 +806,10 @@ def build_session_memory_context(chat_id: str, *, user_query: str = "") -> str:
     if active_plan_context:
         lines.append("")
         lines.append(active_plan_context)
+
+    if related_session_context:
+        lines.append("")
+        lines.append(related_session_context)
 
     if steps:
         lines.append("")

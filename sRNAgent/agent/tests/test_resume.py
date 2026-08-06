@@ -96,6 +96,7 @@ def test_interrupted_run_writes_checkpoint_and_resumes():
         assert text.startswith("final answer"), f"unexpected text: {text!r}"
         assert "耗时" in text, "elapsed time should be appended to the answer"
         assert llm2.calls == 1
+        assert agent2._load_run_checkpoint(chat_id) is None, "completed runs must not remain resumable"
         resumed = llm2.seen_messages[0]
         resumed_text = "\n".join(str(m.get("content") or "") for m in resumed)
         assert "fastq" in resumed_text or any(
@@ -117,6 +118,49 @@ def test_no_checkpoint_when_disabled():
             ),
         )
         assert agent._checkpoint_base_dir() is None
+
+
+def test_code_execution_events_share_the_tool_call_id():
+    class _ExecuteThenFinishLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, tools=None, enable_thinking=None):
+            self.calls += 1
+            if self.calls == 1:
+                return ChatCompletion(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="execute-1",
+                            name="execute_code",
+                            arguments={"description": "检查输入", "code": "print('ok')"},
+                        )
+                    ],
+                )
+            return ChatCompletion(
+                content="",
+                tool_calls=[ToolCall(id="finish-1", name="finish", arguments={"message": "完成"})],
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        llm = _ExecuteThenFinishLLM()
+        agent = _make_agent(Path(tmp), "chat-code-events", llm)
+        agent.dispatch_tool = lambda name, arguments, **kwargs: "ok"  # type: ignore[method-assign]
+        events = []
+        agent.run_with_history(
+            [{"role": "user", "content": "检查输入"}],
+            chat_id="chat-code-events",
+            on_progress=events.append,
+        )
+
+    correlated = [
+        event for event in events
+        if event.get("type") in {"tool_call", "code_execution_started", "tool_result"}
+        and event.get("name", "execute_code") == "execute_code"
+    ]
+    assert len(correlated) == 3
+    assert {event.get("toolCallId") for event in correlated} == {"execute-1"}
 
 
 if __name__ == "__main__":

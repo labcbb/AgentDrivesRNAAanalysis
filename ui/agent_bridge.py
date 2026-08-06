@@ -18,6 +18,7 @@ if str(SRNAGENT_PROJECT) not in sys.path:
 from sRNAgent.agent.agent_config import EXECUTION_TIMEOUT_SEC, ExecutionConfig, SandboxFallbackPolicy  # noqa: E402
 from sRNAgent.agent.bootstrap import initialize_registries  # noqa: E402
 from sRNAgent.agent.context import estimate_tokens, truncate_text  # noqa: E402
+from sRNAgent.agent.checkpoint import load_checkpoint  # noqa: E402
 from sRNAgent.agent.llm_client import LLMConfig  # noqa: E402
 from sRNAgent.agent.srn_agent import AgentCancelledError, SRNAgent  # noqa: E402
 
@@ -26,6 +27,7 @@ from chat_kernel_manager import (  # noqa: E402
     get_chat_execution,
     interrupt_chat_kernel,
     kernel_is_busy,
+    notebook_execution_enabled,
     release_chat_kernel,
 )
 from session_store import (  # noqa: E402
@@ -75,6 +77,7 @@ from work_space import get_work_space, list_work_space_files  # noqa: E402
 _runs_lock = threading.Lock()
 _active_runs: Dict[str, threading.Event] = {}
 _active_run_chat_ids: Dict[str, str] = {}
+_active_code_by_chat: Dict[str, Dict[str, Any]] = {}
 _approval_lock = threading.Lock()
 _pending_approvals: Dict[str, threading.Event] = {}
 _approval_results: Dict[str, bool] = {}
@@ -89,7 +92,7 @@ _MAX_RUN_CONTEXT_TOKENS = 3200
 
 def _default_execution_config(chat_id: str = "") -> ExecutionConfig:
     cfg = ExecutionConfig(
-        use_notebook=True,
+        use_notebook=notebook_execution_enabled(),
         strict_kernel_validation=False,
         strict_env_validation=False,
         sandbox_fallback_policy=SandboxFallbackPolicy.WARN_AND_FALLBACK,
@@ -154,6 +157,52 @@ def _cached_kernel_variables(chat_id: str) -> List[Dict[str, Any]]:
 def _chat_has_active_run(chat_id: str) -> bool:
     with _runs_lock:
         return chat_id in _active_run_chat_ids.values()
+
+
+def _track_code_execution(chat_id: str, run_id: str, event: Dict[str, Any]) -> None:
+    """Track execute_code independently from an otherwise-live LLM loop."""
+    event_type = str(event.get("type") or "")
+    if event_type in {"code_execution_started", "code_execution_progress"}:
+        with _runs_lock:
+            current = _active_code_by_chat.get(chat_id)
+            if not current or str(current.get("runId") or "") != run_id:
+                current = {"runId": run_id, "startedAt": time.time()}
+            for source, target in (
+                ("toolCallId", "toolCallId"),
+                ("summary", "summary"),
+                ("description", "description"),
+                ("stage", "stage"),
+                ("elapsedSec", "elapsedSec"),
+                ("elapsedLabel", "elapsedLabel"),
+                ("highlights", "highlights"),
+            ):
+                if event.get(source) not in (None, ""):
+                    current[target] = event[source]
+            _active_code_by_chat[chat_id] = current
+    elif event_type == "tool_result" and str(event.get("name") or "") == "execute_code":
+        with _runs_lock:
+            state = _active_code_by_chat.get(chat_id)
+            if state and str(state.get("runId") or "") == run_id:
+                _active_code_by_chat.pop(chat_id, None)
+
+
+def _persist_final_chat_message(chat_id: str, text: str) -> None:
+    """Persist the terminal reply even when the browser stream has disconnected."""
+    if not chat_id or not str(text or "").strip():
+        return
+    chat = load_chat_record(chat_id)
+    if not chat:
+        return
+    messages = list(chat.get("messages") or [])
+    for message in reversed(messages):
+        if isinstance(message, dict) and str(message.get("role") or "") == "assistant":
+            message["content"] = str(text).strip()
+            message["_finalReplyLocked"] = True
+            break
+    else:
+        messages.append({"role": "assistant", "content": str(text).strip()})
+    chat["messages"] = messages
+    save_chat_record(chat_id, chat, force=True)
 
 
 def kernel_environment(chat_id: str) -> Dict[str, Any]:
@@ -525,6 +574,8 @@ def cleanup_run(run_id: str) -> None:
         chat_id = _active_run_chat_ids.get(run_id, "")
         _active_runs.pop(run_id, None)
         _active_run_chat_ids.pop(run_id, None)
+        if chat_id and str(_active_code_by_chat.get(chat_id, {}).get("runId") or "") == run_id:
+            _active_code_by_chat.pop(chat_id, None)
     if chat_id:
         clear_run_context(chat_id)
 
@@ -623,6 +674,12 @@ def agent_run_status(chat_id: str) -> Dict[str, Any]:
 
     has_active_run = _chat_has_active_run(chat_id)
     busy = kernel_is_busy(SRNAGENT_PROJECT, chat_id)
+    with _runs_lock:
+        code_state = dict(_active_code_by_chat.get(chat_id) or {})
+    if code_state and not has_active_run:
+        with _runs_lock:
+            _active_code_by_chat.pop(chat_id, None)
+        code_state = {}
     live_run_id = get_live_run_id(chat_id)
     plan = load_plan(chat_id)
     plan_summary = plan_progress_summary(plan) if plan else ""
@@ -645,6 +702,14 @@ def agent_run_status(chat_id: str) -> Dict[str, Any]:
         "chatId": chat_id,
         "hasActiveRun": has_active_run,
         "kernelBusy": busy,
+        "codeActive": bool(code_state),
+        "codeStartedAt": code_state.get("startedAt"),
+        "codeSummary": code_state.get("summary") or "",
+        "codeDescription": code_state.get("description") or "",
+        "codeStage": code_state.get("stage") or "",
+        "codeElapsedSec": code_state.get("elapsedSec"),
+        "codeElapsedLabel": code_state.get("elapsedLabel") or "",
+        "codeHighlights": code_state.get("highlights") or [],
         "planStepRunning": plan_step_running,
         "codePanelRunning": code_panel_running,
         "stalePlanStep": stale_plan_step,
@@ -675,8 +740,8 @@ def agent_status() -> Dict[str, Any]:
             for entry in function_registry.find("fastq")
         ],
         "execution": {
-            "mode": "per_chat_kernel",
-            "use_notebook": True,
+            "mode": "per_chat_kernel" if notebook_execution_enabled() else "per_chat_in_process",
+            "use_notebook": notebook_execution_enabled(),
             "runtime": runtime.to_dict(),
         },
     }
@@ -696,12 +761,12 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
         chat_id = _resolve_chat_id(body)
         user_query = _latest_user_message(messages)
         remember_user_query(chat_id, user_query)
-        run_context = _build_run_context(chat_id, user_query=user_query)
         use_plan_mode = _plan_mode_enabled(agent_cfg)
         resume = bool(body.get("resume") or body.get("continueRun") or False)
+        if not resume:
+            clear_plan(chat_id)
+        run_context = _build_run_context(chat_id, user_query=user_query)
         if use_plan_mode:
-            if not resume:
-                clear_plan(chat_id)
             text = agent.run_planned(
                 messages,
                 extra_context=run_context,
@@ -808,19 +873,59 @@ def _latest_user_message(source):
 def _auto_detect_resume(body: Dict[str, Any], chat_id: str) -> bool:
     """True if the new user message looks like 'continue the interrupted task'.
 
-    The checkpoint-existence check is left to SRNAgent.run_with_history /
-    run_planned: if no checkpoint exists, those paths fall back to rebuilding
-    messages from history (the prior run already finished in the user's
-    perception). We only gate here on message shape — short text that
-    matches a resume keyword — so we don't hijack substantive follow-up
-    questions like '继续分析 piRNA 的差异' or '接着改 bug X'.
+    Resume only when persisted state actually contains unfinished work. A
+    completed run also has a checkpoint (written before ``finish``), so a
+    keyword-only check would incorrectly route a new follow-up into the old
+    plan.
     """
     if not chat_id:
         return False
     msg = _latest_user_message(body).lower()
     if not msg or len(msg) > 60:
         return False
-    return any(kw.lower() in msg for kw in _RESUME_KEYWORDS)
+    if not any(kw.lower() in msg for kw in _RESUME_KEYWORDS):
+        return False
+
+    try:
+        plan = load_plan(chat_id)
+    except Exception:
+        plan = None
+    if isinstance(plan, dict):
+        steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+        if any(
+            isinstance(step, dict)
+            and str(step.get("status") or "pending").strip().lower()
+            in {"pending", "running", "failed"}
+            for step in steps
+        ):
+            return True
+        # An all-done plan is historical context, not a resumable run.
+        return False
+
+    # Non-plan mode: inspect the checkpoint transcript. Tool results or a
+    # non-terminal assistant tool call mean another LLM turn is required.
+    try:
+        checkpoint = load_checkpoint(session_dir(chat_id) / "checkpoints", chat_id)
+    except Exception:
+        checkpoint = None
+    messages = checkpoint.get("messages") if isinstance(checkpoint, dict) else None
+    if not isinstance(messages, list) or not messages:
+        return False
+    for item in reversed(messages):
+        if not isinstance(item, dict) or item.get("role") == "system":
+            continue
+        role = str(item.get("role") or "")
+        if role == "tool":
+            return True
+        if role == "assistant":
+            calls = item.get("tool_calls") if isinstance(item.get("tool_calls"), list) else []
+            return any(
+                str((call.get("function") or {}).get("name") or call.get("name") or "") != "finish"
+                for call in calls
+                if isinstance(call, dict)
+            )
+        return False
+    return False
 
 
 def _append_work_log_event(chat_id: str, event: Dict[str, Any], run_id: str) -> None:
@@ -919,6 +1024,11 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             }
             return
 
+    # Remove the previous plan only after this request has acquired the chat;
+    # a rejected observer must not erase the active operator's plan.
+    if not resume:
+        clear_plan(chat_id)
+
     # Stop any in-flight agent loop for this chat; interrupt kernel only if it is busy.
     cancel_run("", chat_id)
     cancel_event = register_run(run_id, chat_id)
@@ -944,6 +1054,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
     def on_progress(event: Dict[str, Any]) -> None:
         try:
+            _track_code_execution(chat_id, run_id, event)
             update_run_context(chat_id, event)
             record_stream_event(chat_id, event)
             # 持久化错误时用完整 head+tail 结果（fullContent），
@@ -1035,7 +1146,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     def worker() -> None:
         final_text = ""
         try:
-            on_progress({"type": "status", "message": "正在初始化 Agent 和 Jupyter 内核…"})
+            on_progress({"type": "status", "message": "正在初始化 Agent 执行环境…"})
             try:
                 agent, agent_cfg = _build_agent(body)
             except ValueError as exc:
@@ -1045,11 +1156,19 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             on_progress({"type": "status", "message": "Agent 就绪，正在请求 LLM…"})
             use_plan_mode = _plan_mode_enabled(agent_cfg)
             user_query = _latest_user_message(messages)
-            remember_user_query(chat_id, user_query)
+            remember_user_query(
+                chat_id,
+                user_query,
+                reset_request_scope=not resume,
+            )
+            # A new user request starts a new planning context. Clear the
+            # previous unfinished plan before building session memory; doing
+            # it afterward leaked the old pending steps into the planner and
+            # could make an unrelated follow-up inherit the prior workflow.
+            if not resume:
+                clear_plan(chat_id)
             run_context = _build_run_context(chat_id, user_query=user_query)
             if use_plan_mode:
-                if not resume:
-                    clear_plan(chat_id)
                 text = agent.run_planned(
                     messages,
                     extra_context=run_context,
@@ -1074,6 +1193,10 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                     code_approval_callback=request_code_approval,
                 )
             final_text = text
+            try:
+                _persist_final_chat_message(chat_id, text)
+            except Exception:
+                pass
             on_progress(
                 {
                     "type": "done",

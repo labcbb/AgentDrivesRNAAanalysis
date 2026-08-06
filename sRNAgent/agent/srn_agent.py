@@ -40,7 +40,10 @@ _CODE_PROGRESS_INTERVALS = (1, 1, 1, 1, 1, 1, 1, 1)
 _SSE_PROGRESS_HEARTBEAT_SEC = 3
 _PROGRESS_MARKER = "__SRNAGENT_DL__"
 _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-_BROKEN_ESCAPE_RE = re.compile(r"\[(?:\[[0-9;]*[A-Za-z]|[0-9;]*[A-Za-z])")
+# A malformed CSI sequence must contain at least one parameter. The previous
+# optional quantifier also matched ordinary log prefixes such as "[fragomics]"
+# and removed their first two characters.
+_BROKEN_ESCAPE_RE = re.compile(r"\[(?:\[[0-9;]*[A-Za-z]|[0-9;]+[A-Za-z])")
 _OSC_HYPERLINK_RE = re.compile(r"\]8;[^;\n]*;[^\n\\]*\\?")
 _ACCESSION_RE = re.compile(r"\b(SRR|ERR|DRR|SRS|SRP|ERP|DRP|GSE|GSM)\d+\b")
 _RUN_ID_RE = re.compile(r"\b(SRR|ERR|DRR)\d+\b")
@@ -62,6 +65,7 @@ _REFERENCE_DL_RE = re.compile(
     re.IGNORECASE,
 )
 _OUTDIR_RE = re.compile(r"""output_dir\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_TRAX_QUANT_CODE_RE = re.compile(r"sa\.quant\.trax_quant\s*\(", re.IGNORECASE)
 _INTERNAL_REPORT_RE = re.compile(
     r"已向用户|已向用户发送|已向.*发送|等待.{0,8}下一步|等待用户|"
     r"task completed|step (is )?done|waiting for (the )?user|"
@@ -212,27 +216,12 @@ def _audit_execute_code_policy(
             "不要只返回纯文本总结或仅依赖 session run_report。"
         )
 
-    mudata_required = bool(requirements.get("mudata_required"))
     if _FRAGOMICS_CODE_RE.search(code):
         assign_match = _FRAG_RESULT_ASSIGN_RE.search(code)
         if not assign_match:
             return (
                 "POLICY_VIOLATION: 调用 sa.fragment.fragomics(...) 时必须接收返回值，"
-                "因为结果可能是 AnnData，也可能是在已有小RNA定量时返回 MuData。"
-            )
-        var_name = assign_match.group(1)
-        has_safe_branch = (
-            f"{var_name}.mod[" in code
-            or f"hasattr({var_name}, \"mod\")" in code
-            or f"hasattr({var_name}, 'mod')" in code
-            or ".h5mu" in code
-            or "fragmentomics_only.h5ad" in code
-        )
-        if mudata_required and not has_safe_branch:
-            return (
-                "POLICY_VIOLATION: 当前高优先级要求明确需要 MuData，但 fragomics 返回值没有按 AnnData / MuData 双分支安全处理。\n"
-                "如果已有小RNA定量，默认应返回 MuData，并保存/操作 `result.mod['fragmentomics']` 或写出 `.h5mu`；"
-                "不要把返回值直接当普通 AnnData 使用。"
+                "并将独立的 fragmentomics AnnData 保存为 .h5ad。"
             )
 
     if not is_de_code:
@@ -928,10 +917,47 @@ def _merge_execution_progress(
     return merged
 
 
+def _infer_trax_progress(workspace: Optional[Path], code: str) -> Dict[str, Any]:
+    """Read tRAX's durable BAM outputs when in-process stdout is buffered."""
+    if workspace is None or not _TRAX_QUANT_CODE_RE.search(code or ""):
+        return {}
+    output_match = _OUTDIR_RE.search(code or "")
+    output_dir = Path(output_match.group(1) if output_match else "trax_out").expanduser()
+    if not output_dir.is_absolute():
+        output_dir = workspace / output_dir
+    bam_dir = output_dir / "bam"
+    if not bam_dir.exists():
+        return {}
+
+    sample_files = sorted(output_dir.glob("*-samples.txt"), key=lambda path: path.stat().st_mtime)
+    if not sample_files:
+        return {}
+    try:
+        total = sum(
+            1 for line in sample_files[-1].read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    except OSError:
+        return {}
+    if total <= 0:
+        return {}
+    done = len(list(bam_dir.glob("*.bam")))
+    stage = f"已完成 {min(done, total)}/{total} 样本"
+    return {
+        "stage": stage,
+        "highlights": [f"tRAX 已生成 {min(done, total)}/{total} 个 BAM"],
+        "detail": stage,
+    }
+
+
 def _parse_progress_output(text: str, *, workspace: Optional[Path] = None, code: str = "") -> Dict[str, Any]:
     cleaned = _strip_terminal_noise(text)
     if not cleaned:
-        return {"stage": "等待输出", "highlights": [], "detail": ""}
+        base = {"stage": "等待输出", "highlights": [], "detail": ""}
+        trax_progress = _infer_trax_progress(workspace, code)
+        if trax_progress:
+            base.update(trax_progress)
+        return _merge_execution_progress(base, workspace, text, code)
 
     candidates: List[str] = []
     seen_keys: set[str] = set()
@@ -980,6 +1006,9 @@ def _parse_progress_output(text: str, *, workspace: Optional[Path] = None, code:
         "detail": detail,
         **_parse_download_progress_marker(text),
     }
+    trax_progress = _infer_trax_progress(workspace, code)
+    if trax_progress:
+        base.update(trax_progress)
     return _merge_execution_progress(base, workspace, text, code)
 
 
@@ -1056,7 +1085,12 @@ def _build_system_prompt(skill_overview: str, extra_system: str = "") -> str:
         "expensive analysis (DE, quantification, alignment) to answer a lookup.\n"
         "7. After running analysis, PERSIST results: save the adata (with uns results) "
         "back to the h5ad and register result file paths in the workspace.\n"
-        "8. Call `finish` with a concise summary when done.\n\n"
+        "8. For follow-up requests (e.g. '继续', '在此基础上', '刚才的结果'), "
+        "first inspect the current kernel variables and persisted adata/manifest/output files. "
+        "Treat completed work as reusable state; do not rerun QC, alignment, quantification, "
+        "or other expensive steps unless the user explicitly asks to rerun or the required "
+        "result is genuinely missing.\n"
+        "9. Call `finish` with a concise summary when done.\n\n"
         "## Registered skills\n"
         f"{skills_block}\n"
     )
@@ -1272,6 +1306,18 @@ class SRNAgent:
             return None
         return load_checkpoint(base, chat_id)
 
+    def _clear_run_checkpoint(self, chat_id: str) -> None:
+        """Remove resumable state once a run has reached a terminal success."""
+        if not chat_id:
+            return
+        base = self._checkpoint_base_dir()
+        if base is None:
+            return
+        try:
+            clear_checkpoint(base, chat_id)
+        except Exception:  # noqa: BLE001 - cleanup must never mask a reply
+            logger.debug("checkpoint cleanup failed", exc_info=True)
+
     def _compact_context(
         self,
         messages: List[Dict[str, Any]],
@@ -1368,6 +1414,7 @@ class SRNAgent:
         turn: int,
         summary: str,
         description: str,
+        tool_call_id: str,
     ) -> str:
         stream_state = {"stdout": "", "stderr": ""}
         result_box: Dict[str, Any] = {"value": None, "error": None}
@@ -1397,6 +1444,7 @@ class SRNAgent:
                 on_progress,
                 "code_execution_progress",
                 turn=turn,
+                toolCallId=tool_call_id,
                 summary=progress_summary,
                 description=description,
                 elapsedSec=int(elapsed),
@@ -1422,6 +1470,7 @@ class SRNAgent:
             on_progress,
             "code_execution_started",
             turn=turn,
+            toolCallId=tool_call_id,
             summary=summary,
             description=description,
             code=str(arguments.get("code") or ""),
@@ -1481,6 +1530,7 @@ class SRNAgent:
                     on_progress,
                     "code_execution_progress",
                     turn=turn,
+                    toolCallId=tool_call_id,
                     summary=progress_summary,
                     description=description,
                     elapsedSec=int(elapsed),
@@ -1504,6 +1554,7 @@ class SRNAgent:
                 on_progress,
                 "code_execution_progress",
                 turn=turn,
+                toolCallId=tool_call_id,
                 summary=progress_summary,
                 description=description,
                 elapsedSec=int(elapsed),
@@ -1600,6 +1651,7 @@ class SRNAgent:
                         on_progress,
                         "tool_call",
                         turn=turn + 1,
+                        toolCallId=call.id,
                         name=call.name,
                         summary=summary,
                         arguments=call.arguments,
@@ -1616,6 +1668,8 @@ class SRNAgent:
                         self._save_run_checkpoint(
                             messages, chat_id, checkpoint_extra
                         )
+                        if checkpoint_extra is None:
+                            self._clear_run_checkpoint(chat_id)
                         self._emit_progress(
                             on_progress,
                             "final",
@@ -1647,6 +1701,7 @@ class SRNAgent:
                                     turn=turn + 1,
                                     summary=summary,
                                     description=description,
+                                    tool_call_id=call.id,
                                 )
                             else:
                                 result = self.dispatch_tool(call.name, call.arguments)
@@ -1663,6 +1718,7 @@ class SRNAgent:
                                 turn=turn + 1,
                                 summary=summary,
                                 description=description,
+                                tool_call_id=call.id,
                             )
                         else:
                             result = self.dispatch_tool(call.name, call.arguments)
@@ -1676,6 +1732,7 @@ class SRNAgent:
                             on_progress,
                             "tool_result",
                             turn=turn + 1,
+                            toolCallId=call.id,
                             name=call.name,
                             summary=summary,
                             content=_truncate_result(result),
@@ -1703,6 +1760,8 @@ class SRNAgent:
                     cancel_event=cancel_event,
                 )
                 self._save_run_checkpoint(messages, chat_id, checkpoint_extra)
+                if checkpoint_extra is None:
+                    self._clear_run_checkpoint(chat_id)
                 self._emit_progress(
                     on_progress,
                     "final",

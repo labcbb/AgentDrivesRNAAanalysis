@@ -10,7 +10,7 @@ description: "Quantify reads per small-RNA reference sequence from BAM files usi
 
 Use `sa.quant.idxstats` to quantify reads mapped to small-RNA reference sequences in BAM files.
 
-> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
 
 This skill is for BAM files produced by aligning reads to a **small-RNA FASTA reference index** such as piRBase piRNA sequences, Ensembl ncRNA sequences, mature tRNAs, miRNAs, or other transcript-level sequences.
 

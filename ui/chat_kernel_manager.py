@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import threading
 from pathlib import Path
@@ -19,13 +20,26 @@ _CHAT_EXECUTIONS: Dict[str, ExecutionBackend] = {}
 _CHAT_LOCK = threading.Lock()
 
 
+def notebook_execution_enabled() -> bool:
+    """Opt in to the ZMQ/Jupyter backend only when explicitly requested.
+
+    The local HTTP server is multi-threaded.  In the current Python 3.13
+    environment, a busy Jupyter client's ZMQ background thread has crashed
+    the server process (SIGSEGV).  The in-process backend keeps the same
+    per-chat namespace without loading that unstable native transport.
+    """
+    return os.environ.get("SRNAGENT_USE_NOTEBOOK", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 def _chat_session_dir(chat_id: str) -> Path:
     return session_dir(chat_id)
 
 
 def _default_execution_config() -> ExecutionConfig:
     return ExecutionConfig(
-        use_notebook=True,
+        use_notebook=notebook_execution_enabled(),
         max_prompts_per_session=10_000,
         storage_dir=sessions_root(),
         strict_kernel_validation=False,

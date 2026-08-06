@@ -10,7 +10,7 @@ description: "sRNA-seq FASTQ QC pipeline: 3' adapter trimming with cutadapt, per
 
 Small RNA sequencing (sRNA-seq) produces short reads (18–50 bp) with a **3' adapter** ligated during library preparation. This adapter must be removed before mapping, and read quality should be verified. This skill covers the complete FASTQ QC pipeline using `sa.fastq.*` tools:
 
-> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
 
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|

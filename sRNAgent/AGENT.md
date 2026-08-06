@@ -1,22 +1,28 @@
 # sRNAgent Agent Guide
 
-## 数据架构：单模态单 adata，多模态才用 MuData
+## 数据架构：一个模态一个 AnnData
 
-不要把整个项目塞进一个 adata。每个 RNA 模态（miRNA / piRNA / tRNA / tRF）各自持独立的 AnnData；只有真正要做跨模态联合分析时，才升级到 MuData。
+不要把整个项目塞进一个 adata。不同数据模态必须使用各自独立的 AnnData；当前阶段不做跨模态联合分析，也不创建或保存 MuData。
+
+当前模态与 AnnData 的固定对应关系如下：
+
+| 模态名 | 对应 AnnData | 数据范围 |
+|--------|-------------|----------|
+| `srna` | `srna_adata` | 各类小 RNA 定量，如 miRNA、piRNA、tRNA、tRF 等 |
+| `fragmentomics` | `fragmentomics_adata` | 片段组学数据及其定量、片段特征和统计结果 |
+| `isomir` | `isomir_adata` | isomiR 定量及其异构体特征 |
+| `rna` | `rna_adata` | 转录组 RNA 表达定量和下游分析 |
+
+- 每个模态的 counts、`obs`、`var`、`layers`、`uns` 都只写入其对应的 adata；禁止混写。
+- miRNA、piRNA 与 tRNA/tRF 都属于同一个 `srna` 模态，三者定量必须写入同一个 `srna_adata`；不能称为多个模态或创建多个 adata。
+- 因此，“miRNA、tRNA 和片段组学定量”恰好是两个模态、两个独立 AnnData：`srna_adata` 与 `fragmentomics_adata`。
+- 即使样本相同，`srna`、`fragmentomics`、`isomir`、`rna` 仍是四个独立 adata，不能共享或覆盖彼此的 `X`、`var` 或定量结果。
+- 单独分析一个模态时，直接传入该模态的 AnnData。
 
 - **单模态（默认）**：全流程一个 adata 贯穿；工具按 obs / uns / X / var 留痕
-- **多模态**：每个模态一个独立 adata（各自走各自的 quant 流程），外层 MuData 聚合；工具默认对 `mod["<name>"]` 操作
-- 禁止把不同模态 counts 合并到同一个 adata.X、用 `var["rna_type"]` 隐式表达多模态、单模态硬上 MuData
-- 选型：只一种 RNA → AnnData；≥2 种且需联合分析 → 每种一个 adata + 外层 MuData
-
-## MuData 兼容规则：外层容器可用，但执行内核仍是 srna AnnData
-
-tool / skill 围绕 sRNA 模态的 AnnData 设计；若上层传入 MuData，默认取 `mdata.mod["srna"]` 作为执行对象，运行完成后再写回这个模态。
-
-- 允许：`AnnData` 直接输入
-- 允许：`MuData` 作为外层容器，默认操作 `mod="srna"`
-- 暂不支持：单次调用跨多个 mod 联合执行
-- 显式指定其他 mod 可通过 `mod=...`，未指定则默认 `srna`
+- **多模态并列处理**：每个模态一个独立 adata，各自走各自的 quant 流程；本阶段不得联合建模或合并。
+- 禁止把不同模态 counts 合并到同一个 adata.X，或用 `var["rna_type"]` 隐式表达多模态。
+- fragmentomics / isomir / RNA 任务必须显式使用各自模态的 adata，不能写回 `srna_adata`。
 
 ## 留痕规范：每步必须写回 adata
 

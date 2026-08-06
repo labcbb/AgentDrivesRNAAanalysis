@@ -10,7 +10,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 import anndata as ad  # noqa: E402
-import mudata as md  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pysam  # noqa: E402
@@ -108,17 +107,18 @@ def test_fragomics_returns_fragmentomics_anndata_when_input_has_no_counts():
         assert "RCD" in set(result.var["type"].astype(str))
 
 
-def test_fragomics_returns_mudata_when_input_already_has_srna_counts():
+def test_fragomics_returns_independent_anndata_when_input_has_srna_counts():
     with tempfile.TemporaryDirectory() as tmpdir:
         adata = _make_input_adata(Path(tmpdir), with_counts=True)
 
         result = sa.fragment.fragomics(adata, output_dir=str(Path(tmpdir) / "frag"), jobs=1)
 
-        assert isinstance(result, md.MuData)
-        assert set(result.mod.keys()) == {"srna", "fragmentomics"}
-        assert "counts" in result.mod["fragmentomics"].layers
-        assert "CPM" in result.mod["fragmentomics"].layers
-        assert "counts" in result.mod["srna"].layers
+        assert isinstance(result, ad.AnnData)
+        assert result.uns["modality"] == "fragmentomics"
+        assert "counts" in result.layers
+        assert "CPM" in result.layers
+        assert adata.shape == (1, 1)
+        assert "counts" in adata.layers
 
 
 def test_fragomics_rejects_unsorted_bam():

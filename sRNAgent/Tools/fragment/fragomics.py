@@ -382,6 +382,7 @@ def _build_fragmentomics_adata(
     cpm_export.to_csv(cpm_tsv, sep="\t", index=False)
 
     frag_adata.uns["genome_fasta"] = genome_fasta
+    frag_adata.uns["modality"] = "fragmentomics"
     frag_adata.uns["fragomics_output_dir"] = str(output_dir)
     frag_adata.uns["fragomics_raw_tsv"] = str(raw_tsv)
     frag_adata.uns["fragomics_cpm_tsv"] = str(cpm_tsv)
@@ -407,8 +408,7 @@ def _build_fragmentomics_adata(
         "Extract small-RNA fragmentomics features from QC-completed FASTQ files, "
         "coordinate-sorted whole-genome BAM files, and a reference genome FASTA. Computes "
         "FSD, FSC, RCD, EDM, and BPM features, writes per-sample tables plus "
-        "merged raw/CPM matrices, and returns fragmentomics AnnData or a "
-        "MuData containing srna + fragmentomics modalities."
+        "merged raw/CPM matrices, and returns an independent fragmentomics AnnData."
     ),
     examples=[
         'sa.fragment.fragomics(adata, genome_fasta="ref/GRCh38.primary_assembly.genome.fa")',
@@ -466,13 +466,10 @@ def fragomics(
 
     Returns
     -------
-    AnnData or MuData
-        - If the input ``adata`` does not already contain an expression matrix,
-          it is updated in-place with fragmentomics counts/CPM.
-        - If the input ``adata`` already stores sRNA expression, a MuData with
-          ``srna`` and ``fragmentomics`` modalities is returned. Callers should
-          capture the return value and handle the MuData branch explicitly
-          (for example via ``result.mod["fragmentomics"]`` and ``result.write(...)``).
+    AnnData
+        An independent fragmentomics AnnData. The input sRNA AnnData is used
+        only for sample-level input paths and is never modified or combined
+        with fragmentomics results.
     """
     if motif_k <= 0:
         raise ValueError("motif_k must be a positive integer.")
@@ -549,20 +546,4 @@ def fragomics(
         flush=True,
     )
 
-    if _has_srna_expression(adata):
-        try:
-            from mudata import MuData
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise ImportError(
-                "mudata is required to return a multi-modal result when the input "
-                "adata already contains sRNA expression."
-            ) from exc
-
-        mdata = MuData({"srna": adata, "fragmentomics": frag_adata})
-        mdata.uns["default_mod"] = "srna"
-        mdata.uns["fragmentomics_output_dir"] = str(out_dir)
-        mdata.uns["recommended_output"] = "srna_fragmentomics.h5mu"
-        return mdata
-
-    _replace_adata_inplace(adata, frag_adata)
-    return adata
+    return frag_adata

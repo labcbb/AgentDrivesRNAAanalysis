@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 import shutil
@@ -87,6 +88,100 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+def _canonicalize_thinking_steps(steps: Any) -> list[Dict[str, Any]]:
+    """Make persisted Thinking history idempotent across page reloads."""
+    if not isinstance(steps, list):
+        return []
+    result: list[Dict[str, Any]] = []
+    seen: set[str] = set()
+    plan_index: Optional[int] = None
+    for raw in steps:
+        if not isinstance(raw, dict):
+            continue
+        step = {
+            "id": str(raw.get("id") or "").strip(),
+            "kind": str(raw.get("kind") or "tool"),
+            "title": str(raw.get("title") or ""),
+            "body": str(raw.get("body") or ""),
+            "data": raw.get("data") if isinstance(raw.get("data"), (dict, list)) else None,
+            "roundId": str(raw.get("roundId") or "").strip(),
+        }
+        if step["kind"] == "plan":
+            # Plan events are snapshots, not separate Thinking rounds.
+            if plan_index is None:
+                plan_index = len(result)
+                result.append(step)
+            else:
+                result[plan_index] = step
+            continue
+        fingerprint = json.dumps(
+            [step["kind"], step["title"], step["body"], step["data"]],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        if step["id"]:
+            key = f"id:{step['id']}"
+        else:
+            key = f"legacy:{hashlib.sha1(fingerprint.encode('utf-8')).hexdigest()}"
+            step["id"] = key
+        if not step["roundId"] and step["kind"] in {"tool", "result"}:
+            step["roundId"] = _legacy_thinking_round_id(step) or f"legacy:{step['id']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(step)
+    if plan_index is not None and not result[plan_index].get("id"):
+        result[plan_index]["id"] = "legacy:plan"
+    return result
+
+
+def _legacy_thinking_round_id(step: Dict[str, Any]) -> str:
+    """Derive a stable legacy decision key from persisted stream IDs."""
+    if step.get("kind") not in {"tool", "result"}:
+        return ""
+    identifier = str(step.get("id") or "")
+    execution = re.match(r"^execution:([^:]+):(call_[^:]+):", identifier)
+    if execution:
+        return f"legacy:{execution.group(1)}:{execution.group(2)}"
+    stream = re.match(r"^stream:([^:]+):tool:(\d+)$", identifier)
+    if stream:
+        return f"legacy:{stream.group(1)}:tool:{stream.group(2)}"
+    return ""
+
+
+def _thinking_round_count(steps: list[Dict[str, Any]]) -> int:
+    """Count durable model rounds, or legacy tool decisions when unavailable."""
+    recorded = [str(step.get("roundId") or "") for step in steps]
+    recorded = [value for value in recorded if value]
+    trusted = [
+        value for value in recorded
+        if not value.startswith("legacy:") and not value.startswith("turn:")
+    ]
+    if trusted:
+        return len(set(trusted))
+    legacy = [_legacy_thinking_round_id(step) for step in steps]
+    legacy = [value for value in legacy if value]
+    if legacy:
+        return len(set(legacy))
+    return len(set(recorded))
+
+
+def _canonicalize_chat_messages(messages: Any) -> list[Dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    normalized: list[Dict[str, Any]] = []
+    for raw in messages:
+        if not isinstance(raw, dict):
+            continue
+        message = dict(raw)
+        if message.get("role") == "assistant" and isinstance(message.get("thinkingSteps"), list):
+            steps = _canonicalize_thinking_steps(message["thinkingSteps"])
+            message["thinkingSteps"] = steps
+            message["thinkingRoundCount"] = _thinking_round_count(steps)
+        normalized.append(message)
+    return normalized
 
 
 def _load_index() -> Dict[str, Any]:
@@ -286,7 +381,7 @@ def save_chat_record(
         normalized = {
             "id": chat_id,
             "title": str(chat.get("title") or "New Chat"),
-            "messages": chat.get("messages") if isinstance(chat.get("messages"), list) else [],
+            "messages": _canonicalize_chat_messages(chat.get("messages")),
             "codePanel": chat.get("codePanel") if isinstance(chat.get("codePanel"), list) else [],
             "createdAt": int(chat.get("createdAt") or 0) or int((existing or {}).get("createdAt") or 0) or now_ms,
             "updatedAt": int(chat.get("updatedAt") or 0) or now_ms,
@@ -307,6 +402,7 @@ def load_chat_record(chat_id: str) -> Optional[Dict[str, Any]]:
     payload = _read_json(session_dir(chat_id) / CHAT_FILE)
     if payload is None:
         return None
+    payload["messages"] = _canonicalize_chat_messages(payload.get("messages"))
     payload.setdefault("id", chat_id)
     lease = get_operator_lease(chat_id)
     if lease:

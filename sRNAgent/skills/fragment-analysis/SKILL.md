@@ -1,7 +1,7 @@
 ---
 name: fragment-analysis
 title: Fragmentomics Analysis
-description: Generate small-RNA fragmentomics features (FSD/FSC/RCD/EDM/BPM) from QC-completed FASTQ, coordinate-sorted whole-genome BAM, and reference FASTA; return fragmentomics AnnData or srna+fragmentomics MuData.
+description: Generate small-RNA fragmentomics features (FSD/FSC/RCD/EDM/BPM) from QC-completed FASTQ, coordinate-sorted whole-genome BAM, and reference FASTA; write an independent fragmentomics AnnData.
 ---
 
 # Fragmentomics Analysis
@@ -10,7 +10,7 @@ description: Generate small-RNA fragmentomics features (FSD/FSC/RCD/EDM/BPM) fro
 
 This skill extracts **small-RNA fragmentomics** features from QC-completed FASTQ files, coordinate-sorted **whole-genome** BAM files, and a reference genome FASTA using `sa.fragment.fragomics`.
 
-> MuData 兼容说明：当前 skill 仍只操作 `srna` 模态。若输入是 `MuData`，默认取 `mdata.mod["srna"]` 作为 `adata` 执行对象；未显式指定 `mod` 时不要切换到其他模态。
+> 当前阶段只做 `fragmentomics` 单模态统计，不做任何跨模态联合分析。片段组学结果必须作为独立的 fragmentomics AnnData 保存；不要因为输入来自小 RNA 定量流程而合并、比较或联合建模 `srna` 与 `fragmentomics`。
 
 The generated features include:
 
@@ -38,11 +38,8 @@ The generated features include:
    - 不接受 `SAM`，也不接受未排序的 `BAM`
    - 不接受转录组、小 RNA 参考库、局部参考序列上的 BAM
 4. **如果已经有小 RNA 定量结果**
-   - 直接运行 `result = sa.fragment.fragomics(...)`
-   - **必须把返回值当作 `MuData` 处理**
-   - 其中 `srna` 模态保留原有定量结果，`fragmentomics` 模态存放新特征
-   - 必须通过 `result.mod["fragmentomics"]` 访问片段组学结果，并优先写出 `srna_fragmentomics.h5mu`
-   - 不要把返回值直接当普通 `AnnData` 使用
+   - 直接运行 `frag = sa.fragment.fragomics(...)`
+   - 小 RNA adata 仅提供样本、FASTQ 和 BAM 路径；本次任务的交付物仍是独立的 fragmentomics AnnData
 5. **如果当前 adata 还没有小 RNA 表达矩阵**
    - 仍可运行 `sa.fragment.fragomics(...)`
    - 此时直接在当前 `adata` 上承载 fragmentomics 特征并返回 `AnnData`
@@ -135,11 +132,7 @@ fragmentomics_out/fragmentomics_cpm.tsv
 
 ### Returned object
 
-- If the input `adata` already contains small-RNA expression:
-  - returns `MuData({"srna": <old adata>, "fragmentomics": <new adata>})`
-- Otherwise:
-  - returns fragmentomics `AnnData`
-- 如果已有小 RNA 定量，**默认交付物应是 `srna_fragmentomics.h5mu`，而不是只留 fragmentomics 单模态 h5ad**
+- 本阶段始终返回独立的 fragmentomics `AnnData`，保存为 `fragmentomics.h5ad`。
 
 ### Fragmentomics AnnData fields
 
@@ -156,22 +149,19 @@ fragmentomics_out/fragmentomics_cpm.tsv
 
 ### Save results after analysis
 
-If the return value is still `AnnData`:
-
 ```python
-adata.write("fragmentomics_only.h5ad")
-```
-
-If the return value is `MuData`:
-
-```python
-mdata.write("srna_fragmentomics.h5mu")
+frag = sa.fragment.fragomics(
+    adata,
+    genome_fasta="ref/GRCh38.primary_assembly.genome.fa",
+    output_dir="fragmentomics_out",
+    jobs=8,
+)
+frag.write("fragmentomics.h5ad")
 ```
 
 ### Query existing results before rerunning
 
-- If `fragmentomics` modality already exists in `MuData`, inspect it first
-- If `adata.uns["fragomics_raw_tsv"]` already exists and the user only asks to view or summarise results, do **not** rerun
+- 如果已有 `fragmentomics.h5ad`，或其 `uns["fragomics_raw_tsv"]` 已存在，用户只要求查看或总结结果时，先读取现有结果，不要重跑
 - Only rerun when the user explicitly asks to recompute with new parameters
 
 ## Wrong vs Correct
@@ -207,10 +197,8 @@ result = sa.fragment.fragomics(
     adata,
     genome_fasta="ref/GRCh38.primary_assembly.genome.fa",
 )
-if hasattr(result, "mod"):
-    result.write("srna_fragmentomics.h5mu")
-else:
-    result.write("fragmentomics_only.h5ad")
+frag = result.mod["fragmentomics"] if hasattr(result, "mod") else result
+frag.write("fragmentomics.h5ad")
 ```
 
 ## References

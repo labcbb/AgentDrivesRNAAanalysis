@@ -11,11 +11,13 @@ import anndata as ad  # noqa: E402
 import mudata as md  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
+import scipy.sparse as sp  # noqa: E402
 import sRNAgent as sa  # noqa: E402
 from sRNAgent.agent.llm_client import ChatCompletion  # noqa: E402
 from sRNAgent.agent.srn_agent import SRNAgent, _audit_execute_code_policy  # noqa: E402
 from sRNAgent.agent.tools import rank_skill_matches, resolve_skill_query, search_skills  # noqa: E402
 from sRNAgent.skill_registry import SkillDefinition, SkillMetadata  # noqa: E402
+from sRNAgent.Tools.quant.tRAX import store_count_matrix  # noqa: E402
 
 
 class _FakeSkillRegistry:
@@ -123,6 +125,26 @@ def test_registered_adata_tool_accepts_mudata_default_srna_mod():
     assert list(result.mod["srna"].var_names) == ["gene_high"]
 
 
+def test_store_count_matrix_accepts_sparse_existing_counts():
+    adata = ad.AnnData(
+        X=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+        obs=pd.DataFrame(index=["S1", "S2"]),
+        var=pd.DataFrame({"rna_type": ["miRNA", "miRNA"]}, index=["m1", "m2"]),
+    )
+    adata.layers["counts"] = adata.X.copy()
+    adata.X = sp.csr_matrix(adata.X)
+    adata.layers["counts"] = sp.csr_matrix(adata.layers["counts"])
+
+    result = store_count_matrix(
+        adata,
+        sp.csr_matrix([[5.0], [6.0]]),
+        pd.DataFrame(index=["t1"]),
+        rna_type="tRNA",
+    )
+    assert result.shape == (2, 3)
+    assert result.layers["counts"].shape == (2, 3)
+
+
 def test_registered_adata_tool_accepts_mudata_explicit_mod():
     srna = ad.AnnData(
         X=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
@@ -207,27 +229,25 @@ def test_execute_code_policy_blocks_report_step_without_html_output():
     assert ".html" in result
 
 
-def test_execute_code_policy_blocks_fragomics_without_safe_result_handling():
+def test_execute_code_policy_requires_fragomics_result_assignment():
     messages = [
         {
             "role": "system",
             "content": (
                 "## High priority user requirements\n"
-                "- requirements.mudata_required = true\n"
-                "- requirement: 如果已经有小RNA定量，片段组学结果必须放在 MuData 下。\n"
+                "- requirements.mudata_required = false\n"
             ),
         }
     ]
     arguments = {
         "description": "运行片段组学",
         "code": (
-            "adata = sa.fragment.fragomics(adata, genome_fasta='ref/genome.fa')\n"
-            "print(adata.X.shape)\n"
+            "sa.fragment.fragomics(adata, genome_fasta='ref/genome.fa')\n"
         ),
     }
     result = _audit_execute_code_policy(messages, arguments)
     assert "POLICY_VIOLATION" in result
-    assert "MuData" in result
+    assert "fragmentomics AnnData" in result
 
 
 def test_execute_code_policy_respects_default_unpaired_requirement_flag():
