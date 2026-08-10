@@ -22,6 +22,7 @@ from .context import (
 from .execution import ExecutionBackend, initialize_execution_backend
 from .llm_client import ChatClient, LLMConfig
 from .plan_orchestrator import PlanOrchestrator
+from .task_supervisor import TaskProgressSupervisor
 from .tools import (
     AGENT_TOOL_SCHEMAS,
     execute_code,
@@ -54,6 +55,7 @@ _SIZE_RE = re.compile(
 _DOWNLOAD_CMD_RE = re.compile(r"\b(curl|wget|urllib|requests\.get|fastq[\-_]?dl)\b", re.IGNORECASE)
 _CURL_OUT_RE = re.compile(r"""[-]o\s+['"]?([^\s'"]+)['"]?""", re.IGNORECASE)
 _OUT_PATH_RE = re.compile(r"\bOut:\s*(\S+)", re.IGNORECASE)
+_ELAPSED_REPLY_RE = re.compile(r"(?:\n\s*)*⏱️?\s*本次回答耗时[^\n]*", re.IGNORECASE)
 _FILE_PATH_RE = re.compile(
     r"[\w./-]+\.(?:fastq(?:\.gz)?|fa(?:\.gz)?|fasta(?:\.gz)?|gtf(?:\.gz)?|sra|bam|fq(?:\.gz)?)",
     re.IGNORECASE,
@@ -65,7 +67,7 @@ _REFERENCE_DL_RE = re.compile(
     re.IGNORECASE,
 )
 _OUTDIR_RE = re.compile(r"""output_dir\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
-_TRAX_QUANT_CODE_RE = re.compile(r"sa\.quant\.trax_quant\s*\(", re.IGNORECASE)
+_SAMPLE_PROGRESS_RE = re.compile(r"\bprogress:\s*\d+\s*/\s*\d+", re.IGNORECASE)
 _INTERNAL_REPORT_RE = re.compile(
     r"已向用户|已向用户发送|已向.*发送|等待.{0,8}下一步|等待用户|"
     r"task completed|step (is )?done|waiting for (the )?user|"
@@ -373,6 +375,10 @@ def _progress_summary(parsed: Dict[str, Any], fallback: str) -> str:
         return "execute_code — 当前任务：tRNA 定量"
     if any(token in lower for token in ("bowtie", "align", "alignment")):
         return "execute_code — 当前任务：序列比对"
+    # seqcluster consumes trimmed FASTQ, so its descriptions often contain
+    # "trim". Classify the active operation before the generic trim fallback.
+    if any(token in lower for token in ("seqcluster", "collapse", "序列折叠", "去重")):
+        return "execute_code — 当前任务：序列折叠 / 去重"
     if any(token in lower for token in ("cutadapt", "trim")):
         return "execute_code — 当前任务：接头修剪"
     if any(token in lower for token in ("fastqc", "multiqc", " qc ")):
@@ -917,46 +923,10 @@ def _merge_execution_progress(
     return merged
 
 
-def _infer_trax_progress(workspace: Optional[Path], code: str) -> Dict[str, Any]:
-    """Read tRAX's durable BAM outputs when in-process stdout is buffered."""
-    if workspace is None or not _TRAX_QUANT_CODE_RE.search(code or ""):
-        return {}
-    output_match = _OUTDIR_RE.search(code or "")
-    output_dir = Path(output_match.group(1) if output_match else "trax_out").expanduser()
-    if not output_dir.is_absolute():
-        output_dir = workspace / output_dir
-    bam_dir = output_dir / "bam"
-    if not bam_dir.exists():
-        return {}
-
-    sample_files = sorted(output_dir.glob("*-samples.txt"), key=lambda path: path.stat().st_mtime)
-    if not sample_files:
-        return {}
-    try:
-        total = sum(
-            1 for line in sample_files[-1].read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        )
-    except OSError:
-        return {}
-    if total <= 0:
-        return {}
-    done = len(list(bam_dir.glob("*.bam")))
-    stage = f"已完成 {min(done, total)}/{total} 样本"
-    return {
-        "stage": stage,
-        "highlights": [f"tRAX 已生成 {min(done, total)}/{total} 个 BAM"],
-        "detail": stage,
-    }
-
-
 def _parse_progress_output(text: str, *, workspace: Optional[Path] = None, code: str = "") -> Dict[str, Any]:
     cleaned = _strip_terminal_noise(text)
     if not cleaned:
         base = {"stage": "等待输出", "highlights": [], "detail": ""}
-        trax_progress = _infer_trax_progress(workspace, code)
-        if trax_progress:
-            base.update(trax_progress)
         return _merge_execution_progress(base, workspace, text, code)
 
     candidates: List[str] = []
@@ -986,8 +956,8 @@ def _parse_progress_output(text: str, *, workspace: Optional[Path] = None, code:
     highlights = highlights[-4:]
     stage = _infer_progress_stage(highlights or candidates)
     detail = _truncate_result("\n".join(highlights or candidates[-2:]), 180)
-    # tRAX 等工具的累计进度标记（如 '[trax] progress: 12/30'）：
-    # 覆盖 stage 显示"已完成 N/M 样本"，让用户能直观看到批量任务进度
+    # Any tool may emit a cumulative ``progress: N/M`` marker. Display it
+    # as sample progress without coupling the UI to a specific tool.
     progress_match = re.search(r"progress:\s*(\d+)\s*/\s*(\d+)", cleaned)
     if progress_match:
         done_n, total_n = int(progress_match.group(1)), int(progress_match.group(2))
@@ -1006,9 +976,6 @@ def _parse_progress_output(text: str, *, workspace: Optional[Path] = None, code:
         "detail": detail,
         **_parse_download_progress_marker(text),
     }
-    trax_progress = _infer_trax_progress(workspace, code)
-    if trax_progress:
-        base.update(trax_progress)
     return _merge_execution_progress(base, workspace, text, code)
 
 
@@ -1174,6 +1141,7 @@ class SRNAgent:
         arguments: Dict[str, Any],
         *,
         on_stream: Optional[StreamCallback] = None,
+        supervisor: Optional[TaskProgressSupervisor] = None,
     ) -> str:
         if name == "search_functions":
             return search_functions(self.function_registry, arguments.get("query", ""))
@@ -1185,6 +1153,7 @@ class SRNAgent:
                 self.project_root,
                 execution_backend=self.execution,
                 on_stream=on_stream,
+                supervisor=supervisor,
             )
         if name == "finish":
             return arguments.get("message", "Done.")
@@ -1422,6 +1391,22 @@ class SRNAgent:
         start_box: List[Optional[float]] = [None]
         code_text = str(arguments.get("code") or "")
         workspace = self._execution_workspace()
+        supervisor = TaskProgressSupervisor(
+            workspace=workspace,
+            code=code_text,
+            namespace_provider=lambda: self.execution.in_process_ns,
+        )
+
+        def supervised_progress(raw_stream: str) -> Dict[str, Any]:
+            parsed = _parse_progress_output(raw_stream, workspace=workspace, code=code_text)
+            observed = supervisor.snapshot()
+            # A tool-provided N/M marker is the most precise signal. Otherwise
+            # use generic process/filesystem telemetry to avoid a blank card.
+            if not _SAMPLE_PROGRESS_RE.search(raw_stream):
+                parsed["stage"] = observed["stage"]
+                parsed["detail"] = observed["detail"]
+                parsed["highlights"] = observed["highlights"]
+            return parsed
 
         def on_stream(kind: str, text: str) -> None:
             key = "stderr" if kind == "stderr" else "stdout"
@@ -1434,8 +1419,11 @@ class SRNAgent:
             if now - last_stream_progress[0] < 0.2:
                 return
             combined = stream_state["stdout"] or stream_state["stderr"]
-            parsed = _parse_progress_output(combined, workspace=workspace, code=code_text)
-            if not _has_download_progress_fields(parsed):
+            parsed = supervised_progress(combined)
+            if not (
+                _has_download_progress_fields(parsed)
+                or _SAMPLE_PROGRESS_RE.search(combined)
+            ):
                 return
             last_stream_progress[0] = now
             elapsed = now - start_box[0]
@@ -1462,6 +1450,7 @@ class SRNAgent:
                     "execute_code",
                     arguments,
                     on_stream=on_stream,
+                    supervisor=supervisor,
                 )
             except Exception as exc:  # noqa: BLE001
                 result_box["error"] = exc
@@ -1495,6 +1484,7 @@ class SRNAgent:
 
         while thread.is_alive():
             if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                supervisor.terminate_active_processes()
                 self._interrupt_running_code()
                 raise AgentCancelledError("Agent run cancelled.")
             thread.join(timeout=1.0)
@@ -1503,7 +1493,12 @@ class SRNAgent:
 
             now = time.monotonic()
             raw_stream = stream_state["stdout"] or stream_state["stderr"]
-            if raw_stream:
+            telemetry = supervisor.snapshot()
+            if (
+                raw_stream
+                or telemetry.get("activeProcess")
+                or telemetry.get("recentArtifactChange")
+            ):
                 last_output_at = now
             elif (
                 not timed_out
@@ -1524,7 +1519,7 @@ class SRNAgent:
             if on_progress and now - last_sse_heartbeat >= _SSE_PROGRESS_HEARTBEAT_SEC:
                 elapsed = now - start
                 raw_stream = stream_state["stdout"] or stream_state["stderr"]
-                parsed = _parse_progress_output(raw_stream, workspace=workspace, code=code_text)
+                parsed = supervised_progress(raw_stream)
                 progress_summary = _progress_summary(parsed, summary)
                 self._emit_progress(
                     on_progress,
@@ -1548,7 +1543,7 @@ class SRNAgent:
 
             elapsed = now - start
             raw_stream = stream_state["stdout"] or stream_state["stderr"]
-            parsed = _parse_progress_output(raw_stream, workspace=workspace, code=code_text)
+            parsed = supervised_progress(raw_stream)
             progress_summary = _progress_summary(parsed, summary)
             self._emit_progress(
                 on_progress,
@@ -1679,11 +1674,29 @@ class SRNAgent:
                         return message
 
                     if call.name == "execute_code":
-                        code = str(call.arguments.get("code") or "")
+                        raw_code = call.arguments.get("code")
+                        if isinstance(raw_code, dict):
+                            code = next(
+                                (
+                                    value for key in ("$text", "text")
+                                    if isinstance((value := raw_code.get(key)), str)
+                                ),
+                                "",
+                            )
+                        else:
+                            code = raw_code if isinstance(raw_code, str) else ""
                         description = str(call.arguments.get("description") or "")
-                        policy_violation = _audit_execute_code_policy(messages, call.arguments)
+                        tool_arguments = dict(call.arguments)
+                        if code:
+                            tool_arguments["code"] = code
+                        policy_violation = _audit_execute_code_policy(messages, tool_arguments)
                         approved = True
-                        if policy_violation:
+                        if not code:
+                            result = (
+                                "TOOL_INPUT_ERROR: execute_code.code must be a non-empty string. "
+                                "Call execute_code again with Python source in the code field."
+                            )
+                        elif policy_violation:
                             result = policy_violation
                         elif code_approval_callback is not None:
                             request_id = str(uuid.uuid4())
@@ -1695,7 +1708,7 @@ class SRNAgent:
                                 )
                             elif on_progress is not None:
                                 result = self._run_execute_code_with_progress(
-                                    call.arguments,
+                                    tool_arguments,
                                     on_progress=on_progress,
                                     cancel_event=cancel_event,
                                     turn=turn + 1,
@@ -1704,7 +1717,7 @@ class SRNAgent:
                                     tool_call_id=call.id,
                                 )
                             else:
-                                result = self.dispatch_tool(call.name, call.arguments)
+                                result = self.dispatch_tool(call.name, tool_arguments)
                         elif not approved:
                             result = (
                                 "User denied code execution. Explain what the code would do "
@@ -1712,7 +1725,7 @@ class SRNAgent:
                             )
                         elif on_progress is not None:
                             result = self._run_execute_code_with_progress(
-                                call.arguments,
+                                tool_arguments,
                                 on_progress=on_progress,
                                 cancel_event=cancel_event,
                                 turn=turn + 1,
@@ -1721,7 +1734,7 @@ class SRNAgent:
                                 tool_call_id=call.id,
                             )
                         else:
-                            result = self.dispatch_tool(call.name, call.arguments)
+                            result = self.dispatch_tool(call.name, tool_arguments)
                     else:
                         result = self.dispatch_tool(call.name, call.arguments)
 
@@ -1785,6 +1798,9 @@ class SRNAgent:
         if not attach or not answer:
             return answer
         elapsed = time.time() - started_at
+        # A retry/rewrite can carry an earlier duration line in its text.
+        # The user-facing response has exactly one elapsed-time footer.
+        answer = _ELAPSED_REPLY_RE.sub("", answer).rstrip()
         return f"{answer}\n\n⏱️ 本次回答耗时 {_format_elapsed(elapsed)}"
 
     def run(self, user_query: str) -> str:

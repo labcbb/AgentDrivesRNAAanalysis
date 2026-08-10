@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from importlib import import_module
 
+from ._pandas import configure_pandas_string_storage
 from . import agent
 from ._registry import (
     export_registry,
@@ -22,7 +23,7 @@ __version__ = "0.1.0"
 
 
 def __getattr__(name: str):
-    if name in {"alignment", "diff", "fastq", "fragment", "quant", "reference"}:
+    if name in {"alignment", "diff", "download", "fastq", "fragment", "prediction", "quant", "reference", "target"}:
         return import_module(f".Tools.{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -30,10 +31,13 @@ __all__ = [
     "agent",
     "alignment",
     "diff",
+    "download",
     "fastq",
     "fragment",
+    "prediction",
     "quant",
     "reference",
+    "target",
     "SRNAgent",
     "SkillRegistry",
     "build_skill_registry",

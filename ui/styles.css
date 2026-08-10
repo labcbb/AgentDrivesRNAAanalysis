@@ -1977,7 +1977,124 @@ a {
 }
 
 .chat-text {
+  min-width: 0;
+}
+
+.chat-text p {
+  margin: 0 0 10px;
   white-space: pre-wrap;
+}
+
+.chat-text p:last-child {
+  margin-bottom: 0;
+}
+
+.chat-text h3,
+.chat-text h4,
+.chat-text h5,
+.chat-text h6 {
+  margin: 16px 0 8px;
+  color: var(--text-strong);
+  line-height: 1.35;
+}
+
+.chat-text h3 { font-size: 17px; }
+.chat-text h4 { font-size: 15px; }
+.chat-text h5,
+.chat-text h6 { font-size: 14px; }
+
+.chat-text h3:first-child,
+.chat-text h4:first-child,
+.chat-text h5:first-child,
+.chat-text h6:first-child {
+  margin-top: 0;
+}
+
+.chat-text ul,
+.chat-text ol {
+  margin: 6px 0 12px;
+  padding-left: 22px;
+}
+
+.chat-text li + li {
+  margin-top: 3px;
+}
+
+.chat-text code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent-subtle) 58%, var(--panel));
+  color: var(--text-strong);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.9em;
+}
+
+.chat-text pre {
+  margin: 10px 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  white-space: pre;
+}
+
+.chat-text pre code {
+  padding: 0;
+  background: transparent;
+  color: inherit;
+}
+
+.chat-text blockquote {
+  margin: 10px 0;
+  padding: 4px 0 4px 12px;
+  border-left: 3px solid var(--accent);
+  color: var(--muted);
+}
+
+.chat-text hr {
+  height: 1px;
+  margin: 14px 0;
+  border: 0;
+  background: var(--border);
+}
+
+.chat-text a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.chat-markdown__table-wrap {
+  max-width: 100%;
+  margin: 10px 0;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.chat-text table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.chat-text th,
+.chat-text td {
+  padding: 7px 9px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.chat-text th {
+  color: var(--text-strong);
+  background: color-mix(in srgb, var(--panel) 88%, var(--accent-subtle));
+}
+
+.chat-text tr:last-child td {
+  border-bottom: 0;
 }
 
 .chat-text--loading {

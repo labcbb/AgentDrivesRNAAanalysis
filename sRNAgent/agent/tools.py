@@ -6,13 +6,31 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .execution import ExecutionBackend, execute_agent_code
+from .task_supervisor import TaskProgressSupervisor
 from ..skill_registry import SkillDefinition, SkillMetadata, SkillRegistry
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.IGNORECASE)
+_EXPLICIT_QUANT_METHOD_RE = re.compile(
+    r"feature[-_ ]?counts?|idxstats?|samtools|mirdeep(?:2)?|mirtop|trax",
+    re.IGNORECASE,
+)
 
 
 def _tokenize(text: str) -> List[str]:
     return [token.lower() for token in _TOKEN_RE.findall(str(text or "")) if token.strip()]
+
+
+def _default_quantification_skills(query: str) -> set[str]:
+    """Return independent defaults when a request contains multiple RNA types."""
+    lowered = str(query or "").lower()
+    if _EXPLICIT_QUANT_METHOD_RE.search(lowered):
+        return set()
+    defaults: set[str] = set()
+    if "pirna" in lowered:
+        defaults.add("samtools_idxstats")
+    if "mirna" in lowered or "micro-rna" in lowered or "microrna" in lowered:
+        defaults.add("mirdeep2-mirna")
+    return defaults
 
 
 def rank_skill_matches(
@@ -27,6 +45,7 @@ def rank_skill_matches(
 
     query_lower = raw_query.lower()
     query_tokens = _tokenize(raw_query)
+    default_skills = _default_quantification_skills(raw_query)
     scored: List[Tuple[SkillMetadata, int]] = []
 
     for meta in skill_registry.skill_metadata.values():
@@ -53,6 +72,12 @@ def rank_skill_matches(
                 score += 18
             elif token in searchable:
                 score += 10
+
+        # Biological defaults are stronger than generic keyword overlap.  This
+        # keeps piRNA requests on FASTA-level idxstats and miRNA requests on
+        # miRDeep2, while an explicitly named method remains authoritative.
+        if slug in default_skills:
+            score += 200
 
         if score > 0:
             scored.append((meta, score))
@@ -134,12 +159,15 @@ def execute_code(
     project_root: Path,
     execution_backend: Optional[ExecutionBackend] = None,
     on_stream: Optional[Callable[[str, str], None]] = None,
+    supervisor: Optional[TaskProgressSupervisor] = None,
 ) -> str:
     if execution_backend is None:
         from .execution import initialize_execution_backend
 
         execution_backend = initialize_execution_backend(project_root=project_root)
-    return execute_agent_code(execution_backend, code, project_root, on_stream=on_stream)
+    return execute_agent_code(
+        execution_backend, code, project_root, on_stream=on_stream, supervisor=supervisor,
+    )
 
 
 AGENT_TOOL_SCHEMAS = [

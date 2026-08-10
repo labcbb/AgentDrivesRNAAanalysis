@@ -12,6 +12,8 @@ This skill extracts **small-RNA fragmentomics** features from QC-completed FASTQ
 
 > 当前阶段只做 `fragmentomics` 单模态统计，不做任何跨模态联合分析。片段组学结果必须作为独立的 fragmentomics AnnData 保存；不要因为输入来自小 RNA 定量流程而合并、比较或联合建模 `srna` 与 `fragmentomics`。
 
+> ⚡ **批量样本并行：** `sa.fragment.fragomics(..., jobs=N)` 使用统一 work tracker，在每个样本完成后输出 `progress: N/M` 和 `inflight:`，可直接由 UI 显示。调用 API 时只传 `jobs`，不要再手写线程池、Semaphore 或等待全部任务结束后才汇总。
+
 The generated features include:
 
 | Feature type | Meaning | Primary input |

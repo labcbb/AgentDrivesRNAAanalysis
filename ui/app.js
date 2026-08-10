@@ -397,15 +397,46 @@ function countInflightSamples(text) {
   const payload = value.split(/[:：]/).slice(1).join(":").trim();
   if (!payload) return 0;
   if (payload === "[]" || payload === "{}" || payload === "()") return 0;
-  return 1;
+  const sampleIds = payload.match(/\b(?:SRR|ERR|DRR)\d+\b/gi);
+  if (sampleIds?.length) return new Set(sampleIds.map((item) => item.toUpperCase())).size;
+  const items = payload.split(",").map((item) => item.trim()).filter(Boolean);
+  return items.length || 1;
 }
 
 function extractExecutionConcurrency(artifact) {
-  const text = `${artifact?.description || ""} ${artifact?.stage || ""} ${artifact?.progressLabel || ""}`;
-  const jobsMatch = text.match(/\bjobs\s*=\s*(\d+)/i);
-  if (jobsMatch) {
-    const jobs = Number(jobsMatch[1]);
-    if (Number.isFinite(jobs) && jobs > 0) return jobs;
+  const text = [
+    artifact?.description,
+    artifact?.stage,
+    artifact?.progressLabel,
+    artifact?.code,
+  ].filter(Boolean).join(" ");
+  const patterns = [
+    /\bjobs\s*=\s*(\d+)/i,
+    /\bmax_workers\s*=\s*(\d+)/i,
+    /\bN_PARALLEL\s*=\s*(\d+)/i,
+    /(\d+)\s*(?:个|路)?\s*(?:样本)?\s*(?:并行|并发|parallel|concurrent)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const workers = Number(match[1]);
+    if (Number.isFinite(workers) && workers > 0) return workers;
+  }
+  return null;
+}
+
+function inferBatchTotal(artifact) {
+  const text = [artifact?.description, artifact?.stage, artifact?.progressLabel, artifact?.code]
+    .filter(Boolean).join(" ");
+  const patterns = [
+    /[×x]\s*(\d+)\s*(?:个)?\s*(?:样本|samples?)/i,
+    /(?:总样本|total\s*(?:samples?)?)\s*[:：=]?\s*(\d+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const total = Number(match[1]);
+    if (Number.isFinite(total) && total > 0) return total;
   }
   return null;
 }
@@ -434,6 +465,11 @@ function inferExecutionPhaseLabel(payload = {}) {
   }
   if (/bowtie|align|alignment|比对/.test(joined) || /bowtie|align/.test(lower)) {
     return "当前任务：序列比对";
+  }
+  // seqcluster descriptions mention trimmed FASTQ as an input; recognize the
+  // operation itself before falling back to the generic trim label.
+  if (/seqcluster|collapse|序列折叠|去重/.test(joined) || /seqcluster|collapse/.test(lower)) {
+    return "当前任务：序列折叠 / 去重";
   }
   if (/cutadapt|trim|修剪|去接头/.test(joined) || /cutadapt|trim/.test(lower)) {
     return "当前任务：接头修剪";
@@ -507,6 +543,11 @@ function extractBatchExecutionSummary(artifact) {
       total = Number(batchMatch[2]);
       return;
     }
+    const artifactMatch = text.match(/(?:已完成|已发现)\s*(\d+)\s*个样本级\s*GFF/i);
+    if (artifactMatch) {
+      done = Number(artifactMatch[1]);
+      return;
+    }
     const progressMatch = text.match(/^progress\s*:\s*(\d+)\s*\/\s*(\d+)/i);
     if (progressMatch) {
       done = Number(progressMatch[1]);
@@ -517,6 +558,8 @@ function extractBatchExecutionSummary(artifact) {
       running = countInflightSamples(text);
     }
   });
+
+  if (!Number.isFinite(total) || total == null) total = inferBatchTotal(artifact);
 
   if ((!Number.isFinite(running) || running == null) && !artifact?.done && !artifact?.stopped) {
     const jobs = extractExecutionConcurrency(artifact);
@@ -1106,6 +1149,19 @@ async function fetchRunStatus(chatId) {
     return await window.fetchAgentRunStatus(chatId);
   } catch {
     return null;
+  }
+}
+
+async function recoverPersistedFinalReply(chatId) {
+  if (!chatId || !window.fetchChatSessionDetail) return "";
+  try {
+    const detail = await window.fetchChatSessionDetail(chatId);
+    const messages = Array.isArray(detail?.chat?.messages) ? detail.chat.messages : [];
+    const lastAssistant = [...messages].reverse().find((item) => item?.role === "assistant");
+    const text = stripExecutionMemoryBlock(lastAssistant?.content || "");
+    return text && !isPlaceholderAssistantContent(text) ? text : "";
+  } catch {
+    return "";
   }
 }
 
@@ -2256,6 +2312,166 @@ async function initChatSessions() {
   void resumeBackgroundRunIfNeeded(activeChatId);
 }
 
+function appendMarkdownInline(target, text) {
+  const source = String(text || "");
+  const token = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^\s)]+\))/g;
+  let cursor = 0;
+  let match;
+  while ((match = token.exec(source)) !== null) {
+    if (match.index > cursor) target.append(document.createTextNode(source.slice(cursor, match.index)));
+    const value = match[0];
+    if (value.startsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = value.slice(2, -2);
+      target.append(strong);
+    } else if (value.startsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = value.slice(1, -1);
+      target.append(code);
+    } else {
+      const link = /^\[([^\]]+)\]\(([^\s)]+)\)$/.exec(value);
+      const href = link?.[2] || "";
+      if (/^https?:\/\//i.test(href)) {
+        const anchor = document.createElement("a");
+        anchor.href = href;
+        anchor.target = "_blank";
+        anchor.rel = "noopener noreferrer";
+        anchor.textContent = link[1];
+        target.append(anchor);
+      } else {
+        target.append(document.createTextNode(link?.[1] || value));
+      }
+    }
+    cursor = match.index + value.length;
+  }
+  if (cursor < source.length) target.append(document.createTextNode(source.slice(cursor)));
+}
+
+function isMarkdownTableLine(line) {
+  return /^\s*\|?.+\|.+\|?\s*$/.test(line);
+}
+
+function isMarkdownTableSeparator(line) {
+  return /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+}
+
+function markdownTableCells(line) {
+  return line.trim().replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
+}
+
+function renderMarkdown(target, text) {
+  target.replaceChildren();
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    if (/^\s*```/.test(line)) {
+      const language = line.replace(/^\s*```/, "").trim();
+      const codeLines = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```/.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (language) code.dataset.language = language;
+      code.textContent = codeLines.join("\n");
+      pre.append(code);
+      target.append(pre);
+      continue;
+    }
+    if (isMarkdownTableLine(line) && index + 1 < lines.length && isMarkdownTableSeparator(lines[index + 1])) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "chat-markdown__table-wrap";
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const headerRow = document.createElement("tr");
+      markdownTableCells(line).forEach((cell) => {
+        const th = document.createElement("th");
+        appendMarkdownInline(th, cell);
+        headerRow.append(th);
+      });
+      thead.append(headerRow);
+      table.append(thead);
+      const tbody = document.createElement("tbody");
+      index += 2;
+      while (index < lines.length && isMarkdownTableLine(lines[index])) {
+        const row = document.createElement("tr");
+        markdownTableCells(lines[index]).forEach((cell) => {
+          const td = document.createElement("td");
+          appendMarkdownInline(td, cell);
+          row.append(td);
+        });
+        tbody.append(row);
+        index += 1;
+      }
+      table.append(tbody);
+      wrapper.append(table);
+      target.append(wrapper);
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+    if (heading) {
+      const title = document.createElement(`h${heading[1].length + 2}`);
+      appendMarkdownInline(title, heading[2]);
+      target.append(title);
+      index += 1;
+      continue;
+    }
+    const quote = /^>\s?(.*)$/.exec(line);
+    if (quote) {
+      const blockquote = document.createElement("blockquote");
+      appendMarkdownInline(blockquote, quote[1]);
+      target.append(blockquote);
+      index += 1;
+      continue;
+    }
+    const listMatch = /^\s*[-*+]\s+(.+)$/.exec(line);
+    const orderedMatch = /^\s*\d+[.)]\s+(.+)$/.exec(line);
+    if (listMatch || orderedMatch) {
+      const list = document.createElement(orderedMatch ? "ol" : "ul");
+      const itemPattern = orderedMatch ? /^\s*\d+[.)]\s+(.+)$/ : /^\s*[-*+]\s+(.+)$/;
+      while (index < lines.length) {
+        const itemMatch = itemPattern.exec(lines[index]);
+        if (!itemMatch) break;
+        const item = document.createElement("li");
+        appendMarkdownInline(item, itemMatch[1]);
+        list.append(item);
+        index += 1;
+      }
+      target.append(list);
+      continue;
+    }
+    if (/^\s*(?:---|\*\*\*|___)\s*$/.test(line)) {
+      target.append(document.createElement("hr"));
+      index += 1;
+      continue;
+    }
+    const paragraph = document.createElement("p");
+    const paragraphLines = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^\s*```/.test(lines[index])
+      && !/^(#{1,4})\s+/.test(lines[index]) && !/^>\s?/.test(lines[index])
+      && !/^\s*(?:[-*+]\s+|\d+[.)]\s+)/.test(lines[index])) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    appendMarkdownInline(paragraph, paragraphLines.join("\n"));
+    target.append(paragraph);
+  }
+}
+
+function renderChatText(textEl, text, role) {
+  if (role === "assistant") renderMarkdown(textEl, stripExecutionMemoryBlock(text));
+  else textEl.textContent = text;
+}
+
 function appendMessage(role, text, options = {}) {
   if (!threadInner) return null;
 
@@ -2271,7 +2487,7 @@ function appendMessage(role, text, options = {}) {
     textEl.classList.add("chat-text--loading");
     textEl.textContent = "思考中…";
   } else {
-    textEl.textContent = text;
+    renderChatText(textEl, text, role);
   }
   threadInner.appendChild(group);
   scrollThreadToBottom();
@@ -2357,12 +2573,14 @@ function resolvePlanSnapshotTitle(goal, eventType = "") {
   const baseTitle = String(goal || "").trim() || "当前流程";
   if (eventType === "plan_revised") return `${baseTitle}（已更新）`;
   if (eventType === "plan_complete") return `${baseTitle}（已完成）`;
+  if (eventType === "plan_incomplete" || eventType === "plan_failed") return `${baseTitle}（未完成）`;
   return baseTitle;
 }
 
 function summarizePlanStepStatus(status) {
   if (status === "done") return { mark: "✓", label: "已完成" };
   if (status === "running") return { mark: "▶", label: "进行中" };
+  if (status === "awaiting_approval") return { mark: "?", label: "等待确认" };
   if (status === "interrupted") return { mark: "!", label: "已中断" };
   if (status === "failed") return { mark: "✗", label: "失败" };
   return { mark: "○", label: "待执行" };
@@ -2373,6 +2591,7 @@ function buildThinkingPlanData(plan, eventType = "", message = "") {
   const done = steps.filter((step) => step?.status === "done").length;
   const running = steps.filter((step) => step?.status === "running").length;
   const interrupted = steps.filter((step) => step?.status === "interrupted").length;
+  const awaitingApproval = steps.filter((step) => step?.status === "awaiting_approval").length;
   const failed = steps.filter((step) => step?.status === "failed").length;
   const pending = Math.max(0, steps.length - done - running - interrupted - failed);
   const autoInserted = steps.filter((step) => step?.autoInserted);
@@ -2383,6 +2602,7 @@ function buildThinkingPlanData(plan, eventType = "", message = "") {
     done,
     running,
     interrupted,
+    awaitingApproval,
     failed,
     pending,
     autoInsertedCount: autoInserted.length,
@@ -2448,6 +2668,7 @@ function renderPlanThinkingStep(item, step) {
   ];
   if ((Number(data.failed) || 0) > 0) statItems.push(["失败", Number(data.failed) || 0]);
   if ((Number(data.interrupted) || 0) > 0) statItems.push(["中断", Number(data.interrupted) || 0]);
+  if ((Number(data.awaitingApproval) || 0) > 0) statItems.push(["等待确认", Number(data.awaitingApproval) || 0]);
   if (autoInsertedCount > 0) statItems.push(["自动补全", autoInsertedCount]);
 
   statItems.forEach(([label, value]) => {
@@ -2722,6 +2943,39 @@ function markRunningExecutionsStopped() {
     applyExecutionStoppedCard(card);
   });
   activeCodeExecutionId = null;
+}
+
+function finishRunningExecutionsCompleted(chatId = activeChatId) {
+  const chat = chatId === activeChatId ? getActiveChatRecord() : getChatRecord(chatId);
+  if (!chat?.codePanel || !Array.isArray(chat.codePanel)) return;
+  let changed = false;
+  chat.codePanel = chat.codePanel.map((item) => {
+    if (
+      item?.type !== "execution"
+      || item.id === BACKGROUND_EXECUTION_ID
+      || item.done
+      || item.stopped
+    ) {
+      return item;
+    }
+    changed = true;
+    return stripDownloadProgressFields({
+      ...item,
+      title: "代码运行完成",
+      stage: "已完成",
+      done: true,
+      stopped: false,
+      hint: "",
+    });
+  });
+  if (!changed) return;
+  if (chatId === activeChatId) {
+    persistActiveChat();
+    renderCodePanel(chat.codePanel, { interactive: false });
+  } else {
+    saveChatStore();
+    scheduleServerSessionSave(chatId);
+  }
 }
 
 function getExecutionCard(executionId) {
@@ -3703,9 +3957,11 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     || event.type === "plan_step_done"
     || event.type === "plan_step_failed"
     || event.type === "plan_complete"
+    || event.type === "plan_incomplete"
+    || event.type === "plan_failed"
   ) {
     const msg = event.message || "";
-    const isFinalPlanEvent = event.type === "plan_complete";
+    const isFinalPlanEvent = event.type === "plan_complete" || event.type === "plan_incomplete" || event.type === "plan_failed";
     if (msg && (isFinalPlanEvent || canOverwriteAssistantContent(assistantEntry, msg))) {
       if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
         freezeAssistantFinalText(assistantEntry, msg);
@@ -3744,6 +4000,7 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     return;
   }
   if (event.type === "done" && event.text) {
+    finishRunningExecutionsCompleted(streamChatId);
     freezeAssistantFinalText(assistantEntry, stripExecutionMemoryBlock(event.text));
     return;
   }
@@ -3842,11 +4099,13 @@ function handleAgentStreamEvent(group, event) {
     event.type === "plan_step_start" ||
     event.type === "plan_step_done" ||
     event.type === "plan_step_failed" ||
-    event.type === "plan_complete"
+    event.type === "plan_complete" ||
+    event.type === "plan_incomplete" ||
+    event.type === "plan_failed"
   ) {
     const entry = getLastAssistantEntry();
     const msg = event.message || "";
-    const isFinalPlanEvent = event.type === "plan_complete";
+    const isFinalPlanEvent = event.type === "plan_complete" || event.type === "plan_incomplete" || event.type === "plan_failed";
     if (entry && msg && (isFinalPlanEvent || canOverwriteAssistantContent(entry, msg))) {
       if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
         freezeAssistantFinalText(entry, msg);
@@ -3893,6 +4152,7 @@ function handleAgentStreamEvent(group, event) {
   }
 
   if (event.type === "done" && event.text) {
+    finishRunningExecutionsCompleted();
     const entry = getLastAssistantEntry();
     const text = stripExecutionMemoryBlock(event.text);
     if (entry) freezeAssistantFinalText(entry, text);
@@ -4021,7 +4281,7 @@ function updateMessageGroup(group, text) {
   const textEl = group.querySelector(".chat-text");
   if (!textEl) return;
   textEl.classList.remove("chat-text--loading");
-  textEl.textContent = stripExecutionMemoryBlock(text);
+  renderChatText(textEl, text, group.classList.contains("assistant") ? "assistant" : "user");
 
   const thinkingEl = group.querySelector(".chat-thinking");
   if (thinkingEl && !thinkingEl.querySelector(".chat-thinking__step")) {
@@ -4154,6 +4414,11 @@ async function handleSend() {
           });
           return;
         }
+        // `cleanup_run` can clear the backend active-run flag a few
+        // milliseconds before the direct SSE reader receives its terminal
+        // `done` frame. Keep the current card intact until that stream settles.
+        const direct = chatStreams.get(streamChatId);
+        if (direct && !direct.isFollower && direct.generation === streamGeneration) return;
         const offlinePlan = planSnapshotFromThinking(assistantEntry);
         reconcileStaleTaskUi(streamChatId, status || {
           ok: true,
@@ -4364,6 +4629,14 @@ async function handleSend() {
       },
     });
     reply = streamResult?.text || "";
+    if (streamResult?.incomplete) {
+      // The backend saves a completed reply independently of the browser
+      // stream. Recover it immediately when the terminal SSE frame is lost,
+      // rather than making the user refresh the page.
+      const recovered = await recoverPersistedFinalReply(streamChatId);
+      if (recovered) reply = recovered;
+      if (reply) finishRunningExecutionsCompleted(streamChatId);
+    }
     const meta = streamResult?.meta;
     if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
     if (!historyRecorded) {

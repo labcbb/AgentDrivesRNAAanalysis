@@ -10,7 +10,7 @@ description: "Quantify tRNA-derived fragments from sRNA-seq FASTQ files using tR
 
 This skill quantifies tRNA-derived fragments (tRFs/tDRs) from small RNA-seq FASTQ files using the bundled tRAX workflow.
 
-> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData。tRNA/tRF 与 miRNA 定量共享该 `srna` AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
+> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData。tRNA/tRF、miRNA 与 piRNA 定量共享同一个 `srna` AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
 
 Detailed API notes and output file examples are in `reference.md`.
 

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "reference-before-genome-alignment",
+      "type": "order",
+      "when": {},
+      "before_step_regex": "准备参考基因组 FASTA",
+      "after_step_regex": "完成参考基因组比对"
+    },
+    {
+      "id": "validate-genome-bam-before-fragmentomics",
+      "when": {},
+      "match_step_regex": "核验.*fragmentomics.*输入|核验.*片段组学.*输入|验证.*全基因组.*BAM",
+      "insert_before_regex": "fragment-analysis|fragmentomics|片段组学",
+      "fallback_before_skill": "fragment-analysis",
+      "step": {
+        "title": "核验 fragmentomics 全基因组 BAM 与参考 FASTA",
+        "goal": "只检查 bam_path 是否为 coordinate-sorted 的全基因组 BAM，且 BAM header 的 SQ/SN/LN 与 genome_fasta 一致；不满足时停止 fragmentomics，先补齐正确输入。",
+        "skill": "fragment-analysis"
+      }
+    }
+  ]
+}

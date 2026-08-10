@@ -1,14 +1,16 @@
 ---
 name: feature-count
-title: Read quantification with featureCounts
-description: "Count aligned sRNA-seq reads over genomic features (miRNA, piRNA, etc.) using featureCounts, with BAM vs annotation chromosome validation."
+title: Explicit genomic-feature quantification with featureCounts
+description: "Count whole-genome-aligned reads over explicitly requested genomic annotations using featureCounts, with BAM vs annotation chromosome validation."
 ---
 
 # Read Quantification with featureCounts
 
 ## Overview
 
-After aligning sRNA-seq reads to the reference genome (`sa.alignment.bowtie`), the next step is **quantification** — counting how many reads overlap each genomic feature (miRNA, piRNA, etc.). This skill uses `sa.quant.feature_count`, a wrapper around [featureCounts](https://subread.sourceforge.net/).
+Use this skill only when the user explicitly requests featureCounts for a whole-genome-aligned BAM and genomic annotation. It counts reads overlapping genomic features through `sa.quant.feature_count`, a wrapper around [featureCounts](https://subread.sourceforge.net/).
+
+**It is not the default for small-RNA quantification:** piRNA defaults to `samtools_idxstats` against a piRNA FASTA reference; miRNA defaults to `mirdeep2-mirna`. Do not select this skill for either method unless the user specifically asks for featureCounts.
 
 > 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
 
@@ -37,9 +39,7 @@ Count matrix (samples × features) → adata.X / adata.layers["counts"]
 
 ## Instructions
 
-> 💡 **推荐流程：用 featureCounts 对已知 miRNA/piRNA 做定量。** 速度快、结果兼容主流下游分析（DESeq2、edgeR 等）。
->
-> miRDeep2 适合已有 miRBase 的物种；featureCounts 适用于任意已注释的基因组特征。
+> 💡 **适用场景：**用户明确要求以 featureCounts 对 whole-genome BAM 和 GTF/GFF3 注释做计数。它不是 piRNA 或 miRNA 的默认流程。
 
 > ⚠️ **必须先确认链特异性参数 `-s` 是否正确 —— 这直接影响定量准确性**
 >
@@ -68,7 +68,7 @@ Count matrix (samples × features) → adata.X / adata.layers["counts"]
 >
 > 默认 `-t miRNA -g Name` 适用于 miRBase GFF3/GENCODE miRNA 注释。用户定量其他 RNA 时需调整。
 
-### 1. 定量已知 miRNA（默认，人类 hsa，TruSeq 链特异性）
+### 1. 用户明确要求时，定量已知 miRNA（人类 hsa，TruSeq 链特异性）
 
 ```python
 import sRNAgent as sa

@@ -10,9 +10,7 @@ The wrapper runs three mirtop subcommands:
 1. ``mirtop gff --sps <species> --gtf <precursor.gff3>
    --hairpin <hairpin.fa> --out <dir> <bam1> <bam2> ...`` -- one
    invocation over all BAMs writes a merged ``mirtop.gff`` plus one
-   per-sample ``<bamstem>.gff``. While it runs, a monitor thread prints
-   ``[mirtop] progress: N/M`` (mirtop writes the per-sample GFFs
-   incrementally, one per processed BAM).
+   per-sample ``<bamstem>.gff``.
 2. ``mirtop counts --gff <merged.gff> --out <dir>`` -- writes
    ``<dir>/mirtop.tsv`` (the name derives from the GFF basename).
 3. ``mirtop stats -o <dir> <merged.gff>`` -- writes ``mirtop_stats.txt``
@@ -21,15 +19,15 @@ The wrapper runs three mirtop subcommands:
 Note: ``mirtop counts`` accepts a single ``--gff``, so the per-sample
 GFFs must first be combined into one merged GFF by a single ``mirtop
 gff`` invocation over all BAMs -- per-sample parallel invocations cannot
-feed ``mirtop counts``. Progress is therefore surfaced through a
-monitor thread (same pattern as ``trax_quant``) instead of
-:func:`run_threads`.
+feed ``mirtop counts``. The agent runtime supervises output artifacts and
+subprocess lifecycle generically, without mirtop-specific UI hooks.
 """
 
 from __future__ import annotations
 
+import csv
+import os
 import shutil
-import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -39,6 +37,7 @@ from anndata import AnnData
 
 from ..._registry import register_function
 from ..._utils import run_cli_cmd
+from ..alignment.bowtie import normalize_rna_fasta_to_dna
 from .tRAX import store_count_matrix
 
 
@@ -164,6 +163,40 @@ def _find_counts_tsv(out_dir: Path) -> Optional[Path]:
         return _resolve_counts_tsv(out_dir)
     except FileNotFoundError:
         return None
+
+
+def _normalize_mirtop_counts_tsv(counts_path: Path) -> bool:
+    """Expand mirtop's incorrectly quoted multi-sample count field in-place.
+
+    mirtop 0.4.30 constructs its DataFrame with ``samples=["S1\\tS2..."]``
+    instead of one column per sample.  Pandas then quotes that one tab-bearing
+    field in the TSV.  Parse it as CSV first, split only that final field, and
+    atomically rewrite a real tabular TSV.
+    """
+    rows: List[List[str]] = []
+    changed = False
+    try:
+        with counts_path.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.reader(handle, delimiter="\t"):
+                if row and "\t" in row[-1]:
+                    row = [*row[:-1], *row[-1].split("\t")]
+                    changed = True
+                rows.append(row)
+    except OSError:
+        return False
+    if not changed:
+        return False
+
+    temporary = counts_path.with_suffix(f"{counts_path.suffix}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
+            writer.writerows(rows)
+        os.replace(temporary, counts_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return True
 
 
 def _counts_tsv_covers_samples(tsv: Path, sample_names: List[str]) -> bool:
@@ -326,8 +359,8 @@ def _aggregate_by_granularity(
     category="quant",
     description=(
         "Quantify isoMiR (isomiR) variants from BAM files using mirtop. "
-        "Runs a single `mirtop gff` over all BAMs (progress streamed as "
-        "`[mirtop] progress: N/M`) to build the merged isomiR GFF, then "
+        "Runs a single `mirtop gff` over all BAMs to build the merged "
+        "isomiR GFF, then "
         "`mirtop counts` to summarise reads at the requested granularity "
         "(variant, miRNA, or hairpin), and `mirtop stats` for the "
         "per-sample variant-type distribution. Counts merge into "
@@ -383,9 +416,7 @@ def mirtop_quant(
     1. **Merged GFF** -- one ``mirtop gff --sps <species> --gtf <gff>
        --hairpin <hairpin> --out <out> <bam1> <bam2> ...`` call over all
        BAMs writes the merged ``mirtop.gff`` plus per-sample
-       ``<bamstem>.gff``. A monitor thread prints ``[mirtop] progress:
-       N/M`` while it runs (mirtop writes the per-sample GFFs
-       incrementally). Idempotent: skipped when ``mirtop.gff`` already
+       ``<bamstem>.gff``. Idempotent: skipped when ``mirtop.gff`` already
        covers every sample.
     2. **Combined counts** -- ``mirtop counts --gff <merged.gff> --out
        <out>`` writes ``<out>/mirtop.tsv``. Idempotent: skipped when the
@@ -403,7 +434,9 @@ def mirtop_quant(
         Path to miRBase **precursor** GFF3 (``*-hairpin.gff3``). Passed
         to ``mirtop gff --gtf``.
     hairpin
-        Path to miRBase **hairpin** FASTA (``hairpin.fa``).
+        Path to miRBase **hairpin** FASTA (``hairpin.fa``). RNA references
+        containing ``U`` are normalized to a sibling ``*.dna.fa`` before the
+        mirtop command, matching the Bowtie index reference.
     output_dir
         Output directory for mirtop artefacts.
     bam_col
@@ -445,12 +478,14 @@ def mirtop_quant(
         - ``adata.var['reads']`` + ``iso_*`` columns -- per-feature total
           reads and per-variant-type counts (variant granularity)
         - ``adata.uns['mirtop_result']`` -- output paths and stats log
+          (including source/normalized hairpin provenance)
     """
     if not isinstance(adata, AnnData):
         raise TypeError("adata must be an AnnData object")
 
     binary = _find_mirtop_binary()
-    gff_path, hairpin_path = _resolve_reference_files(gff, hairpin)
+    gff_path, source_hairpin_path = _resolve_reference_files(gff, hairpin)
+    hairpin_path, hairpin_normalized = normalize_rna_fasta_to_dna(source_hairpin_path)
     out_dir = Path(output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -488,33 +523,7 @@ def mirtop_quant(
             cmd.extend(list(extra_args))
         cmd.extend(bam_paths[sample] for sample in sample_names)
 
-        total = len(sample_names)
-        stop_progress = threading.Event()
-
-        def _monitor_progress() -> None:
-            while not stop_progress.wait(15):
-                written = {
-                    p.name
-                    for p in out_dir.glob("*.gff")
-                    if p.name != "mirtop.gff"
-                }
-                done = [
-                    sample
-                    for sample in sample_names
-                    if f"{Path(bam_paths[sample]).stem}.gff" in written
-                ]
-                print(f"[mirtop] progress: {len(done)}/{total}", flush=True)
-                remaining = [sample for sample in sample_names if sample not in done]
-                if remaining:
-                    print(f"inflight: {','.join(remaining)}", flush=True)
-
-        monitor = threading.Thread(target=_monitor_progress, daemon=True)
-        monitor.start()
-        try:
-            run_cli_cmd(cmd)
-        finally:
-            stop_progress.set()
-            monitor.join(timeout=2)
+        run_cli_cmd(cmd)
 
     if not merged_gff.exists():
         raise FileNotFoundError(f"`mirtop gff` did not produce {merged_gff}")
@@ -527,6 +536,8 @@ def mirtop_quant(
 
     # Step 2: combined `mirtop counts` (idempotent).
     existing_tsv = _find_counts_tsv(out_dir)
+    if existing_tsv is not None and _normalize_mirtop_counts_tsv(existing_tsv):
+        print(f"[mirtop] Normalized quoted sample columns in {existing_tsv}", flush=True)
     if (
         existing_tsv is not None
         and not overwrite
@@ -557,6 +568,8 @@ def mirtop_quant(
 
     # Parse the combined counts TSV.
     counts_tsv = _resolve_counts_tsv(out_dir)
+    if _normalize_mirtop_counts_tsv(counts_tsv):
+        print(f"[mirtop] Normalized quoted sample columns in {counts_tsv}", flush=True)
     sample_df, id_col, mirna_series, meta_df = _parse_mirtop_counts(counts_tsv, sample_names)
 
     if sample_df.shape[0] == 0:
@@ -630,6 +643,8 @@ def mirtop_quant(
         "granularity": granularity,
         "gff": str(gff_path),
         "hairpin": str(hairpin_path),
+        "source_hairpin": str(source_hairpin_path),
+        "hairpin_rna_to_dna_normalized": hairpin_normalized,
         "rna_type": rna_type,
         "files": {
             "merged_gff": str(merged_gff),

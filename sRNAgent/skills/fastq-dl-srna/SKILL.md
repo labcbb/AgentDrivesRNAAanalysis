@@ -15,6 +15,7 @@ Small RNA sequencing (sRNA-seq, miRNA-seq, piRNA-seq) is typically **single-end*
 > `sa.fastq.fastq_dl` 支持 `jobs` 参数控制并行下载的样本数（通过线程池实现）。
 > 样本多时（比如 >5 个），设置 `jobs=4` 或 `jobs=5` 可大幅缩短总耗时。
 > 如果用户没主动提并行数，**agent 应该根据样本量推荐一个合理的 `jobs` 值**。
+> 内置样本级并行会自动发出标准 `progress: N/M` 和 `inflight:` 事件；下载中的字节进度由下载器单独上报。调用本 API 时只传 `jobs`，不要额外嵌套线程池。
 
 - Accepts **any accession level**: BioProject (`PRJNA...`), SRA Study (`SRP...`), BioSample (`SRS/SAMN...`), Experiment (`SRX...`), Run (`SRR/ERR/DRR...`)
 - Queries ENA's Data Warehouse API to resolve all associated Runs automatically

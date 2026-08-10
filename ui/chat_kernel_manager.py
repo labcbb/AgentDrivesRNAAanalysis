@@ -21,16 +21,9 @@ _CHAT_LOCK = threading.Lock()
 
 
 def notebook_execution_enabled() -> bool:
-    """Opt in to the ZMQ/Jupyter backend only when explicitly requested.
-
-    The local HTTP server is multi-threaded.  In the current Python 3.13
-    environment, a busy Jupyter client's ZMQ background thread has crashed
-    the server process (SIGSEGV).  The in-process backend keeps the same
-    per-chat namespace without loading that unstable native transport.
-    """
-    return os.environ.get("SRNAGENT_USE_NOTEBOOK", "").strip().lower() in {
-        "1", "true", "yes", "on",
-    }
+    """Use a persistent per-chat Jupyter kernel unless explicitly disabled."""
+    value = os.environ.get("SRNAGENT_USE_NOTEBOOK", "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _chat_session_dir(chat_id: str) -> Path:

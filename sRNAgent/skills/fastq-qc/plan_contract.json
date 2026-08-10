@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "confirm-adapter-before-trimming",
+      "type": "approval",
+      "when": {},
+      "match_step_regex": "确认.*(?:adapter|接头)|确认建库.*接头",
+      "insert_before_regex": "fastq-qc|cutadapt|FASTQ 质控",
+      "fallback_before_skill": "fastq-qc",
+      "step": {
+        "title": "确认 sRNA-seq 3' adapter",
+        "goal": "展示拟使用的 3' adapter、建库来源和长度过滤范围；未确认前不得运行 cutadapt。",
+        "skill": "fastq-qc"
+      },
+      "preflight": {
+        "title": "读取现有 FASTQ 修剪配置",
+        "goal": "只读检查当前 AnnData、cutadapt JSON/log 和 FASTQ 元数据。finish 回复必须逐行输出 `INPUT_FASTQ: <路径/obs 列或未记录>`、`SAMPLE_COUNT: <数量或未记录>`、`ADAPTER_3: <序列或未记录>`、`MIN_LENGTH: <值或未记录>`、`MAX_LENGTH: <值或未记录>`。不得运行 cutadapt、不得修改 adata 或文件。",
+        "skill": "fastq-qc"
+      },
+      "approval": {
+        "prompt": "上述值是下一步 cutadapt 将使用的配置；不会默认采用 TruSeq 或其他 adapter。",
+        "review": {
+          "fields": [
+            {
+              "label": "目前输入 FASTQ",
+              "source": "input_fastq",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "目前样本数",
+              "source": "sample_count",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "拟使用 3' adapter",
+              "source": "adapter_3",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "拟使用最小长度",
+              "source": "min_length",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "拟使用最大长度",
+              "source": "max_length",
+              "unknown": "未记录，不能据此执行"
+            }
+          ],
+          "edit_hint": "请回复“可以”采用上述配置；回复“不可以”并说明问题；或直接回复“adapter_3=新序列，min_length=值，max_length=值”更改。"
+        }
+      }
+    }
+  ]
+}

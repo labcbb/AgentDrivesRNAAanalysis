@@ -394,7 +394,9 @@ def fastq_dl(
                 if fq1:
                     fastq_paths[sample] = fq1
 
-    adata.obs["fastq_path"] = pd.Series(fastq_paths, dtype=str)
+    # Metadata-only lookups must not erase paths from a previous FASTQ download.
+    if not only_metadata:
+        adata.obs["fastq_path"] = pd.Series(fastq_paths, dtype=str)
     adata.uns["output_dir"] = output_dir
     adata.uns["fastq_dl_runs"] = all_runs
     adata.uns["fastq_dl_run_info"] = sample_run_info

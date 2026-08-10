@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import threading
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -453,23 +452,7 @@ def trax_quant(
             flush=True,
         )
     else:
-        # 监控线程：定期统计已生成的 BAM 数并打印累计进度，
-        # 供执行层解析为 UI 进度（'[trax] progress: N/M'）
-        total_samples = len(entries)
-        stop_progress = threading.Event()
-
-        def _monitor_progress() -> None:
-            while not stop_progress.wait(15):
-                done = len(list(bam_dir.glob("*.bam")))
-                print(f"[trax] progress: {done}/{total_samples}", flush=True)
-
-        monitor = threading.Thread(target=_monitor_progress, daemon=True)
-        monitor.start()
-        try:
-            run_cli_cmd(cmd, cwd=str(out_dir))
-        finally:
-            stop_progress.set()
-            monitor.join(timeout=2)
+        run_cli_cmd(cmd, cwd=str(out_dir))
 
     result: Dict[str, object] = {
         "experiment": experiment_name,

@@ -13,8 +13,39 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .agent_config import ExecutionConfig, SandboxExecutionError, SandboxFallbackPolicy
 from .env import RuntimeEnvironment, detect_runtime_environment, validate_expected_environment
+from .task_supervisor import TaskProgressSupervisor, active_task_supervisor
 
 logger = logging.getLogger(__name__)
+
+
+class _StreamingStdout(io.StringIO):
+    """Capture in-process output while forwarding it to the UI callback.
+
+    The default UI runs code in-process.  ``redirect_stdout(StringIO())``
+    kept the final tool result but hid output from long-running tools until
+    they exited, including progress messages from long-running analysis tools.
+    """
+
+    def __init__(self, on_stream: Optional[Callable[[str, str], None]] = None):
+        super().__init__()
+        self._on_stream = on_stream
+        self._write_lock = threading.Lock()
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        with self._write_lock:
+            written = super().write(text)
+        if self._on_stream is not None:
+            try:
+                self._on_stream("stdout", text)
+            except Exception:  # Progress delivery must not break analysis code.
+                logger.debug("Ignoring stream callback failure", exc_info=True)
+        return written
+
+    def getvalue(self) -> str:
+        with self._write_lock:
+            return super().getvalue()
 
 
 @dataclass
@@ -137,6 +168,8 @@ def _execute_in_process(
     code: str,
     project_root: Path,
     namespace: Optional[Dict[str, Any]] = None,
+    on_stream: Optional[Callable[[str, str], None]] = None,
+    supervisor: Optional[TaskProgressSupervisor] = None,
 ) -> str:
     project_root_str = str(project_root.resolve())
     if project_root_str not in sys.path:
@@ -146,9 +179,9 @@ def _execute_in_process(
         namespace = {"__name__": "__srnagent_exec__"}
     _ensure_base_namespace(namespace)
 
-    stdout = io.StringIO()
+    stdout = _StreamingStdout(on_stream)
     try:
-        with contextlib.redirect_stdout(stdout):
+        with contextlib.redirect_stdout(stdout), active_task_supervisor(supervisor):
             exec(code, namespace, namespace)
         output = stdout.getvalue().strip()
         return output or "Code executed successfully (no stdout)."
@@ -162,6 +195,8 @@ def _run_in_process(
     backend: ExecutionBackend,
     code: str,
     project_root: Path,
+    on_stream: Optional[Callable[[str, str], None]] = None,
+    supervisor: Optional[TaskProgressSupervisor] = None,
 ) -> str:
     """Execute *code* against the backend's shared in-process namespace.
 
@@ -171,7 +206,9 @@ def _run_in_process(
     if backend.in_process_ns is None:
         backend.in_process_ns = {}
     with backend._ns_lock:
-        return _execute_in_process(code, project_root, backend.in_process_ns)
+        return _execute_in_process(
+            code, project_root, backend.in_process_ns, on_stream, supervisor,
+        )
 
 
 def _format_notebook_result(result: dict) -> str:
@@ -193,7 +230,15 @@ def _handle_notebook_failure(
     exc: Exception,
     code: str,
     project_root: Path,
+    on_stream: Optional[Callable[[str, str], None]] = None,
+    supervisor: Optional[TaskProgressSupervisor] = None,
 ) -> str:
+    """Return a notebook failure without replaying code in the UI process.
+
+    A notebook exception often means that code made partial state changes.
+    Re-executing it in the HTTP server both duplicates work and can move large
+    AnnData/pandas operations into a long-lived multithreaded process.
+    """
     backend.last_notebook_error = str(exc)
     policy = backend.fallback_policy
 
@@ -203,23 +248,38 @@ def _handle_notebook_failure(
         ) from exc
 
     if policy == SandboxFallbackPolicy.WARN_AND_FALLBACK:
-        prefix = (
-            f"⚠️  Notebook execution failed: {exc}\n"
-            f"   Falling back to in-process execution...\n\n"
+        return (
+            f"NOTEBOOK_EXECUTION_ERROR: {exc}\n"
+            "The code was not replayed in the UI process. Inspect the kernel or persisted outputs before retrying."
         )
-    else:
-        prefix = ""
-
-    return prefix + _run_in_process(backend, code, project_root)
+    return f"NOTEBOOK_EXECUTION_ERROR: {exc}"
 
 
 def execute_agent_code(
     backend: ExecutionBackend,
-    code: str,
+    code: Any,
     project_root: Path,
     on_stream: Optional[Callable[[str, str], None]] = None,
+    supervisor: Optional[TaskProgressSupervisor] = None,
 ) -> str:
-    code = (code or "").strip()
+    # A few OpenAI-compatible providers serialize a text tool field as
+    # {"$text": "..."}.  Treat that as its string value rather than letting an
+    # AttributeError terminate the whole agent worker.  Other malformed values
+    # become a normal tool result, so the model can correct its next call.
+    if isinstance(code, dict):
+        for key in ("$text", "text"):
+            candidate = code.get(key)
+            if isinstance(candidate, str):
+                code = candidate
+                break
+        else:
+            return "TOOL_INPUT_ERROR: execute_code.code must be a string."
+    elif code is None:
+        code = ""
+    elif not isinstance(code, str):
+        return "TOOL_INPUT_ERROR: execute_code.code must be a string."
+
+    code = code.strip()
     if not code:
         return "No code provided."
 
@@ -229,18 +289,13 @@ def execute_agent_code(
             if result.get("error"):
                 if backend.fallback_policy == SandboxFallbackPolicy.RAISE:
                     raise SandboxExecutionError(result["error"])
-                if backend.fallback_policy == SandboxFallbackPolicy.WARN_AND_FALLBACK:
-                    backend.last_notebook_error = result["error"]
-                    prefix = (
-                        "⚠️  Notebook execution returned an error.\n"
-                        "   Falling back to in-process execution...\n\n"
-                    )
-                    return prefix + _run_in_process(backend, code, project_root)
                 return _format_notebook_result(result)
             return _format_notebook_result(result)
         except SandboxExecutionError:
             raise
         except Exception as exc:
-            return _handle_notebook_failure(backend, exc, code, project_root)
+            return _handle_notebook_failure(
+                backend, exc, code, project_root, on_stream, supervisor,
+            )
 
-    return _run_in_process(backend, code, project_root)
+    return _run_in_process(backend, code, project_root, on_stream, supervisor)

@@ -2,6 +2,7 @@
 name: mirdeep2-mirna
 title: miRNA quantification with miRDeep2
 description: "Quantify known miRNAs and predict novel miRNAs using miRDeep2, with human (hsa) as the default species."
+default_for: mirna_quantification
 ---
 
 # miRNA Quantification with miRDeep2
@@ -18,7 +19,7 @@ description: "Quantify known miRNAs and predict novel miRNAs using miRDeep2, wit
 
 miRDeep2 is a widely used tool for identifying known and novel miRNAs from small RNA-seq data. This skill wraps three miRDeep2 modules:
 
-> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData。miRNA 与 tRNA/tRF 定量共享该 `srna` AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
+> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData。miRNA、piRNA 与 tRNA/tRF 定量共享同一个 `srna` AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
 
 | Step | Tool | Function | Purpose |
 |------|------|----------|---------|
@@ -43,6 +44,7 @@ Trimmed FASTQ  ──→  mapper.pl  ──→  miRDeep2.pl  ──→  result.h
 > `sa.quant.quantify_mirna` 和 `sa.quant.predict_mirna` 都支持 `jobs` 参数控制并行处理的样本数（每个样本独立跑 mapper.pl + quantifier.pl 或 miRDeep2.pl）。
 > 样本多时（比如 >3 个），设置 `jobs=3` 可显著缩短总耗时。
 > 如果用户没主动提并行数，**agent 应该根据样本量推荐一个合理的 `jobs` 值**。
+> 内置样本级并行使用统一 work tracker，在每个样本返回时输出 `progress: N/M` 和 `inflight:`；调用 API 时只传 `jobs`，不要手写 `ThreadPoolExecutor` 或统一 `join()`。
 
 ## Prerequisites
 

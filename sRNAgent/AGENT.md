@@ -133,6 +133,7 @@ UI 左侧的 **Branch Chat（监管者）** 是**旁路只读 Agent**，与当�
 
 用户的定量/比对/分析任务**必须严格按 skill 执行**，这是"智能"的第一条标准：
 
+- **定量默认方法固定如下**：piRNA 默认使用 `samtools_idxstats`（先比对到 piRNA FASTA reference，再以 `samtools idxstats` 计数），不得默认改用 `feature_count`；miRNA 默认使用 `mirdeep2-mirna` / `sa.quant.quantify_mirna`。只有用户明确指定 featureCounts 时，才为 miRNA 或 piRNA 使用 `feature_count`。
 - **目录名、参数、函数**一律采用 skill 里写明的（如比对一律 `output_dir="aligned"`；定量用 `mirdeep2` / `trax_quant` / `idxstats` / `feature_count`，各自 output_dir 见对应 skill）。**禁止发明** skill 外的目录/变体（历史上出现过 agent 自创 `aligned_perm`、`aligned_strict`，skill 里根本没有）。
 - skill 里的**概念说明**（如"stringent/permissive mapping"）只是备选信息，**不是要求跑两条独立流程**；除非用户明确要对比两种模式，否则按 skill 主流程**一次完成**。
 - 执行前先加载对应 skill 的 SKILL.md，确认里面**有**这个操作；skill 没有覆盖的需求 → **先向用户报告缺口并询问**，不要自由发挥。
@@ -154,6 +155,14 @@ UI 左侧的 **Branch Chat（监管者）** 是**旁路只读 Agent**，与当�
 - 为了"保险"重复 `read_h5ad` / `list uns` / `print shape` —— 产物已在内存 adata 或落盘 h5ad 里，直接用。
 
 **关键事实在做完后立即登记**（写 `adata.uns` 或 session_memory），不要只留在对话气泡里 —— 对话会被 compaction 摘要，**memory context 不丢**。
+
+### 分组未知时的检索与确认
+
+差异分析的分组未知时，先展示当前缺失项并等待确认。若用户随后下达明确的检索指令（例如根据 SRR 用 fastq-dl、从 GEO 样本注释、从论文补充表或本地元数据检索），必须将其作为一个实际的元数据检索步骤执行，而不是再次原样展示确认门。
+
+- 仅使用用户指定或工作区已有的可核验来源；对 Run accession 的 fastq-dl 查询只允许 `only_metadata=True`，不得重新下载 FASTQ 或覆盖已有 `fastq_path`。
+- 只有获得“样本 accession -> 实验标签”的明确证据时才能写入 `adata.obs` 分组列；禁止按样本编号或顺序猜测分组。
+- 检索结束后必须给出分组列、每组样本数、对照组、设计和证据，再次等待用户确认，确认前不得运行差异分析。
 
 ## 执行超时处理（内核无响应）
 

@@ -13,6 +13,8 @@ Key sRNA-seq use cases:
 
 from __future__ import annotations
 
+import gzip
+import json
 import os
 import re
 import subprocess
@@ -41,6 +43,49 @@ def _discover_sam(output_dir: str, sample: str) -> str:
 # bowtie-build
 # ---------------------------------------------------------------------------
 
+_GZIP_SUFFIXES = (".gz", ".bgz")
+
+
+def normalize_rna_fasta_to_dna(reference: Union[str, Path]) -> Tuple[Path, bool]:
+    """Return a Bowtie-safe FASTA, deriving ``*.dna.fa`` only when needed.
+
+    Bowtie does not convert RNA ``U`` to thymine: it silently removes those
+    bases while building its index. The source FASTA remains unchanged; the
+    derived DNA FASTA preserves headers and coordinates, replacing only
+    sequence ``U/u`` with ``T/t``.
+    """
+    source = Path(reference).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Reference FASTA not found: {source}")
+
+    def _open_text(path: Path):
+        if path.suffix.lower() in _GZIP_SUFFIXES:
+            return gzip.open(path, "rt", encoding="utf-8")
+        return path.open("r", encoding="utf-8")
+
+    with _open_text(source) as handle:
+        has_rna_u = any(
+            not line.startswith(">") and ("U" in line or "u" in line)
+            for line in handle
+        )
+    if not has_rna_u:
+        return source, False
+
+    name = source.name
+    if name.lower().endswith(_GZIP_SUFFIXES):
+        name = Path(name).stem
+    derived = source.with_name(f"{Path(name).stem}.dna.fa")
+    temporary = derived.with_name(f".{derived.name}.tmp")
+    try:
+        with _open_text(source) as src, temporary.open("w", encoding="utf-8") as dst:
+            for line in src:
+                dst.write(line if line.startswith(">") else line.replace("U", "T").replace("u", "t"))
+        os.replace(temporary, derived)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return derived, True
+
 @register_function(
     aliases=[
         "bowtie_build", "bowtie-build", "build_index", "index",
@@ -64,7 +109,7 @@ def bowtie_build(
     threads: int = 1,
     verbose: bool = False,
     extra_args: Optional[Sequence[str]] = None,
-) -> Dict[str, str]:
+) -> Dict[str, Union[str, List[str], bool]]:
     """Build a Bowtie index from reference FASTA sequences.
 
     Parameters
@@ -86,9 +131,15 @@ def bowtie_build(
     Returns
     -------
     dict
-        ``{"index_basename": "<path>", "directory": "<dir>"}``
+        Includes ``reference_used`` and ``rna_to_dna_normalized`` so callers
+        can persist the exact reference that produced the index.
     """
     ref_list = [reference] if isinstance(reference, str) else list(reference)
+    if not ref_list:
+        raise ValueError("At least one reference FASTA is required")
+    source_references = [str(Path(ref).expanduser().resolve()) for ref in ref_list]
+    prepared = [normalize_rna_fasta_to_dna(ref) for ref in ref_list]
+    prepared_references = [str(path) for path, _ in prepared]
     basename = str(Path(index_basename))
 
     cmd = ["bowtie-build"]
@@ -102,14 +153,33 @@ def bowtie_build(
     if extra_args:
         cmd.extend(extra_args)
 
-    cmd.extend(ref_list)
+    cmd.extend(prepared_references)
     cmd.append(basename)
 
     run_cli_cmd(cmd)
 
+    index_manifest = Path(f"{basename}.reference.json").resolve()
+    manifest_payload = {
+        "index_basename": str(Path(basename).resolve()),
+        "source_references": source_references,
+        "reference_used": prepared_references[0] if len(prepared_references) == 1 else prepared_references,
+        "rna_to_dna_normalized": any(normalized for _, normalized in prepared),
+    }
+    manifest_tmp = index_manifest.with_name(f".{index_manifest.name}.tmp")
+    try:
+        manifest_tmp.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
+        os.replace(manifest_tmp, index_manifest)
+    except Exception:
+        manifest_tmp.unlink(missing_ok=True)
+        raise
+
     return {
         "index_basename": str(Path(basename).resolve()),
         "directory": str(Path(basename).parent.resolve()),
+        "source_references": source_references,
+        "reference_used": prepared_references[0] if len(prepared_references) == 1 else prepared_references,
+        "rna_to_dna_normalized": any(normalized for _, normalized in prepared),
+        "reference_manifest": str(index_manifest),
     }
 
 

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -77,26 +76,6 @@ def test_bounded_tool_result_keeps_error_tail():
     out = bounded_tool_result(head + filler + tail, 8000)
     assert len(out) <= 8000
     assert out.endswith(tail)
-
-
-def test_trax_progress_uses_bam_outputs_when_stdout_is_buffered():
-    with tempfile.TemporaryDirectory() as tmp:
-        workspace = Path(tmp)
-        out_dir = workspace / "trax_out"
-        bam_dir = out_dir / "bam"
-        bam_dir.mkdir(parents=True)
-        (out_dir / "trax_quant-samples.txt").write_text("S1\tS1\ta.fq\nS2\tS2\tb.fq\nS3\tS3\tc.fq\n")
-        (bam_dir / "S1.bam").touch()
-        (bam_dir / "S2.bam").touch()
-
-        progress = _parse_progress_output(
-            "",
-            workspace=workspace,
-            code='adata = sa.quant.trax_quant(adata, output_dir="trax_out")',
-        )
-
-    assert progress["stage"] == "已完成 2/3 样本"
-    assert progress["highlights"] == ["tRAX 已生成 2/3 个 BAM"]
 
 
 def test_progress_parser_preserves_fragomics_log_prefix():

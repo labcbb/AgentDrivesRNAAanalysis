@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import importlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
@@ -57,6 +58,27 @@ class _FakeSkillRegistry:
         return self._skills.get(str(slug).lower())
 
 
+class _DefaultQuantSkillRegistry:
+    def __init__(self):
+        self.skill_metadata = {
+            "samtools_idxstats": SkillMetadata(
+                name="Default piRNA quantification", slug="samtools_idxstats",
+                description="Default piRNA quantification with idxstats", path=Path("."),
+            ),
+            "mirdeep2-mirna": SkillMetadata(
+                name="miRNA quantification", slug="mirdeep2-mirna",
+                description="miRNA quantification with miRDeep2", path=Path("."),
+            ),
+            "feature-count": SkillMetadata(
+                name="featureCounts", slug="feature-count",
+                description="Count explicitly requested genomic features", path=Path("."),
+            ),
+        }
+
+    def load_full_skill(self, _slug: str):
+        return None
+
+
 def test_rank_skill_matches_prefers_exact_slug():
     registry = _FakeSkillRegistry()
     matches = rank_skill_matches(registry, "fastq-qc")
@@ -71,11 +93,50 @@ def test_resolve_skill_query_supports_chinese_description_match():
     assert skill.slug == "differential-analysis"
 
 
+def test_default_quantification_skill_ranking_prefers_idxstats_and_mirdeep2():
+    registry = _DefaultQuantSkillRegistry()
+
+    assert rank_skill_matches(registry, "piRNA 定量")[0][0].slug == "samtools_idxstats"
+    assert rank_skill_matches(registry, "miRNA 定量")[0][0].slug == "mirdeep2-mirna"
+    assert rank_skill_matches(registry, "用 featureCounts 做 piRNA 定量")[0][0].slug == "feature-count"
+
+
+def test_combined_small_rna_query_boosts_both_default_quantification_skills():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    ranked = rank_skill_matches(registry, "完成 miRNA/piRNA/tRNA 定量")
+    top_slugs = {metadata.slug for metadata, _score in ranked[:2]}
+
+    assert {"mirdeep2-mirna", "samtools_idxstats"}.issubset(top_slugs)
+
+
 def test_search_skills_returns_best_skill_body():
     registry = _FakeSkillRegistry()
     text = search_skills(registry, "adapter 质控")
     assert "FASTQ QC" in text
     assert "必须先确认 adapter" in text
+
+
+def test_fastq_dl_metadata_only_keeps_existing_fastq_paths(tmp_path: Path, monkeypatch):
+    module = importlib.import_module("sRNAgent.Tools.fastq.fastq_dl")
+    adata = ad.AnnData(obs=pd.DataFrame({"fastq_path": ["existing/S1.fastq.gz"]}, index=["S1"]))
+
+    def fake_run_cli(cmd, **_kwargs):
+        out_dir = Path(cmd[cmd.index("--outdir") + 1])
+        accession = cmd[cmd.index("--accession") + 1]
+        (out_dir / f"fastq-{accession}-run-info.tsv").write_text(
+            "run_accession\tfastq_ftp\n"
+            f"{accession}\tftp.sra.ebi.ac.uk/example.fastq.gz\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(module, "run_cli_cmd", fake_run_cli)
+    result = module.fastq_dl(adata, accessions="SRR000001", output_dir=str(tmp_path), only_metadata=True)
+
+    assert result.obs.loc["S1", "fastq_path"] == "existing/S1.fastq.gz"
+    assert "SRR000001" in result.uns["fastq_dl_runs"]
 
 
 class _DummyAgent:

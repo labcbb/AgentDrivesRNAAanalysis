@@ -44,6 +44,7 @@ MultiQC ─── aggregated multiqc_report.html
 > 样本多时（比如 >3 个），设置 `jobs=4` 可大幅缩短总耗时。
 > 注意 `multiqc` 是单进程聚合报告，不需要 `jobs` 参数。
 > 如果用户没主动提并行数，**agent 应该根据样本量推荐一个合理的 `jobs` 值**。
+> `cutadapt` 和 `fastqc` 的样本级并行自动输出统一的 `progress: N/M` 与 `inflight:` 事件，兼容 UI；调用 API 时只传 `jobs`，不要另写线程池或等待所有线程后才打印结果。
 
 ## Instructions
 

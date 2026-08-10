@@ -16,9 +16,16 @@ description: "Quantify isoMiR (isomiR) variants (5'/3' trimming, additions, SNPs
 
 **2. isomiR 定量的 BAM 是比对到 miRBase hairpin 前体序列的，不是全基因组。**
 
-- 参考序列是 `hairpin_hsa.fa`（前体），索引由 `sa.alignment.bowtie_build(hairpin_fa, ...)` 构建。
+- 原始参考序列是 `hairpin_hsa.fa`（前体）。miRBase FASTA 使用 RNA 字母 `U`，而 Bowtie 会丢弃 `U`；`sa.alignment.bowtie_build` 会自动生成同目录的 `hairpin_hsa.dna.fa`（`U -> T`）并基于它构建索引。该 DNA FASTA 必须同时传给 mirtop，保证 BAM 与注释使用相同坐标体系。
 - **禁止**把全基因组比对的 BAM 传给 `sa.quant.mirtop`（mirtop 会把 reads 重比对到 hairpin 坐标，基因组坐标的 BAM 结果无意义）。
 - 比对参数面向"成熟体在 hairpin 上的精确位置"：`bowtie -n 1 -l 15 -m 100 --best --strata`。
+
+**3. 从 trimmed/clean FASTQ 开始的 isomiR 工作流必须先 Collapse。**
+
+- 固定顺序是：`trimmed FASTQ -> sa.fastq.seqcluster_collapse -> collapsed_path -> hairpin Bowtie -> 新 BAM -> mirtop`。
+- `mirtop` 只接收 BAM；禁止将未折叠 trimmed FASTQ 生成的旧 BAM 混入定量。
+- 计划中必须将 Collapse 列为 Bowtie 前的独立步骤，不能写成 “trimmed FASTQ 重建 hairpin 比对并定量” 这样省略 Collapse 的合并步骤。
+- 此顺序同时由本目录的 `plan_contract.json` 声明，规划器按该契约强制排序，而不是依赖模型从自然语言中猜测。
 
 ## Overview
 
@@ -29,28 +36,33 @@ isomiR（isomiR/isomiR）是 miRNA 成熟体的序列变异形式——5'/3' 端
 | 0 | — | `ad.AnnData(obs=...)` | 初始化**独立 isomiR 模态** adata |
 | 1 | miRBase | `sa.reference.download_mirbase` | 下载 hairpin FASTA + 前体 GFF3（含物种三位代码） |
 | 2 | cutadapt/FastQC | `sa.fastq.cutadapt` / `sa.fastq.fastqc` | 接头去尽 + 质控（clean reads） |
+| 2.5 | seqcluster | `sa.fastq.seqcluster_collapse` | 相同 clean reads 折叠为带频数 header 的 collapsed FASTQ |
 | 3 | bowtie-build | `sa.alignment.bowtie_build` | 用 **hairpin.fa** 构建比对索引 |
-| 4 | bowtie | `sa.alignment.bowtie` | clean reads 比对到 **hairpin 前体** → sorted BAM |
-| 5 | mirtop | `sa.quant.mirtop` | isomiR 注释 + counts（variant/miRNA 粒度）+ stats |
+| 4 | bowtie | `sa.alignment.bowtie` | collapsed FASTQ 比对到 **hairpin 前体** → sorted BAM |
+| 5 | mirtop | `sa.quant.mirtop` | 从 collapsed FASTQ 生成的 BAM 做 isomiR 注释 + counts（variant/miRNA 粒度）+ stats |
 
 典型流程：
 
 ```
-raw FASTQ ──cutadapt──> clean FASTQ ──bowtie(→hairpin)──> sorted BAM
-                                                              │
-                                              sa.quant.mirtop │
-                                                              ▼
+raw FASTQ ──cutadapt──> clean FASTQ ──seqcluster collapse──> collapsed FASTQ
+                                                                   │
+                                                   bowtie(→hairpin)──> sorted BAM
+                                                                          │
+                                                          sa.quant.mirtop │
+                                                                          ▼
                           adata_iso.X / layers["counts"] (isomiR 独立模态)
                           + adata_iso.uns["mirtop_result"]（含 stats 分布）
 ```
 
-> ⚡ **批量样本：** `sa.fastq.cutadapt` / `sa.fastq.fastqc` / `sa.alignment.bowtie` 均支持 `jobs=N` 样本级并行；`sa.quant.mirtop` 一次调用处理所有 BAM，运行中输出 `[mirtop] progress: N/M` 进度（监控线程，UI 代码卡可见）。
+> ⚡ **批量样本：** `sa.fastq.cutadapt` / `sa.fastq.fastqc` / `sa.alignment.bowtie` 均支持 `jobs=N` 样本级并行。`sa.quant.mirtop` 虽可一次接收多个 BAM，但底层 `mirtop gff` 没有 `jobs` / `threads` 参数，会在单个进程中处理；不能把 `jobs=N` 传给它。若用户明确要求多样本并行，必须改为每个样本一个 `mirtop gff` 进程、每个进程使用私有 staging 输出目录，完成后验证各自 GFF 并汇总到独立 isomiR AnnData。并发调度必须使用 `sRNAgent._utils.run_threads`，不能手写 `ThreadPoolExecutor`、`Semaphore` 或统一 `join()`；绝不能让并发进程共享同一个 `mirtop_out`。
+
+> **并行进度纪律：** `run_threads` 会在每个 worker 返回时自动输出 `progress: N/M` 和 `inflight:`，与 UI 进度框架直接兼容。不要等全部线程 `join()` 后再输出。mirtop 的 stdout/stderr 可能非常大，必须分别重定向到每个样本的日志文件，不能使用 `capture_output=True` 将全部日志缓存在内存。
 
 ## Prerequisites
 
 - **独立 isomiR AnnData**：样本名在 `adata_iso.obs.index`，与 srna 模态分开。
 - **miRBase hairpin 数据**：`ref/hairpin_hsa.fa`（前体序列）+ `ref/hsa.gff3`（前体 GFF3 注释），来自 `sa.reference.download_mirbase`（见 `reference-download` skill，物种三位代码可用 `sa.reference.list_mirbase_codes` 查）。
-- **clean FASTQ**：`adata_iso.obs["trimmed_path"]`（cutadapt 后自动写入，见 `fastq-qc` skill）。
+- **clean FASTQ**：`adata_iso.obs["trimmed_path"]`（cutadapt 后自动写入，见 `fastq-qc` skill）。必须先用 `sa.fastq.seqcluster_collapse` 折叠，Bowtie 的输入改为其生成的 `adata_iso.obs["collapsed_path"]`。
 - 或 **现成 hairpin 比对 BAM**：`adata_iso.obs["bam_path"]`。
 
 ## Instructions
@@ -80,7 +92,7 @@ result = sa.reference.download_mirbase(species="hsa", output_dir="ref", jobs=4)
 # result["gff3"]     → ref/hsa.gff3          （前体 GFF3 注释，mirtop 的 --gtf 输入）
 ```
 
-- `hairpin_hsa.fa` 用作 **bowtie 索引的参考序列**（后续比对到它）。
+- `hairpin_hsa.fa` 是 miRBase 原始 RNA 参考；`bowtie_build` 返回的 `reference_used` 是实际的 DNA 比对参考（通常为 `hairpin_hsa.dna.fa`），后续 Bowtie 与 mirtop 都必须使用它。
 - `hsa.gff3` 用作 **`sa.quant.mirtop` 的 `gff` 参数**（前体 + 成熟体坐标）。
 
 > ❌ 不要用 `mature_hsa.fa`（成熟体）建索引 —— isomiR 的 5'/3' 修剪需要 reads 落在 **hairpin 前体**上才有上下文。
@@ -104,15 +116,46 @@ adata_iso = sa.fastq.cutadapt(
 - 参考 `fastq-qc` skill：先确认建库试剂盒的 3' adapter 序列，必要时跑 FastQC 看 Overrepresented Sequences。
 - 长度过滤建议 15–35 nt（miRNA 成熟体 + isomiR 变异范围）。
 
+### 2.5. 序列折叠（Collapse）
+
+必须在 Bowtie 前折叠质控后的 FASTQ；折叠后的 header 携带序列频数，既消除重复序列的比对开销，也保留 mirtop 定量所需的丰度信息。
+
+```python
+adata_iso = sa.fastq.seqcluster_collapse(
+    adata_iso,
+    output_dir="collapsed_iso",
+    input_col="trimmed_path",
+    minimum=1,
+    jobs=4,
+)
+# 产物：adata_iso.obs["collapsed_path"]，每个样本为 *.fastq.gz
+
+# sa.alignment.bowtie 默认读取 trimmed_path；本流程明确将其切换为 collapsed FASTQ。
+# 原始 clean FASTQ 仍保留在磁盘上，供质控追溯。
+adata_iso.obs["trimmed_path"] = adata_iso.obs["collapsed_path"]
+```
+
+`seqcluster_collapse` 会删除 seqcluster 产生的临时 `log/` 目录，并将最终 FASTQ 压缩为 `.fastq.gz`。不得跳过此步骤后直接把 clean FASTQ 用于本 isomiR 流程。
+
 ### 3. 构建 hairpin 比对索引
 
 ```python
-sa.alignment.bowtie_build("ref/hairpin_hsa.fa", "ref/hairpin_hsa", threads=4)
+index_info = sa.alignment.bowtie_build(
+    "ref/hairpin_hsa.fa",
+    "ref/hairpin_hsa",
+    threads=4,
+)
+hairpin_dna = index_info["reference_used"]
+assert index_info["rna_to_dna_normalized"] is True
 ```
+
+`hairpin_dna`、`index_info["reference_manifest"]` 与 `index_info["rna_to_dna_normalized"]` 必须登记到 `adata_iso.uns` 或 manifest；不要猜测文件名。`sa.quant.mirtop` 即使收到原始含 `U` 的 FASTA 也会复用/生成同一 `*.dna.fa`，并在 `uns["mirtop_result"]` 记录 `source_hairpin`、`hairpin` 与规范化标记。
+
+> ⚠️ 必须依次重建 hairpin index → 重新比对所有 collapsed FASTQ 生成 BAM → 删除或以新目录生成 `mirtop_out` → 重新进行 variant 定量和差异分析。开始前检查 `index_info["rna_to_dna_normalized"]`；原始 hairpin 含 `U` 时它应为 `True`，且实际参考应是 `*.dna.fa`。
 
 ### 4. 比对到 hairpin 前体（不是全基因组）
 
-对应 CLI：`bowtie -n 1 -l 15 -m 100 --best --strata -S hairpin_ref clean_reads.fq | samtools sort -o sorted.bam`
+对应 CLI：`bowtie -n 1 -l 15 -m 100 --best --strata -S hairpin_ref collapsed_reads.fastq.gz | samtools sort -o sorted.bam`
 
 ```python
 adata_iso = sa.alignment.bowtie(
@@ -134,11 +177,13 @@ adata_iso = sa.alignment.bowtie(
 
 ### 5. isomiR 定量（mirtop）
 
+`mirtop` 的直接输入仍是 `bam_path`，不会读取 FASTQ；本流程保证这些 BAM 全部由第 2.5 步的 collapsed FASTQ 产生，不能混入由未折叠 clean FASTQ 生成的 BAM。
+
 ```python
 adata_iso = sa.quant.mirtop(
     adata_iso,
     gff="ref/hsa.gff3",            # 前体 GFF3（--gtf）
-    hairpin="ref/hairpin_hsa.fa",  # hairpin 前体 FASTA（--hairpin）
+    hairpin=hairpin_dna,             # 与 Bowtie index 一致的 DNA hairpin FASTA
     species="hsa",                 # 物种三位代码（--sps）
     granularity="variant",         # 默认 variant：不聚合，每个 isomiR 一个特征
                                    # 需要成熟体水平汇总时才显式传 "miRNA"
@@ -150,7 +195,7 @@ adata_iso = sa.quant.mirtop(
 工具内部（真实 mirtop CLI）：
 
 ```bash
-mirtop gff --sps hsa --gtf ref/hsa.gff3 --hairpin ref/hairpin_hsa.fa \
+mirtop gff --sps hsa --gtf ref/hsa.gff3 --hairpin ref/hairpin_hsa.dna.fa \
   --out mirtop_out/ aligned_hairpin/SRR1.bam aligned_hairpin/SRR2.bam ...
 mirtop counts --gff mirtop_out/mirtop.gff --out mirtop_out/     # → mirtop.tsv
 mirtop stats -o mirtop_out/ mirtop_out/mirtop.gff               # → mirtop_stats.txt
@@ -169,7 +214,7 @@ adata_iso.obs["bam_path"] = ["aligned/S1.hairpin.bam", "aligned/S2.hairpin.bam"]
 adata_iso = sa.quant.mirtop(
     adata_iso,
     gff="ref/hsa.gff3",
-    hairpin="ref/hairpin_hsa.fa",
+    hairpin="ref/hairpin_hsa.dna.fa",
     species="hsa",
     granularity="variant",   # 默认值：不聚合，每个 isomiR 变异一行
     output_dir="mirtop_out",
@@ -198,7 +243,8 @@ adata_iso.write("isomir_counts.h5ad")
 
 - **mirtop 启动报 `ModuleNotFoundError: No module named 'pkg_resources'`**：环境里的 setuptools ≥ 82 移除了 pkg_resources。修复：`pip install "setuptools<81"`。
 - **mirtop 报 `Database not found in ... header`**：前体 GFF3 头部缺 `##miRBase` 标识。用 `sa.reference.download_mirbase` 下载的正规 miRBase GFF3 自带该标识；自制的 GFF 需在头部补 `##miRBase <version> <species>`。
-- **counts 全为 0 / stats 报 IndexError**：该样本没有 reads 落在成熟体位置——检查是否用了成熟体索引而非 hairpin 索引、adapter 是否去干净、`--sps` 物种代码是否与 GFF 一致。
+- **counts 全为 0 / stats 报 IndexError**：该样本没有 reads 落在成熟体位置——检查是否用了成熟体索引而非 hairpin 索引、adapter 是否去干净、`--sps` 物种代码是否与 GFF 一致；同时检查 index manifest 的 `reference_used` 是否为 `*.dna.fa`。若旧 index 直接从含 `U` 的 RNA FASTA 建立，按第 3 步的完整重建顺序执行，不能复用旧 BAM。
+- **Bowtie 仍在使用未折叠 reads**：确认第 2.5 步已完成，`adata_iso.obs["collapsed_path"]` 均为非空的 `.fastq.gz`，且在调用 Bowtie 前已将 `trimmed_path` 替换为 `collapsed_path`。更换输入后必须重新生成全部 BAM，不能复用旧 BAM。
 - **`sa.quant.mirtop` 找不到 BAM**：`adata.obs` 需有 `bam_path` 列（`sa.alignment.bowtie` 自动写）；只有 `sam_path` 时会自动找同名 `.bam`。
 
 ## 结果持久化与查询纪律
@@ -233,6 +279,7 @@ print(adata_iso.uns["mirtop_result"]["stats_log"])   # 变异类型分布
 - mirtop docs: <https://github.com/miRTop/mirtop>
 - Upstream skills:
   - [`fastq-qc`](../fastq-qc/SKILL.md) — 接头去尽与质控
+  - [`seqcluster_collapse`](../../Tools/fastq/seqcluster.py) — FASTQ 序列折叠
   - [`alignment-srna`](../alignment-srna/SKILL.md) — bowtie 比对（本 skill 用 hairpin 索引）
   - [`reference-download`](../reference-download/SKILL.md) — hairpin FASTA / GFF3 / 物种三位代码
   - [`feature-count`](../feature-count/SKILL.md) — 需要成熟体 level 定量（非 isomiR 变异）时的替代方案

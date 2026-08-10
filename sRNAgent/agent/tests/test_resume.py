@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from sRNAgent.agent.agent_config import ExecutionConfig
 from sRNAgent.agent.llm_client import ChatCompletion, LLMConfig, ToolCall
-from sRNAgent.agent.srn_agent import AgentCancelledError, SRNAgent
+from sRNAgent.agent.srn_agent import AgentCancelledError, SRNAgent, _progress_summary
 
 
 class _FakeLLM:
@@ -120,6 +120,25 @@ def test_no_checkpoint_when_disabled():
         assert agent._checkpoint_base_dir() is None
 
 
+def test_elapsed_footer_is_deduplicated():
+    text = SRNAgent._maybe_attach_elapsed(
+        "完成\n\n⏱️ 本次回答耗时 2 秒\n⏱️ 本次回答耗时 1 秒",
+        started_at=0,
+    )
+    assert text.count("本次回答耗时") == 1
+
+
+def test_seqcluster_progress_is_not_labeled_as_adapter_trimming():
+    title = _progress_summary(
+        {
+            "stage": "正在运行 seqcluster collapse",
+            "highlights": ["Input: trimmed FASTQ", "jobs=8"],
+        },
+        "execute_code",
+    )
+    assert title == "execute_code — 当前任务：序列折叠 / 去重"
+
+
 def test_code_execution_events_share_the_tool_call_id():
     class _ExecuteThenFinishLLM:
         def __init__(self):
@@ -161,6 +180,51 @@ def test_code_execution_events_share_the_tool_call_id():
     ]
     assert len(correlated) == 3
     assert {event.get("toolCallId") for event in correlated} == {"execute-1"}
+
+
+def test_tool_loop_normalizes_provider_text_object_before_dispatch():
+    class _DictCodeThenFinishLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, tools=None, enable_thinking=None):
+            self.calls += 1
+            if self.calls == 1:
+                return ChatCompletion(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            id="execute-dict",
+                            name="execute_code",
+                            arguments={
+                                "description": "检查输入",
+                                "code": {"$text": "print('ok')"},
+                            },
+                        )
+                    ],
+                )
+            return ChatCompletion(
+                content="",
+                tool_calls=[ToolCall(id="finish-dict", name="finish", arguments={"message": "完成"})],
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        llm = _DictCodeThenFinishLLM()
+        agent = _make_agent(Path(tmp), "chat-dict-code", llm)
+        seen = {}
+
+        def dispatch(name, arguments, **kwargs):
+            seen.update(arguments)
+            return "ok"
+
+        agent.dispatch_tool = dispatch  # type: ignore[method-assign]
+        result = agent.run_with_history(
+            [{"role": "user", "content": "检查输入"}],
+            chat_id="chat-dict-code",
+        )
+
+    assert result.startswith("完成")
+    assert seen["code"] == "print('ok')"
 
 
 if __name__ == "__main__":

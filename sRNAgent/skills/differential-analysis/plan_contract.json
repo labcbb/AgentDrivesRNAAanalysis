@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "confirm-groups-before-de",
+      "type": "approval",
+      "when": {},
+      "match_step_regex": "确认.*(?:样本分组|分组信息|差异分析设计)",
+      "insert_before_regex": "differential-analysis|差异分析|limma",
+      "fallback_before_skill": "differential-analysis",
+      "step": {
+        "title": "确认差异分析样本分组",
+        "goal": "展示 group/Condition/treatment 的样本分布、对照组和统计设计；用户确认后才运行差异分析。",
+        "skill": "differential-analysis"
+      },
+      "preflight": {
+        "title": "读取差异分析分组与设计",
+        "goal": "先只读检查 AnnData.obs 和已有分析元数据。若未记录分组且 obs_names 为 SRR/ERR/DRR，则优先读取工作区已有 fastq-dl run-info/metadata TSV；仍缺失时仅调用 sa.fastq.fastq_dl(..., only_metadata=True) 获取元数据，绝不下载 FASTQ 或覆盖 fastq_path。仅当元数据提供可验证实验标签时才写入新的 obs 分组列并保存 h5ad；不得按 Run 编号猜测分组。finish 回复必须逐行输出 `GROUP_COLUMN: <列名或未记录>`、`GROUP_COUNTS: <每组样本数或未记录>`、`CONTROL_GROUP: <组名或未记录>`、`DESIGN: <unpaired/paired/未记录>` 和简短依据。不得运行差异分析。",
+        "skill": "differential-analysis"
+      },
+      "approval": {
+        "prompt": "上述值是下一步差异分析将使用的分组和统计设计；未确认前不会运行差异分析。",
+        "review": {
+          "fields": [
+            {
+              "label": "目前分组列",
+              "source": "group_column",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "目前各组样本数",
+              "source": "group_counts",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "拟使用对照组",
+              "source": "control_group",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "当前计划的统计设计",
+              "source": "analysis_design",
+              "unknown": "未记录"
+            },
+            {
+              "label": "待确认项目",
+              "value": "group/Condition 列、各组样本归属、对照组、配对或非配对设计"
+            }
+          ],
+          "edit_hint": "请回复“可以”采用上述配置；回复“不可以”并说明问题；或直接回复“group_col=字段，control_group=组名，design=unpaired/paired”更改。若分组未记录，也可直接下达检索指令（如“根据 SRR 样本号用 fastq-dl 检索分组”或“从 GEO 样本注释检索分组”）；系统会先检索证据，再重新请你确认。"
+        }
+      }
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import sys
 import threading
 import time
@@ -763,6 +764,10 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
         remember_user_query(chat_id, user_query)
         use_plan_mode = _plan_mode_enabled(agent_cfg)
         resume = bool(body.get("resume") or body.get("continueRun") or False)
+        if _FRESH_WORKFLOW_KEYWORDS.search(user_query):
+            resume = False
+        if not resume and _plan_awaits_approval(chat_id):
+            resume = True
         if not resume:
             clear_plan(chat_id)
         run_context = _build_run_context(chat_id, user_query=user_query)
@@ -839,6 +844,11 @@ _RESUME_KEYWORDS = (
     "继续", "继续刚才", "继续任务", "继续对话", "接着", "接着做",
     "从断的地方", "从上次", "go on", "continue", "resume",
 )
+_FRESH_WORKFLOW_KEYWORDS = re.compile(
+    r"(?:清空|清除|删除|重建|重新生成|重跑).{0,48}(?:mirtop|iso[- ]?mir|isomiR)|"
+    r"(?:从|自).{0,16}(?:hairpin )?(?:比对|alignment|bowtie).{0,32}(?:开始|重建|重新|生成)",
+    re.I,
+)
 
 
 def _normalize_message_list(messages):
@@ -881,6 +891,11 @@ def _auto_detect_resume(body: Dict[str, Any], chat_id: str) -> bool:
     if not chat_id:
         return False
     msg = _latest_user_message(body).lower()
+    # A destructive/rebuild request establishes a new execution scope even
+    # when it contains words such as "continue". Reusing a checkpoint here
+    # can resurrect an interrupted subprocess with incompatible outputs.
+    if _FRESH_WORKFLOW_KEYWORDS.search(msg):
+        return False
     if not msg or len(msg) > 60:
         return False
     if not any(kw.lower() in msg for kw in _RESUME_KEYWORDS):
@@ -926,6 +941,21 @@ def _auto_detect_resume(body: Dict[str, Any], chat_id: str) -> bool:
             )
         return False
     return False
+
+
+def _plan_awaits_approval(chat_id: str) -> bool:
+    """A user reply after a plan approval gate resumes that exact plan."""
+    if not chat_id:
+        return False
+    try:
+        plan = load_plan(chat_id)
+    except Exception:
+        return False
+    steps = plan.get("steps") if isinstance(plan, dict) and isinstance(plan.get("steps"), list) else []
+    return any(
+        isinstance(step, dict) and str(step.get("status") or "").strip().lower() == "awaiting_approval"
+        for step in steps
+    )
 
 
 def _append_work_log_event(chat_id: str, event: Dict[str, Any], run_id: str) -> None:
@@ -991,10 +1021,12 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     device_id = str(body.get("deviceId") or "").strip()
     approval_mode = _normalize_approval_mode(body)
     resume = bool(body.get("resume") or body.get("continueRun") or False)
+    if _FRESH_WORKFLOW_KEYWORDS.search(_latest_user_message(body)):
+        resume = False
     # 自动检测"继续中断任务"：用户消息含这些关键词 + 该 chat 有 checkpoint
     # → 当作 resume=true，让 agent 从上次中断的 tool_loop 消息恢复
     if not resume:
-        resume = _auto_detect_resume(body, chat_id)
+        resume = _plan_awaits_approval(chat_id) or _auto_detect_resume(body, chat_id)
 
     # Exclusive operator lease: another device mid-run cannot steal this chat.
     existing_lease = get_operator_lease(chat_id)

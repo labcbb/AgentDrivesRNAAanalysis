@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "collapse-before-hairpin-alignment",
+      "when": {
+        "query_regex": "iso[- ]?mir|isomir|mirtop",
+        "input_regex": "\\b(trimmed_path|clean_fastq_path)\\b|\\b(?:trimmed|clean)\\s*(?:fastq|fq)\\b",
+        "unless_context_regex": "\\bcollapsed_path\\b|(?:^|[/\\\\])[^ \\n\\t]+(?:collapsed|collapse)[^ \\n\\t]*\\.f(?:ast)?q(?:\\.gz)?\\b"
+      },
+      "match_step_regex": "seqcluster|collapse|折叠",
+      "insert_before_regex": "hairpin.{0,40}(?:bowtie|比对)|(?:bowtie|比对).{0,40}hairpin|alignment-srna",
+      "fallback_before_skill": "isomir-quantification",
+      "step": {
+        "title": "折叠 trimmed FASTQ 供 isomiR hairpin 比对",
+        "goal": "对全部样本运行 sa.fastq.seqcluster_collapse；验证每个 collapsed_path 为非空 .fastq.gz，并将其作为 hairpin Bowtie 输入。不得用未折叠 FASTQ 生成的 BAM 做 mirtop。",
+        "skill": "isomir-quantification"
+      }
+    },
+    {
+      "id": "isolated-parallel-mirtop-execution",
+      "type": "execution",
+      "when": {},
+      "target_step_regex": "运行 mirtop|mirtop 定量|isomir 定量",
+      "execution": {
+        "instructions": "mirtop gff 没有 jobs/threads 参数。多样本并行时必须每样本一个独立 staging 输出目录，使用 run_threads 限制并发；每个 worker 返回时输出 progress 与 inflight；stdout/stderr 写入样本私有日志，禁止 capture_output=True；汇总前验证每个样本非空 GFF。"
+      }
+    }
+  ]
+}

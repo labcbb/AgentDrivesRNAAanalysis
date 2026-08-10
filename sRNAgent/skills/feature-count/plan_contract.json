@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "confirm-strandedness-before-feature-count",
+      "type": "approval",
+      "when": {},
+      "match_step_regex": "确认.*(?:链特异性|stranded|建库方向)",
+      "insert_before_regex": "feature-count|featurecounts|feature.?count",
+      "fallback_before_skill": "feature-count",
+      "step": {
+        "title": "确认 featureCounts 链特异性",
+        "goal": "展示拟使用的 stranded 参数及其建库依据；未确认前不得运行 featureCounts。",
+        "skill": "feature-count"
+      },
+      "preflight": {
+        "title": "读取 featureCounts 已知配置",
+        "goal": "只读检查当前 AnnData、BAM/注释元数据和会话记录。输出固定字段：样本数、BAM 输入列、注释文件、已记录的 strandedness 及其证据；无法从元数据可靠判断时必须写“未记录”。不得运行 featureCounts、不得修改 adata 或文件。",
+        "skill": "feature-count"
+      },
+      "approval": {
+        "prompt": "上述值是下一步 featureCounts 将使用的链特异性配置；未记录时不会猜测 strandedness。",
+        "review": {
+          "fields": [
+            {
+              "label": "当前会话已记录的 strandedness",
+              "source": "strandedness",
+              "unknown": "未记录"
+            },
+            {
+              "label": "可用参数",
+              "value": "unstranded / forward / reverse"
+            }
+          ],
+          "edit_hint": "请回复“可以”采用上述配置；回复“不可以”并说明问题；或直接回复“strandedness=unstranded/forward/reverse”更改。"
+        }
+      }
+    }
+  ]
+}

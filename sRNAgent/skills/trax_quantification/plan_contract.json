@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "trim-raw-fastq-before-trax",
+      "when": {
+        "input_regex": "\\bfastq_path\\b|(?:^|[/\\\\])[^ \\n\\t]+\\.(?:fastq|fq)(?:\\.gz)?\\b",
+        "unless_context_regex": "\\b(clean_fastq_path|trimmed_path)\\b|\\b(?:clean|trimmed)\\s*(?:fastq|fq)\\b"
+      },
+      "match_step_regex": "FASTQ 质控与修剪|cutadapt|adapter trimming",
+      "insert_before_regex": "trax|trna|trf|tdr",
+      "fallback_before_skill": "trax_quantification",
+      "step": {
+        "title": "完成 tRAX 前的 FASTQ 质控与修剪",
+        "goal": "先运行 sa.fastq.cutadapt，生成 clean_fastq_path / trimmed_path；确认 adapter 与长度过滤后，再将 clean FASTQ 交给 tRAX。",
+        "skill": "fastq-qc"
+      }
+    }
+  ]
+}

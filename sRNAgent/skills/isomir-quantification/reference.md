@@ -1,6 +1,6 @@
 # isoMiR (isomiR) Quantification Quick Reference
 
-## End-to-end: QC → hairpin index → hairpin alignment → mirtop
+## End-to-end: QC → collapse → hairpin index/alignment → mirtop
 
 ```python
 import sRNAgent as sa
@@ -25,8 +25,20 @@ adata_iso = sa.fastq.cutadapt(
     jobs=4,
 )
 
+# 2.5 折叠相同序列。isomiR 从 FASTQ 开始时此步骤不可跳过。
+adata_iso = sa.fastq.seqcluster_collapse(
+    adata_iso,
+    output_dir="collapsed_iso",
+    input_col="trimmed_path",
+    minimum=1,
+    jobs=4,
+)
+# Bowtie 默认读取 trimmed_path；明确改用 collapsed FASTQ。
+adata_iso.obs["trimmed_path"] = adata_iso.obs["collapsed_path"]
+
 # 3. 用 hairpin.fa 建索引（不是全基因组！）
-sa.alignment.bowtie_build("ref/hairpin_hsa.fa", "ref/hairpin_hsa", threads=4)
+index_info = sa.alignment.bowtie_build("ref/hairpin_hsa.fa", "ref/hairpin_hsa", threads=4)
+hairpin_dna = index_info["reference_used"]
 
 # 4. 比对到 hairpin 前体（等价 bowtie -n 1 -l 15 -m 100 --best --strata）
 adata_iso = sa.alignment.bowtie(
@@ -46,7 +58,7 @@ adata_iso = sa.alignment.bowtie(
 adata_iso = sa.quant.mirtop(
     adata_iso,
     gff="ref/hsa.gff3",
-    hairpin="ref/hairpin_hsa.fa",
+    hairpin=hairpin_dna,
     species="hsa",
     granularity="variant",   # 默认不聚合：每个 isomiR 一个特征（要成熟体汇总才用 "miRNA"）
     output_dir="mirtop_out",
@@ -110,7 +122,7 @@ sa.quant.mirtop(
 )
 
 sa.alignment.bowtie(
-    adata,                 # 读取 adata.obs["trimmed_path"]（或 fastq_path）
+    adata,                 # isomiR 流程中读取已替换为 collapsed_path 的 trimmed_path
     index_basename,        # hairpin 索引（bowtie_build 产物）
     seed_mismatches=1, seed_len=15, m=100, best=True, strata=True,
     threads=8, jobs=4,
@@ -120,6 +132,12 @@ sa.fastq.cutadapt(
     adata,
     adapter_3="TGGAATTCTCGGGTGCCAAGG", min_length=15, max_length=35, jobs=4,
 )
+
+sa.fastq.seqcluster_collapse(
+    adata,                 # 读取 adata.obs["trimmed_path"]
+    output_dir="collapsed_out", input_col="trimmed_path", minimum=1, jobs=4,
+)
+# 将 adata.obs["trimmed_path"] 设为 adata.obs["collapsed_path"] 后再调用 bowtie。
 
 sa.reference.download_mirbase(species="hsa", output_dir="ref", jobs=4)
 # → ref/hairpin_hsa.fa + ref/hsa.gff3；species 代码用 sa.reference.list_mirbase_codes() 查
@@ -132,7 +150,7 @@ sa.reference.download_mirbase(species="hsa", output_dir="ref", jobs=4)
 bowtie-build ref/hairpin_hsa.fa ref/hairpin_hsa
 
 # 比对（允许 1 个 seed 错配，最多 100 个 hit，最优 + 分层报告）
-bowtie -n 1 -l 15 -m 100 --best --strata -S ref/hairpin_hsa clean_reads.fq | samtools sort -o sorted.bam
+bowtie -n 1 -l 15 -m 100 --best --strata -S ref/hairpin_hsa collapsed_reads.fastq.gz | samtools sort -o sorted.bam
 
 # mirtop 三阶段
 mirtop gff --sps hsa --gtf ref/hsa.gff3 --hairpin ref/hairpin_hsa.fa --out mirtop_out/ bam1.bam bam2.bam

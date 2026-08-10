@@ -10,7 +10,7 @@ import re
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
-from .tools import list_available_skills, resolve_skill_query
+from .tools import list_available_skills, rank_skill_matches, resolve_skill_query
 
 if TYPE_CHECKING:
     from .srn_agent import SRNAgent, ProgressCallback, CodeApprovalCallback
@@ -20,6 +20,35 @@ STEP_RUNNING = "running"
 STEP_DONE = "done"
 STEP_FAILED = "failed"
 STEP_SKIPPED = "skipped"
+STEP_AWAITING_APPROVAL = "awaiting_approval"
+
+_APPROVAL_ACCEPT_RE = re.compile(
+    r"^\s*(?:可以|确认(?:使用|执行|继续)?|同意|继续|按(?:此|上述)|采用|yes|ok|okay)(?:\s|[，,。.!！]|$)",
+    re.I,
+)
+_APPROVAL_REJECT_RE = re.compile(
+    r"^\s*(?:不可以|不同意|不确认|不要(?:执行|使用)?|否|no)(?:\s|[，,。.!！]|$)",
+    re.I,
+)
+_APPROVAL_ASSIGNMENT_RE = re.compile(
+    r"(?:adapter(?:_3)?|strandedness|group(?:_col)?|control_group|design|min_length|max_length)\s*=\s*\S+",
+    re.I,
+)
+_APPROVAL_EXPLICIT_VALUE_RE = re.compile(r"\b(?:unstranded|forward|reverse|paired|unpaired)\b|\b[ACGTUN]{8,}\b", re.I)
+_GROUP_CONFIRMATION_RE = re.compile(
+    r"(?:确认|同意|采用|按|根据|使用).{0,24}(?:分组|组别|group)|"
+    r"(?:分组|组别|group).{0,24}(?:确认|同意|采用|继续)",
+    re.I,
+)
+_NATURAL_CONTROL_GROUP_RE = re.compile(
+    r"(?:对照组|control(?:\s*group)?)\s*(?:为|是|=|:|：)\s*`?([A-Za-z][\w.-]*)`?|"
+    r"\b([A-Za-z][\w.-]*)\s*(?:是|作为|as)\s*(?:对照组|control(?:\s*group)?)",
+    re.I,
+)
+_NATURAL_DESIGN_RE = re.compile(
+    r"(?:design|设计)\s*(?:为|是|=|:|：)?\s*`?((?:un)?paired|配对|非配对|不配对)`?",
+    re.I,
+)
 
 _MAX_REPLAN_ATTEMPTS = 8
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
@@ -46,7 +75,11 @@ _INTERNAL_REPORT_RE = re.compile(
     r"回复用户|向用户回复|发送问候",
     re.I,
 )
-_TRIMMED_FASTQ_RE = re.compile(r"\b(trimmed_path|clean_fastq_path)\b|(?:^|[/\\])[^ \n\t]+(?:trimmed|clean)[^ \n\t]*\.f(?:ast)?q(?:\.gz)?\b", re.I)
+_TRIMMED_FASTQ_RE = re.compile(
+    r"\b(trimmed_path|clean_fastq_path)\b|\b(?:trimmed|clean)\s*(?:fastq|fq)\b|"
+    r"(?:^|[/\\])[^ \n\t]+(?:trimmed|clean)[^ \n\t]*\.f(?:ast)?q(?:\.gz)?\b",
+    re.I,
+)
 _RAW_FASTQ_RE = re.compile(r"\bfastq_path\b|(?:^|[/\\])[^ \n\t]+\.(?:fastq|fq)(?:\.gz)?\b", re.I)
 _BAM_RE = re.compile(r"\bbam_path\b|(?:^|[/\\])[^ \n\t]+\.bam\b", re.I)
 _GENOME_FASTA_RE = re.compile(
@@ -55,7 +88,7 @@ _GENOME_FASTA_RE = re.compile(
 )
 _GENOME_INDEX_RE = re.compile(r"\bgenome_index\b|\.ebwt\b|index_basename\b", re.I)
 _COUNTS_RE = re.compile(
-    r'\blayers\["counts"\]\b|\badata\.X\b|\bcounts_csv\b|\bfc_counts_csv\b|\bidxstats_file\b|'
+    r"\blayers\[['\"]counts['\"]\]|\badata\.X\b|\bcounts_csv\b|\bfc_counts_csv\b|\bidxstats_file\b|"
     r"\btrnacounts\b|\bshared raw count matrix\b|\braw counts\b",
     re.I,
 )
@@ -74,11 +107,27 @@ _PAIRED_INFEASIBLE_RE = re.compile(
     re.I,
 )
 _MIRNA_RE = re.compile(r"\bmirna\b|miRNA|mirdeep", re.I)
+_PIRNA_RE = re.compile(r"\bpirna\b|piRNA", re.I)
 _TRNA_RE = re.compile(r"\btrna\b|tRNA|tRF|tRAX", re.I)
 _ISOMIR_RE = re.compile(r"\biso[- ]?mir\b|isomiR|mirtop", re.I)
+_ISOMIR_PARALLEL_RE = re.compile(
+    r"(?:iso[- ]?mir|isomiR|mirtop|样本).{0,32}(?:并行|并发|同时|parallel|concurrent)|"
+    r"(?:并行|并发|同时|parallel|concurrent).{0,32}(?:iso[- ]?mir|isomiR|mirtop|样本)",
+    re.I,
+)
+_ISOMIR_REBUILD_RE = re.compile(
+    r"(?:清空|清除|删除|重建|重新生成|重跑).{0,48}(?:mirtop|iso[- ]?mir|isomiR)|"
+    r"(?:从|自).{0,16}(?:hairpin )?(?:比对|alignment|bowtie).{0,32}(?:开始|重建|重新|生成)",
+    re.I,
+)
 _FRAGMENTOMICS_RE = re.compile(r"fragmentomics|fragomics|fragment-analysis|片段组学|FSD|FSC|RCD|EDM|BPM", re.I)
 _UNIFIED_RE = re.compile(r"统一做|统一跑|都跑|一起跑|两组学|两种组学|miRNA\s*\+\s*fragmentomics", re.I)
-_HTML_REPORT_RE = re.compile(r"html\s*报告|html report|report\.html|生成.*html|写.*html|报告", re.I)
+_HTML_REPORT_RE = re.compile(
+    r"html\s*报告|html report|report\.html|生成.*html|写.*html|报告|"
+    r"(?:re[- ]?write|rewrite|re[- ]?style|restyle|finali[sz]e).{0,40}\bhtml\b|"
+    r"\bhtml\b.{0,40}(?:re[- ]?write|rewrite|re[- ]?style|restyle|finali[sz]e)",
+    re.I,
+)
 _DE_SUMMARY_RE = re.compile(r"汇总|summary|切片|输出.*结果|结果.*输出|top\s*(?:de|差异|feature)", re.I)
 _MUDATA_RE = re.compile(r"\bmudata\b|MuData|h5mu|放在\s*mudata|放到\s*mudata|返回\s*mudata", re.I)
 _WHOLE_GENOME_BAM_RE = re.compile(r"全基因组.*bam|whole[-\s]*genome\s+bam|genome[-\s]*aligned\s+bam", re.I)
@@ -86,6 +135,12 @@ _REQUIREMENT_CUE_RE = re.compile(
     r"(必须|需要|要|不要|不能|默认|优先|如果|若|只有|除非|确保|记得|统一做|放在|生成|写入|保存|返回)",
     re.I,
 )
+_EXPLICIT_QUANT_METHOD_RE = re.compile(
+    r"feature[-_ ]?counts?|idxstats?|samtools|mirdeep(?:2)?|mirtop|trax",
+    re.I,
+)
+_QUANT_METHOD_TEXT_RE = re.compile(r"feature[-_ ]?counts?|samtools\s+idxstats?|idxstats?|mirdeep(?:2)?", re.I)
+_QUANTIFICATION_RE = re.compile(r"定量|quant(?:if(?:y|ication))?|count|表达", re.I)
 
 
 def _extract_user_query(history: List[Dict[str, str]]) -> str:
@@ -220,16 +275,18 @@ def _normalize_steps(raw_steps: Any, *, goal: str) -> List[Dict[str, Any]]:
             continue
         title = str(item.get("title") or f"Step {index}").strip()
         step_goal = str(item.get("goal") or title).strip()
-        steps.append(
-            {
-                "id": str(item.get("id") or index),
-                "title": title,
-                "goal": step_goal,
-                "skill": str(item.get("skill") or "").strip(),
-                "status": STEP_PENDING,
-                "result": "",
-            }
-        )
+        normalized = {
+            "id": str(item.get("id") or index),
+            "title": title,
+            "goal": step_goal,
+            "skill": str(item.get("skill") or "").strip(),
+            "status": STEP_PENDING,
+            "result": "",
+        }
+        for field in ("approval", "depends_on", "inputs", "outputs"):
+            if field in item:
+                normalized[field] = deepcopy(item[field])
+        steps.append(normalized)
 
     if not steps:
         return _normalize_steps([], goal=goal)
@@ -245,8 +302,10 @@ def _make_plan_step(
     status: str = STEP_PENDING,
     result: str = "",
     auto_inserted: bool = False,
+    approval: Optional[Dict[str, Any]] = None,
+    execution_contracts: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    return {
+    step = {
         "id": str(step_id),
         "title": str(title).strip(),
         "goal": str(goal).strip(),
@@ -255,6 +314,11 @@ def _make_plan_step(
         "result": str(result or ""),
         "autoInserted": bool(auto_inserted),
     }
+    if approval:
+        step["approval"] = dict(approval)
+    if execution_contracts:
+        step["executionContracts"] = [dict(item) for item in execution_contracts]
+    return step
 
 
 def _context_has_trimmed_fastq(extra_context: str) -> bool:
@@ -304,6 +368,183 @@ def _context_has_logcpm(extra_context: str) -> bool:
     return bool(_LOGCPM_RE.search(extra_context or ""))
 
 
+def _load_planning_skill_guidance(skill_registry: Any, user_query: str) -> str:
+    """Bind the most relevant workflow guides before the planner creates steps."""
+    matches = rank_skill_matches(skill_registry, user_query)
+    sections: List[str] = []
+    for metadata, _score in matches[:6]:
+        skill = skill_registry.load_full_skill(metadata.slug)
+        if skill is None:
+            continue
+        sections.append(
+            f"=== {skill.name} ({skill.slug}) ===\n"
+            f"{skill.prompt_instructions(max_chars=4500)}"
+        )
+    return "\n\n".join(sections)
+
+
+def _load_skill_plan_contracts(
+    skill_registry: Any,
+    user_query: str,
+    *,
+    step_skills: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Load declarative ordering rules from the skills matched for this request."""
+    contracts: List[Dict[str, Any]] = []
+    slugs: List[str] = [metadata.slug for metadata, _score in rank_skill_matches(skill_registry, user_query)[:2]]
+    for slug in step_skills or []:
+        normalized = str(slug or "").strip().lower()
+        if normalized and normalized not in slugs:
+            slugs.append(normalized)
+    for slug in slugs:
+        skill = skill_registry.load_full_skill(slug) if skill_registry else None
+        if skill is None:
+            continue
+        try:
+            raw = json.loads((skill.path / "plan_contract.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for rule in raw.get("rules", []) if isinstance(raw, dict) else []:
+            if isinstance(rule, dict):
+                contracts.append(rule)
+    return contracts
+
+
+def _plan_step_text(step: Dict[str, Any]) -> str:
+    return " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
+
+
+def _apply_skill_plan_contracts(
+    steps: List[Dict[str, Any]],
+    contracts: List[Dict[str, Any]],
+    *,
+    user_query: str,
+    extra_context: str,
+) -> List[Dict[str, Any]]:
+    """Apply skill-owned order, approval, and execution constraints."""
+    planned = [deepcopy(step) for step in steps if isinstance(step, dict)]
+    combined = "\n".join((user_query or "", extra_context or ""))
+    for rule in contracts:
+        when = rule.get("when") if isinstance(rule.get("when"), dict) else {}
+        query_regex = str(when.get("query_regex") or "")
+        input_regex = str(when.get("input_regex") or "")
+        unless_regex = str(when.get("unless_context_regex") or "")
+        try:
+            applies = (
+                (not query_regex or bool(re.search(query_regex, user_query or "", re.I)))
+                and (not input_regex or bool(re.search(input_regex, combined, re.I)))
+                and (not unless_regex or not bool(re.search(unless_regex, combined, re.I)))
+            )
+        except re.error:
+            continue
+        if not applies:
+            continue
+
+        rule_type = str(rule.get("type") or "prerequisite").strip().lower()
+        if rule_type == "order" and (rule.get("before_step_regex") or rule.get("after_step_regex")):
+            before_regex = str(rule.get("before_step_regex") or "")
+            after_regex = str(rule.get("after_step_regex") or "")
+            if not before_regex or not after_regex:
+                continue
+            try:
+                before_index = next(
+                    (index for index, step in enumerate(planned)
+                     if re.search(before_regex, _plan_step_text(step), re.I)),
+                    None,
+                )
+                after_index = next(
+                    (index for index, step in enumerate(planned)
+                     if re.search(after_regex, _plan_step_text(step), re.I)),
+                    None,
+                )
+            except re.error:
+                continue
+            if before_index is not None and after_index is not None and before_index > after_index:
+                moved = planned.pop(before_index)
+                planned.insert(after_index, moved)
+            continue
+        if rule_type == "execution":
+            target_regex = str(rule.get("target_step_regex") or "")
+            execution = rule.get("execution") if isinstance(rule.get("execution"), dict) else {}
+            if not target_regex or not execution:
+                continue
+            try:
+                targets = [step for step in planned if re.search(target_regex, _plan_step_text(step), re.I)]
+            except re.error:
+                continue
+            for target in targets:
+                existing = target.setdefault("executionContracts", [])
+                if isinstance(existing, list):
+                    existing.append({"id": str(rule.get("id") or "execution"), **execution})
+            continue
+
+        match_regex = str(rule.get("match_step_regex") or "")
+        before_regex = str(rule.get("insert_before_regex") or "")
+        fallback_skill = str(rule.get("fallback_before_skill") or "").strip().lower()
+        spec = rule.get("step") if isinstance(rule.get("step"), dict) else {}
+        if not match_regex or not spec:
+            continue
+        try:
+            matches = [step for step in planned if re.search(match_regex, _plan_step_text(step), re.I)]
+        except re.error:
+            continue
+        # Remove any LLM-proposed occurrence, then place exactly one at the
+        # contract's dependency boundary.
+        planned = [step for step in planned if step not in matches]
+        candidate = matches[0] if matches else {}
+        contract_step = _make_plan_step(
+            step_id=str(candidate.get("id") or len(planned) + 1),
+            title=str(spec.get("title") or candidate.get("title") or "Required prerequisite"),
+            goal=str(spec.get("goal") or candidate.get("goal") or ""),
+            skill=str(spec.get("skill") or candidate.get("skill") or ""),
+            status=str(candidate.get("status") or STEP_PENDING),
+            result=str(candidate.get("result") or ""),
+            auto_inserted=True,
+            approval=(
+                {"id": str(rule.get("id") or "approval"), **rule.get("approval", {})}
+                if rule_type == "approval" and isinstance(rule.get("approval"), dict)
+                else None
+            ),
+        )
+        preflight_spec = rule.get("preflight") if rule_type == "approval" and isinstance(rule.get("preflight"), dict) else {}
+        preflight_step: Optional[Dict[str, Any]] = None
+        if preflight_spec:
+            preflight_title = str(preflight_spec.get("title") or "读取待确认配置").strip()
+            # A contract can be reapplied during replanning; retain one
+            # read-only preflight rather than stacking identical inspections.
+            planned = [
+                step for step in planned
+                if str(step.get("title") or "").strip() != preflight_title
+            ]
+            preflight_step = _make_plan_step(
+                step_id=f"{contract_step['id']}-preflight",
+                title=preflight_title,
+                goal=str(preflight_spec.get("goal") or "只读检查待确认配置，不修改数据或文件。"),
+                skill=str(preflight_spec.get("skill") or contract_step.get("skill") or ""),
+                auto_inserted=True,
+            )
+        insert_at = len(planned)
+        if before_regex:
+            try:
+                insert_at = next(
+                    (index for index, step in enumerate(planned) if re.search(before_regex, _plan_step_text(step), re.I)),
+                    insert_at,
+                )
+            except re.error:
+                pass
+        if insert_at == len(planned) and fallback_skill:
+            insert_at = next(
+                (index for index, step in enumerate(planned)
+                 if str(step.get("skill") or "").strip().lower() == fallback_skill),
+                insert_at,
+                )
+        if preflight_step is not None:
+            planned.insert(insert_at, preflight_step)
+            insert_at += 1
+        planned.insert(insert_at, contract_step)
+    return planned
+
+
 def _context_has_group_info(extra_context: str) -> bool:
     return bool(_GROUP_RE.search(extra_context or ""))
 
@@ -337,7 +578,7 @@ def _step_modality(step: Dict[str, Any]) -> str:
         return "fragmentomics"
     if _ISOMIR_RE.search(text):
         return "isomir"
-    if _MIRNA_RE.search(text) or _TRNA_RE.search(text):
+    if _MIRNA_RE.search(text) or _PIRNA_RE.search(text) or _TRNA_RE.search(text):
         return "srna"
     return "general"
 
@@ -356,7 +597,7 @@ def _requires_srna_and_fragmentomics(user_query: str, steps: List[Dict[str, Any]
     )
     combined = f"{user_query}\n{step_text}"
     return bool(
-        (_MIRNA_RE.search(combined) or _TRNA_RE.search(combined))
+        (_MIRNA_RE.search(combined) or _PIRNA_RE.search(combined) or _TRNA_RE.search(combined))
         and _FRAGMENTOMICS_RE.search(combined)
     )
 
@@ -372,12 +613,12 @@ def _apply_modality_boundaries(
     has_srna_and_fragmentomics = _requires_srna_and_fragmentomics(user_query, steps)
     if has_srna_and_fragmentomics:
         normalized_goal = re.sub(
-            r"miRNA\s*[、,，和与+]+\s*tRNA\s*[、,，和与+]+\s*片段组学\s*(三类|三种|三模态|3 类|3 种|3 模态)",
-            "miRNA 与 tRNA（同属 srna）及片段组学两种模态",
+            r"miRNA(?:\s*[、,，和与+]+\s*piRNA)?\s*[、,，和与+]+\s*tRNA\s*[、,，和与+]+\s*片段组学\s*(?:三|四|3|4)(?:类|种|模态)",
+            "miRNA、piRNA 与 tRNA（同属 srna）及片段组学两种模态",
             normalized_goal,
             flags=re.I,
         )
-        normalized_goal = re.sub(r"三模态|3\s*模态", "两种模态", normalized_goal, flags=re.I)
+        normalized_goal = re.sub(r"(?:三|四|3|4)\s*模态", "两种模态", normalized_goal, flags=re.I)
         normalized_goal = re.sub(
             r"各自独立的?\s*AnnData",
             "srna 与 fragmentomics 的独立 AnnData",
@@ -386,7 +627,7 @@ def _apply_modality_boundaries(
         )
         if "srna" not in normalized_goal.lower() or "两种模态" not in normalized_goal:
             normalized_goal = (
-                f"{normalized_goal}（miRNA 与 tRNA 共用 srna AnnData；"
+                f"{normalized_goal}（miRNA、piRNA 与 tRNA 共用 srna AnnData；"
                 "片段组学使用独立 fragmentomics AnnData）"
             )
 
@@ -406,11 +647,75 @@ def _apply_modality_boundaries(
         step_goal = re.sub(r"(?:MuData|h5mu)[^；;。]*", "独立 fragmentomics AnnData", step_goal, flags=re.I)
         updated["goal"] = step_goal
         if modality == "srna" and "srna AnnData" not in step_goal:
-            updated["goal"] = f"{step_goal}；miRNA 与 tRNA/tRF 结果共用 srna AnnData。".strip("；")
+            updated["goal"] = f"{step_goal}；miRNA、piRNA 与 tRNA/tRF 结果共用 srna AnnData。".strip("；")
         elif modality == "fragmentomics" and "fragmentomics AnnData" not in step_goal:
             updated["goal"] = f"{step_goal}；结果写入独立 fragmentomics AnnData。".strip("；")
         bounded.append(updated)
     return normalized_goal, bounded
+
+
+def _user_named_method_for_modality(user_text: str, modality_re: re.Pattern[str]) -> bool:
+    """Whether the user, rather than a generated plan, chose a method for one RNA type."""
+    text = str(user_text or "")
+    hits = list(modality_re.finditer(text))
+    if not hits:
+        return False
+    for hit in hits:
+        window = text[max(0, hit.start() - 96):min(len(text), hit.end() + 96)]
+        if _EXPLICIT_QUANT_METHOD_RE.search(window):
+            return True
+    requested_types = int(bool(_PIRNA_RE.search(text))) + int(bool(_MIRNA_RE.search(text)))
+    return requested_types == 1 and bool(_EXPLICIT_QUANT_METHOD_RE.search(text))
+
+
+def _skill_default_for_quantification_step(
+    skill_registry: Any,
+    step: Dict[str, Any],
+    *,
+    user_text: str,
+) -> str:
+    """Select mandatory defaults from skill metadata, never from a planner method."""
+    if not skill_registry:
+        return ""
+    text = _plan_step_text(step)
+    if not _QUANTIFICATION_RE.search(text):
+        return ""
+    target = ""
+    if _MIRNA_RE.search(text) and not _PIRNA_RE.search(text) and not _user_named_method_for_modality(user_text, _MIRNA_RE):
+        target = "mirna_quantification"
+    elif _PIRNA_RE.search(text) and not _MIRNA_RE.search(text) and not _user_named_method_for_modality(user_text, _PIRNA_RE):
+        target = "pirna_quantification"
+    if not target:
+        return ""
+    for metadata in getattr(skill_registry, "skill_metadata", {}).values():
+        if str(metadata.metadata.get("default_for") or "").strip().lower() == target:
+            return metadata.slug
+    return ""
+
+
+def _bind_execution_skill_from_registry(
+    step: Dict[str, Any],
+    skill_registry: Any,
+    history: List[Dict[str, str]],
+) -> None:
+    """Make a skill-declared default authoritative immediately before execution."""
+    user_text = "\n".join(
+        str(item.get("content") or "")
+        for item in history
+        if isinstance(item, dict) and str(item.get("role") or "") == "user"
+    )
+    selected = _skill_default_for_quantification_step(
+        skill_registry, step, user_text=user_text,
+    )
+    if not selected:
+        return
+    previous = str(step.get("skill") or "").strip()
+    step["skill"] = selected
+    replacement = "miRDeep2" if selected == "mirdeep2-mirna" else "samtools idxstats"
+    for key in ("title", "goal"):
+        step[key] = _QUANT_METHOD_TEXT_RE.sub(replacement, str(step.get(key) or ""))
+    if previous != selected:
+        step["skillBoundAtExecution"] = selected
 
 
 def _replace_paired_with_unpaired(text: str) -> str:
@@ -495,7 +800,7 @@ def _resolve_analysis_policy(
     if not modalities and _UNIFIED_RE.search(combined):
         modalities = ["srna", "fragmentomics"]
     elif not modalities:
-        if _MIRNA_RE.search(combined) or _TRNA_RE.search(combined):
+        if _MIRNA_RE.search(combined) or _PIRNA_RE.search(combined) or _TRNA_RE.search(combined):
             modalities.append("srna")
         if _FRAGMENTOMICS_RE.search(combined):
             modalities.append("fragmentomics")
@@ -650,7 +955,8 @@ def _is_quantification_step(step: Dict[str, Any]) -> bool:
     return skill in {"isomir-quantification", "fragment-analysis"} or bool(
         _ISOMIR_RE.search(text) and re.search(r"定量|quant", text, re.I)
     ) or bool(
-        _FRAGMENTOMICS_RE.search(text) and re.search(r"定量|quant|提取|extract", text, re.I)
+        re.search(r"fragmentomics|fragomics|片段组学", text, re.I)
+        and re.search(r"定量|quant|提取|extract", text, re.I)
     )
 
 
@@ -672,12 +978,12 @@ def _order_de_workflow_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]
     reports: List[Dict[str, Any]] = []
     for step in steps:
         text = " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
-        if _is_de_step(step):
-            de_steps.append(step)
+        if _is_de_input_validation_step(step):
+            validation.append(step)
         elif _is_quantification_step(step):
             quantification.append(step)
-        elif _is_de_input_validation_step(step):
-            validation.append(step)
+        elif _is_de_step(step):
+            de_steps.append(step)
         elif _HTML_REPORT_RE.search(text):
             reports.append(step)
         elif _DE_SUMMARY_RE.search(text):
@@ -738,6 +1044,28 @@ def _resolve_requirements_policy(
     # independent AnnData objects.
     mudata_required = bool(_MUDATA_RE.search(str(user_query or "")))
     whole_genome_bam_required = bool(_WHOLE_GENOME_BAM_RE.search(combined))
+    isomir_parallel_workers: Optional[int] = None
+    isomir_jobs_match = re.search(r"\bjobs\s*=\s*(\d{1,2})\b", str(user_query or ""), re.I)
+    if _ISOMIR_PARALLEL_RE.search(str(user_query or "")) or (_ISOMIR_RE.search(str(user_query or "")) and isomir_jobs_match):
+        worker_match = re.search(
+            r"(?:最多|至多|用|以|)(\d{1,2})\s*(?:个|路)?\s*(?:样本|worker|workers|并发|并行|同时)",
+            str(user_query or ""),
+            re.I,
+        )
+        chinese_worker_match = re.search(
+            r"([一二三四五六七八九十])\s*(?:个|路)?\s*(?:样本|并发|并行|同时)",
+            str(user_query or ""),
+        )
+        if isomir_jobs_match:
+            isomir_parallel_workers = max(2, min(int(isomir_jobs_match.group(1)), 32))
+        elif worker_match:
+            isomir_parallel_workers = max(2, min(int(worker_match.group(1)), 32))
+        elif chinese_worker_match:
+            isomir_parallel_workers = {
+                "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+            }[chinese_worker_match.group(1)]
+    isomir_rebuild_from_alignment = bool(_ISOMIR_REBUILD_RE.search(str(user_query or "")))
     default_unpaired = str((analysis or {}).get("design") or "").strip().lower() == "unpaired"
     if not default_unpaired and not bool(_PAIRED_RE.search(user_query or "")):
         if _UNPAIRED_RE.search(str(user_query or "")) or _DE_STEP_RE.search(str(user_query or "")):
@@ -752,6 +1080,13 @@ def _resolve_requirements_policy(
         derived_items.append("如果已经有小RNA定量，片段组学结果必须放在 MuData 下并优先写出 h5mu。")
     if whole_genome_bam_required:
         derived_items.append("片段组学输入 BAM 必须是全基因组坐标系、与 genome FASTA 一致的 whole-genome BAM。")
+    if isomir_rebuild_from_alignment:
+        derived_items.append("这是一次新的 isomiR 重建：旧 mirtop 输出、旧 isomir AnnData 和中断计划均不可复用；从 hairpin 比对产物开始核验并重建。")
+    if isomir_parallel_workers:
+        derived_items.append(
+            f"isomiR mirtop 必须按样本隔离输出目录并最多 {isomir_parallel_workers} 路并发；"
+            "不得把全部 BAM 交给单次 sa.quant.mirtop 调用。"
+        )
 
     for item in derived_items:
         normalized = _normalise_requirement_text(item)
@@ -765,6 +1100,8 @@ def _resolve_requirements_policy(
         "mudata_required": mudata_required,
         "whole_genome_bam_required": whole_genome_bam_required,
         "default_unpaired": default_unpaired,
+        "isomir_parallel_workers": isomir_parallel_workers,
+        "isomir_rebuild_from_alignment": isomir_rebuild_from_alignment,
     }
 
 
@@ -792,6 +1129,7 @@ def _expand_plan_prerequisites(
     steps: List[Dict[str, Any]],
     *,
     extra_context: str,
+    user_query: str = "",
 ) -> List[Dict[str, Any]]:
     expanded: List[Dict[str, Any]] = []
     next_id = 1
@@ -906,7 +1244,6 @@ def _expand_plan_prerequisites(
                     goal="确保 reference-download 提供 genome_fasta 或已有可用参考 FASTA，供 BPM 断点基序计算使用。",
                     skill="reference-download",
                 )
-                next_id += 0
                 has_genome_fasta = True
         elif skill_slug == "differential-analysis":
             modality = _step_modality(step)
@@ -1070,8 +1407,17 @@ def _expand_plan_prerequisites(
     return expanded or steps
 
 
-def _build_planner_system_prompt(skill_overview: str) -> str:
+def _build_planner_system_prompt(skill_overview: str, workflow_guidance: str = "") -> str:
     skills_block = skill_overview or "(no skills loaded)"
+    workflow_block = ""
+    if workflow_guidance:
+        workflow_block = (
+            "\n## Bound workflow guidance\n"
+            "The following matched SKILL.md content is the source of truth for this request. "
+            "Turn every mandatory transformation, required input, and prohibited shortcut into an explicit "
+            "ordered plan step. Do not replace a skill requirement with a generic shortcut.\n\n"
+            f"{workflow_guidance}\n"
+        )
     try:
         from .srn_agent import _load_agent_constitution
 
@@ -1098,7 +1444,8 @@ def _build_planner_system_prompt(skill_overview: str) -> str:
         '      "id": "1",\n'
         '      "title": "short step title",\n'
         '      "goal": "specific objective for this step only",\n'
-        '      "skill": "optional skill slug from registered skills, or empty string"\n'
+        '      "skill": "optional skill slug from registered skills, or empty string",\n'
+        '      "approval": "optional object; required when this step needs a user decision. Include id, prompt, and review.fields/edit_hint"\n'
         "    }\n"
         "  ]\n"
         "}\n\n"
@@ -1108,27 +1455,104 @@ def _build_planner_system_prompt(skill_overview: str) -> str:
         "reference → alignment → quantification.\n"
         "3. Each step must be independently completable in one focused execution session.\n"
         "4. Do not duplicate work already marked done in session context.\n"
+        "4a. Before returning the plan, reason over an artifact dependency graph: every step that consumes an "
+        "artifact must follow its producer. A synthesis deliverable (report, table, dashboard, export, or summary) "
+        "must follow every requested analysis whose outputs it presents.\n"
+        "4b. A user confirmation is a blocking state, not an executable step. Whenever a step requires a choice, "
+        "confirmation, parameter, or grouping from the user, emit an `approval` object containing an id, prompt, "
+        "and review fields that display the concrete values or clearly say what is unknown.\n"
         "5. Prefer skill slugs when a step matches a registered skill.\n"
         "6. Keep 1–8 steps; split oversized steps rather than one giant step.\n"
         "7. For differential analysis, default to unpaired unless the user explicitly asks for paired.\n"
         "8. If session context says paired is not feasible, do NOT plan paired DE steps.\n"
         "9. Do not keep paired and unpaired DE branches simultaneously unless the user explicitly asks to compare both.\n"
-        "10. If the user asks for an HTML report, keep an explicit final step that writes a real .html artifact.\n"
-        "11. miRNA and tRNA/tRF are one `srna` modality and must share one srna AnnData. "
-        "They are not two modalities. A request for miRNA + tRNA + fragmentomics therefore has exactly "
+        "10. Model requested deliverables by the artifacts they consume; do not schedule a consumer before its inputs exist.\n"
+        "11. miRNA, piRNA, and tRNA/tRF are one `srna` modality and must share one srna AnnData. "
+        "They are not separate modalities. A request for miRNA + piRNA + tRNA + fragmentomics therefore has exactly "
         "two independent AnnData outputs: srna and fragmentomics. Do not propose MuData or joint analysis.\n"
         "12. If the latest request refers to earlier work ('continue', 'on this basis', '刚才的结果'), "
         "use the recent conversation and session context to identify completed prerequisites. "
         "Plan only the new requested work; never recreate completed QC, alignment, or quantification steps "
-        "unless the relevant artifact is missing.\n\n"
+        "unless the relevant artifact is missing.\n"
+        "13. A request that explicitly clears/rebuilds mirtop or says to restart from hairpin alignment starts "
+        "a NEW isomiR workflow. Do not restore an interrupted mirtop plan or reuse its in-memory AnnData. "
+        "If the user requests parallel isomiR samples, plan per-sample isolated mirtop GFF jobs and a final "
+        "aggregation step. mirtop gff has no jobs/threads option, so never claim that sa.quant.mirtop can "
+        "provide sample-level parallelism.\n"
+        "14. For any isomiR workflow starting from trimmed/clean FASTQ, insert sequence collapse before hairpin "
+        "alignment: `sa.fastq.seqcluster_collapse` -> `collapsed_path` -> Bowtie -> new hairpin BAM -> mirtop. "
+        "Never describe or execute a trimmed FASTQ -> Bowtie -> mirtop path, and never reuse BAM produced from "
+        "un-collapsed FASTQ.\n"
+        "15. Default small-RNA quantification methods: for piRNA use `samtools_idxstats` after alignment to a "
+        "piRNA FASTA reference; do not use featureCounts unless the user explicitly requests featureCounts. "
+        "For miRNA quantification use `mirdeep2-mirna` / miRDeep2; do not substitute featureCounts unless "
+        "the user explicitly requests it.\n\n"
         "## Registered skills\n"
         f"{skills_block}\n"
+        f"{workflow_block}"
         f"{constitution_block}"
     )
 
 
-def _build_replanner_system_prompt(skill_overview: str) -> str:
-    base = _build_planner_system_prompt(skill_overview)
+def _build_plan_review_system_prompt(skill_guidance: str = "") -> str:
+    guidance = f"\n\n## Relevant SKILL.md guidance\n{skill_guidance}" if skill_guidance else ""
+    return (
+        "You are the plan reviewer for a scientific analysis agent. You do not execute work. "
+        "Review a proposed JSON plan against the user's request and the supplied skill guidance, then return a "
+        "corrected JSON plan only.\n\n"
+        "Construct the dependency graph from declared inputs and outputs. Every consumer must be after its producer. "
+        "A synthesis deliverable such as a report, table, dashboard, export, or summary must be after every requested "
+        "analysis whose output it consumes; it cannot claim unavailable results. Preserve valid work, remove duplicates, "
+        "and add missing prerequisite steps only when required by a skill. Do not invent methods, files, or assumptions.\n\n"
+        "A step that asks the user to confirm, choose, provide, or validate any configuration MUST carry an `approval` "
+        "object (`id`, `prompt`, and `review.fields`/`review.edit_hint`). The review fields must show concrete known "
+        "values; if a required value is unknown, they must state what the user should provide or where to retrieve it. "
+        "Such a step is a blocking gate and cannot be an ordinary executable "
+        "step. In particular, do not place any downstream analysis after an unrepresented user decision.\n\n"
+        "Return exactly {\"goal\": string, \"steps\": [{\"id\": string, \"title\": string, \"goal\": string, "
+        "\"skill\": string, \"depends_on\": [step id], \"inputs\": [artifact], \"outputs\": [artifact], "
+        "optional \"approval\": object}]}. Include every approval required by a skill contract in the plan."
+        f"{guidance}"
+    )
+
+
+def _load_plan_review_skill_guidance(
+    skill_registry: Any,
+    raw_steps: Any,
+    user_query: str,
+) -> str:
+    """Give the reviewer the skills named by the draft plus relevant discovered skills."""
+    if not skill_registry:
+        return ""
+    slugs: List[str] = []
+    for step in raw_steps if isinstance(raw_steps, list) else []:
+        if isinstance(step, dict):
+            slug = str(step.get("skill") or "").strip().lower()
+            if slug and slug not in slugs:
+                slugs.append(slug)
+    for metadata, _score in rank_skill_matches(skill_registry, user_query)[:6]:
+        if metadata.slug not in slugs:
+            slugs.append(metadata.slug)
+    sections: List[str] = []
+    for slug in slugs[:8]:
+        skill = skill_registry.load_full_skill(slug)
+        if skill is not None:
+            section = f"=== {skill.slug} ===\n{skill.prompt_instructions(max_chars=2500)}"
+            contract_path = skill.path / "plan_contract.json"
+            try:
+                contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                contract = None
+            if contract:
+                section += "\n\nPlan contract (follow its dependencies and approvals):\n" + json.dumps(
+                    contract, ensure_ascii=False,
+                )
+            sections.append(section)
+    return "\n\n".join(sections)
+
+
+def _build_replanner_system_prompt(skill_overview: str, workflow_guidance: str = "") -> str:
+    base = _build_planner_system_prompt(skill_overview, workflow_guidance)
     return (
         f"{base}\n"
         "## Replanning mode\n"
@@ -1150,6 +1574,7 @@ def _build_executor_system_prompt(
     analysis: Optional[Dict[str, Any]] = None,
     deliverables: Optional[Dict[str, Any]] = None,
     requirements: Optional[Dict[str, Any]] = None,
+    confirmed_approvals: str = "",
     skill_prompt: str = "",
     conversation_context: str = "",
 ) -> str:
@@ -1165,6 +1590,19 @@ def _build_executor_system_prompt(
             "\n## Bound workflow skill for this subtask\n"
             "Follow the workflow constraints below as hard guidance for this step.\n\n"
             f"{skill_prompt}\n"
+        )
+    execution_contract_block = ""
+    execution_contracts = step.get("executionContracts") if isinstance(step.get("executionContracts"), list) else []
+    instructions = [
+        str(item.get("instructions") or "").strip()
+        for item in execution_contracts
+        if isinstance(item, dict) and str(item.get("instructions") or "").strip()
+    ]
+    if instructions:
+        execution_contract_block = (
+            "\n## Bound execution contract\n"
+            "These constraints are supplied by the selected skill and are mandatory for this step.\n"
+            + "".join(f"- {instruction}\n" for instruction in instructions)
         )
     analysis_block = ""
     if isinstance(analysis, dict) and analysis:
@@ -1200,11 +1638,37 @@ def _build_executor_system_prompt(
             f"- requirements.html_report_requested = {bool(requirements.get('html_report_requested'))}\n"
             f"- requirements.mudata_required = {bool(requirements.get('mudata_required'))}\n"
             f"- requirements.whole_genome_bam_required = {bool(requirements.get('whole_genome_bam_required'))}\n"
+            f"- requirements.isomir_rebuild_from_alignment = {bool(requirements.get('isomir_rebuild_from_alignment'))}\n"
+            f"- requirements.isomir_parallel_workers = {requirements.get('isomir_parallel_workers') or 'none'}\n"
         )
         if items:
             requirements_block += "\n".join(f"- requirement: {item}\n" for item in items)
         requirements_block += (
             "Hard rule: do not ignore, overwrite, or silently drop these user requirements during replanning or execution.\n"
+        )
+        if requirements.get("isomir_rebuild_from_alignment"):
+            requirements_block += (
+                "Hard rule: this is a new workflow scope. Verify or recreate the requested hairpin BAM inputs, "
+                "then rebuild isomiR outputs. Do not resume an interrupted mirtop subprocess or trust its old plan status.\n"
+            )
+        if requirements.get("isomir_parallel_workers"):
+            requirements_block += (
+                "Hard rule: upstream `mirtop gff` has no `jobs` or `threads` option. Do not call "
+                "`sa.quant.mirtop` once over all BAMs for this task. Launch one mirtop GFF job per sample in "
+                "a private staging directory, limit concurrent jobs to the requested worker count, validate each "
+                "per-sample GFF, then aggregate and persist the independent isomir AnnData. Drive UI progress from "
+                "worker completion/return events: after each completed worker print exactly `progress: N / TOTAL <sample>` "
+                "with `flush=True`. Do not wait until all worker threads join to print progress, and do not use "
+                "`capture_output=True` for mirtop's high-volume logs; redirect each worker's output to its own log file.\n"
+            )
+    approval_block = ""
+    if confirmed_approvals:
+        approval_block = (
+            "\n## User-confirmed configuration\n"
+            "The user explicitly confirmed or changed these settings. Apply them exactly; "
+            "they override skill examples and defaults. An explicit assignment in the user's reply "
+            "overrides any earlier detected value.\n"
+            f"{confirmed_approvals}\n"
         )
     conversation_block = ""
     if conversation_context:
@@ -1219,6 +1683,7 @@ def _build_executor_system_prompt(
         f"Title: {step.get('title') or 'Subtask'}\n"
         f"Goal: {step.get('goal') or plan_goal}\n"
         f"{skill_hint}\n\n"
+        f"{execution_contract_block}"
         "IMPORTANT: Complete ONLY this subtask in this session.\n"
         "- Do not start later pipeline stages.\n"
         "- When done, call `finish` with your message TO THE USER.\n"
@@ -1226,8 +1691,11 @@ def _build_executor_system_prompt(
         "- NEVER write internal status reports (e.g. '已向用户…', '等待用户下一步', "
         "'Task completed', 'Step done').\n"
         "- The Jupyter kernel state (e.g. adata) persists across steps.\n"
+        "- For any multi-item or parallel operation, use `sRNAgent._utils.run_threads` instead of hand-written "
+        "ThreadPoolExecutor, ProcessPoolExecutor, Semaphore, or thread join loops. It emits standard `progress: N/M` "
+        "and `inflight:` events compatible with the UI.\n"
     )
-    return f"{agent_system_prompt}\n{skill_block}{analysis_block}{deliverables_block}{requirements_block}{conversation_block}{step_block}"
+    return f"{agent_system_prompt}\n{skill_block}{analysis_block}{deliverables_block}{requirements_block}{approval_block}{conversation_block}{step_block}"
 
 
 def _build_step_user_message(
@@ -1255,6 +1723,8 @@ def _step_failed(result: str) -> bool:
         return True
     if "cancelled" in lowered or "canceled" in lowered:
         return True
+    if "step_execution_error:" in lowered:
+        return True
     return False
 
 
@@ -1271,6 +1741,175 @@ def _format_plan_for_planner(plan: Dict[str, Any]) -> str:
             preview = result[:300] + ("…" if len(result) > 300 else "")
             line += f"\n    result: {preview}"
         lines.append(line)
+    return "\n".join(lines)
+
+
+def _approval_value_from_context(source: str, context: str, plan: Dict[str, Any]) -> str:
+    text = str(context or "")
+    normalized = str(source or "").strip().lower()
+    if normalized == "adapter":
+        match = re.search(
+            r"(?:adapter(?:_3)?|3['’]?\s*(?:adapter|接头)|接头)\s*(?:=|:|：|为|使用)?\s*([ACGTUN]{8,})",
+            text,
+            re.I,
+        )
+        return match.group(1).upper() if match else ""
+    if normalized == "strandedness":
+        match = re.search(r"\b(unstranded|forward|reverse)\b", text, re.I)
+        return match.group(1).lower() if match else ""
+    if normalized == "analysis_design":
+        explicit = re.search(r"(?:DESIGN|设计)\s*[:=：]\s*`?((?:un)?paired|配对|非配对|不配对)`?", text, re.I)
+        if explicit:
+            value = explicit.group(1).lower()
+            return "unpaired" if value in {"非配对", "不配对"} else ("paired" if value == "配对" else value)
+        analysis = plan.get("analysis") if isinstance(plan.get("analysis"), dict) else {}
+        design = str(analysis.get("design") or "").strip()
+        reason = str(analysis.get("reason") or "").strip()
+        return f"{design}{f' ({reason})' if reason else ''}" if design else ""
+    labels = {
+        "group_column": r"GROUP_COLUMN\s*[:=：]\s*(.+?)(?=\s+(?:GROUP_COUNTS|CONTROL_GROUP|DESIGN)\s*[:=：]|$)",
+        "group_counts": r"GROUP_COUNTS\s*[:=：]\s*(.+?)(?=\s+(?:CONTROL_GROUP|DESIGN)\s*[:=：]|$)",
+        "control_group": r"CONTROL_GROUP\s*[:=：]\s*(.+?)(?=\s+DESIGN\s*[:=：]|$)",
+        "input_fastq": r"INPUT_FASTQ\s*[:=：]\s*(.+?)(?=\s+(?:SAMPLE_COUNT|ADAPTER_3|MIN_LENGTH|MAX_LENGTH)\s*[:=：]|$)",
+        "sample_count": r"SAMPLE_COUNT\s*[:=：]\s*(.+?)(?=\s+(?:ADAPTER_3|MIN_LENGTH|MAX_LENGTH)\s*[:=：]|$)",
+        "adapter_3": r"ADAPTER_3\s*[:=：]\s*(.+?)(?=\s+(?:MIN_LENGTH|MAX_LENGTH)\s*[:=：]|$)",
+        "min_length": r"MIN_LENGTH\s*[:=：]\s*(.+?)(?=\s+MAX_LENGTH\s*[:=：]|$)",
+        "max_length": r"MAX_LENGTH\s*[:=：]\s*(.+?)(?=$)",
+    }
+    if normalized == "group_column":
+        explicit = re.search(labels[normalized], text, re.I)
+        if explicit:
+            return explicit.group(1).strip()
+        # Existing reports often summarize this as `group: 15 Tumor / 15 Normal`
+        # instead of emitting the preflight contract's canonical labels.
+        if re.search(r"\b(?:adata\.obs\[['\"])?group(?:['\"]\])?\s*[:=：]", text, re.I):
+            return "group"
+        return ""
+    if normalized == "group_counts":
+        explicit = re.search(labels[normalized], text, re.I)
+        if explicit:
+            return explicit.group(1).strip()
+        summary = re.search(
+            r"\bgroup\s*[:=：]\s*((?:\d+\s+[A-Za-z][\w.-]*\s*(?:/|,|；|;)?\s*){2,})",
+            text,
+            re.I,
+        )
+        return summary.group(1).strip(" /,;；") if summary else ""
+    pattern = labels.get(normalized)
+    if pattern:
+        match = re.search(pattern, text, re.I)
+        return match.group(1).strip() if match else ""
+    return ""
+
+
+def _format_completed_approval_evidence(plan: Dict[str, Any], step: Dict[str, Any]) -> List[str]:
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    try:
+        current_index = steps.index(step)
+    except ValueError:
+        current_index = len(steps)
+    evidence: List[str] = []
+    for prior in reversed(steps[:current_index]):
+        if not isinstance(prior, dict) or prior.get("status") != STEP_DONE:
+            continue
+        result = re.sub(r"\s+", " ", str(prior.get("result") or "")).strip()
+        if not result:
+            continue
+        title = str(prior.get("title") or prior.get("id") or "已完成检查").strip()
+        evidence.append(f"{title}: {result[:800]}{'…' if len(result) > 800 else ''}")
+        if len(evidence) >= 2:
+            break
+    return list(reversed(evidence))
+
+
+def _build_approval_request(
+    plan: Dict[str, Any],
+    step: Dict[str, Any],
+    *,
+    history: List[Dict[str, str]],
+    extra_context: str,
+) -> str:
+    """Render a reviewable approval request instead of a blind yes/no gate."""
+    approval = step.get("approval") if isinstance(step.get("approval"), dict) else {}
+    review = approval.get("review") if isinstance(approval.get("review"), dict) else {}
+    conversation = "\n".join(
+        str(item.get("content") or "")
+        for item in history
+        if isinstance(item, dict)
+    )
+    context = "\n".join((conversation, extra_context, "\n".join(_format_completed_approval_evidence(plan, step))))
+    lines = [f"配置审阅（尚未执行）：{step.get('title') or step.get('goal') or '当前配置'}", "", "当前已知信息与拟使用配置："]
+    fields = review.get("fields") if isinstance(review.get("fields"), list) else []
+    reviewed = approval.setdefault("reviewed", {})
+    if not isinstance(reviewed, dict):
+        reviewed = {}
+        approval["reviewed"] = reviewed
+    for field in fields:
+        if not isinstance(field, dict):
+            continue
+        label = str(field.get("label") or field.get("key") or "配置").strip()
+        value = str(field.get("value") or "").strip()
+        source = str(field.get("source") or "").strip()
+        if source:
+            value = _approval_value_from_context(source, context, plan) or value
+        if not value:
+            value = str(field.get("unknown") or "未记录").strip()
+        lines.append(f"- {label}: {value}")
+        key = str(field.get("key") or source or label).strip()
+        if key and value and value != str(field.get("unknown") or "").strip():
+            reviewed[key] = value
+
+    evidence = _format_completed_approval_evidence(plan, step)
+    if evidence:
+        lines.append("- 已完成检查:")
+        lines.extend(f"  - {item}" for item in evidence)
+
+    if str(approval.get("id") or "") == "confirm-groups-before-de":
+        group_column = str(reviewed.get("group_column") or "未记录").strip()
+        group_counts = str(reviewed.get("group_counts") or "未记录").strip()
+        control_group = str(reviewed.get("control_group") or "未记录").strip()
+        design = str(reviewed.get("analysis_design") or "未记录").strip()
+        lines.extend([
+            "",
+            f"摘要：目前分组列为 `{group_column}`（{group_counts}）；"
+            f"拟使用 `{control_group}` 作为对照组，统计设计为 `{design}`。",
+        ])
+    if str(approval.get("id") or "") == "confirm-adapter-before-trimming":
+        input_fastq = str(reviewed.get("input_fastq") or "未记录").strip()
+        sample_count = str(reviewed.get("sample_count") or "未记录").strip()
+        adapter = str(reviewed.get("adapter_3") or "未记录").strip()
+        min_length = str(reviewed.get("min_length") or "未记录").strip()
+        max_length = str(reviewed.get("max_length") or "未记录").strip()
+        lines.extend([
+            "",
+            f"摘要：将对 `{input_fastq}` 中的 {sample_count} 个样本使用 3' adapter "
+            f"`{adapter}`，长度过滤为 `{min_length}`-{max_length} nt。",
+        ])
+
+    last_response = str(approval.get("lastResponse") or "").strip()
+    if last_response:
+        lines.append(f"- 你的上一条反馈（尚未执行）: {last_response}")
+
+    prompt = str(approval.get("prompt") or step.get("goal") or "请确认上述配置。").strip()
+    edit_hint = str(review.get("edit_hint") or "").strip()
+    lines.extend(["", prompt])
+    lines.append(edit_hint or "请直接回复“可以”采用上述配置，回复“不可以”并说明原因；要修改请直接回复“字段=新值”。")
+    return "\n".join(lines)
+
+
+def _format_confirmed_approvals(plan: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    for step in plan.get("steps") or []:
+        if not isinstance(step, dict) or step.get("status") != STEP_DONE:
+            continue
+        approval = step.get("approval") if isinstance(step.get("approval"), dict) else {}
+        response = str(approval.get("response") or "").strip()
+        if response:
+            title = str(step.get("title") or step.get("id") or "确认项").strip()
+            reviewed = approval.get("reviewed") if isinstance(approval.get("reviewed"), dict) else {}
+            reviewed_text = ", ".join(f"{key}={value}" for key, value in reviewed.items())
+            suffix = f"; 已知配置: {reviewed_text}" if reviewed_text else ""
+            lines.append(f"- {title}: 用户回复={response}{suffix}")
     return "\n".join(lines)
 
 
@@ -1294,7 +1933,7 @@ def _build_final_summary(plan: Dict[str, Any]) -> str:
             titles = "、".join(str(s.get("title") or s.get("id")) for s in done)
             return f"{last_result}\n\n---\n已完成：{titles}"
 
-    lines = [f"## 任务完成：{goal}", ""]
+    lines = [f"## {'任务未完成' if failed else '任务完成'}：{goal}", ""]
     if done:
         lines.append(f"已完成 {len(done)}/{len(steps)} 个步骤：")
         for step in done:
@@ -1311,6 +1950,63 @@ def _build_final_summary(plan: Dict[str, Any]) -> str:
         for step in failed:
             lines.append(f"- {step.get('title') or step.get('id')}")
     return "\n".join(lines).strip()
+
+
+def approval_response_is_actionable(response: str) -> bool:
+    """True only for an explicit approval or a concrete parameter change."""
+    text = str(response or "").strip()
+    if not text or _APPROVAL_REJECT_RE.search(text):
+        return False
+    return bool(
+        _APPROVAL_ACCEPT_RE.search(text)
+        or _APPROVAL_ASSIGNMENT_RE.search(text)
+        or _APPROVAL_EXPLICIT_VALUE_RE.search(text)
+    )
+
+
+def _group_approval_is_ready(approval: Dict[str, Any]) -> bool:
+    reviewed = approval.get("reviewed") if isinstance(approval.get("reviewed"), dict) else {}
+    required = ("group_column", "group_counts", "control_group", "analysis_design")
+    return all(str(reviewed.get(key) or "").strip() not in {"", "未记录"} for key in required)
+
+
+def _hydrate_group_approval_from_completed_steps(plan: Dict[str, Any], step_index: int, approval: Dict[str, Any]) -> None:
+    """Persist canonical group values from completed preflight/lookup results."""
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    context = "\n".join(
+        str(step.get("result") or "")
+        for step in steps[:step_index]
+        if isinstance(step, dict) and step.get("status") == STEP_DONE
+    )
+    reviewed = approval.setdefault("reviewed", {})
+    if not isinstance(reviewed, dict):
+        reviewed = {}
+        approval["reviewed"] = reviewed
+    for source in ("group_column", "group_counts", "control_group", "analysis_design"):
+        value = _approval_value_from_context(source, context, plan)
+        if value:
+            reviewed[source] = value
+
+
+def _apply_natural_group_overrides(approval: Dict[str, Any], response: str) -> None:
+    """Accept concise confirmations such as 'normal是对照组' without requiring DSL syntax."""
+    reviewed = approval.setdefault("reviewed", {})
+    if not isinstance(reviewed, dict):
+        reviewed = {}
+        approval["reviewed"] = reviewed
+    control = _NATURAL_CONTROL_GROUP_RE.search(response or "")
+    if control:
+        supplied = next((value for value in control.groups() if value), "")
+        labels = re.findall(r"[A-Za-z][\w.-]*", str(reviewed.get("group_counts") or ""))
+        reviewed["control_group"] = next(
+            (label for label in labels if label.casefold() == supplied.casefold()), supplied,
+        )
+    design = _NATURAL_DESIGN_RE.search(response or "")
+    if design:
+        supplied = design.group(1).lower()
+        reviewed["analysis_design"] = "unpaired" if supplied in {"非配对", "不配对"} else (
+            "paired" if supplied == "配对" else supplied
+        )
 
 
 PlanStore = Callable[[str, Dict[str, Any]], None]
@@ -1356,14 +2052,49 @@ class PlanOrchestrator:
         return plan if isinstance(plan, dict) and isinstance(plan.get("steps"), list) else None
 
     @staticmethod
-    def _prepare_restored_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    def _prepare_restored_plan(
+        plan: Dict[str, Any],
+        *,
+        approval_response: str = "",
+    ) -> Dict[str, Any]:
         """Make an interrupted plan executable without changing its agreed scope."""
         restored = deepcopy(plan)
-        for step in restored.get("steps") or []:
+        for index, step in enumerate(restored.get("steps") or []):
             if isinstance(step, dict) and step.get("status") == STEP_RUNNING:
                 # No process is still executing after a resume request.  Treat
                 # its interrupted step as the next pending unit of work.
                 step["status"] = STEP_PENDING
+            elif (
+                isinstance(step, dict)
+                and step.get("status") == STEP_AWAITING_APPROVAL
+                and approval_response.strip()
+            ):
+                approval = step.get("approval")
+                if isinstance(approval, dict):
+                    group_gate = str(approval.get("id") or "") == "confirm-groups-before-de"
+                    if group_gate:
+                        _hydrate_group_approval_from_completed_steps(restored, index, approval)
+                        _apply_natural_group_overrides(approval, approval_response)
+                    actionable = approval_response_is_actionable(approval_response) or bool(
+                        group_gate and _GROUP_CONFIRMATION_RE.search(approval_response)
+                    )
+                    if actionable:
+                        if (
+                            group_gate
+                            and _APPROVAL_ACCEPT_RE.search(approval_response)
+                            and not _group_approval_is_ready(approval)
+                        ):
+                            # A bare "可以" cannot approve an unknown group
+                            # configuration. Keep the gate open so its missing
+                            # preflight/lookup step can run first.
+                            approval["lastResponse"] = approval_response.strip()
+                            continue
+                        step["status"] = STEP_DONE
+                        step["result"] = f"用户确认：{approval_response.strip()}"
+                        approval["response"] = approval_response.strip()
+                        approval.pop("lastResponse", None)
+                    else:
+                        approval["lastResponse"] = approval_response.strip()
         return restored
 
     def _save_step_checkpoint(
@@ -1398,13 +2129,19 @@ class PlanOrchestrator:
         cancel_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         recent_history = _format_recent_history(history)
+        planning_skill_guidance = _load_planning_skill_guidance(
+            getattr(self.agent, "skill_registry", None), user_query,
+        )
         conversation_block = (
             f"\nRecent conversation (use to resolve references to earlier work):\n{recent_history}\n"
             if recent_history
             else ""
         )
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": _build_planner_system_prompt(self.skill_overview)},
+            {
+                "role": "system",
+                "content": _build_planner_system_prompt(self.skill_overview, planning_skill_guidance),
+            },
             {
                 "role": "user",
                 "content": (
@@ -1422,30 +2159,48 @@ class PlanOrchestrator:
             enable_thinking=False,
         )
         raw = _parse_plan_json(str(completion.content or ""))
-        steps = _normalize_steps(raw.get("steps"), goal=user_query)
-        plan_goal, steps = _apply_modality_boundaries(
-            str(raw.get("goal") or user_query), steps, user_query=user_query,
-        )
-        steps = _expand_plan_prerequisites(
-            steps,
-            extra_context=extra_context,
-        )
-        analysis = _resolve_analysis_policy(user_query, extra_context, steps)
-        steps = _apply_analysis_policy(steps, analysis=analysis)
-        deliverables = _resolve_deliverables_policy(user_query, extra_context, steps)
-        steps = _apply_deliverables_policy(steps, deliverables=deliverables)
-        steps = _order_de_workflow_steps(steps)
-        plan_goal = _strip_unrequested_html_report(
-            plan_goal,
-            requested=bool(deliverables.get("html_report_requested")),
-        )
-        analysis["modalities"] = _infer_modalities_from_steps(steps) or list(analysis.get("modalities") or [])
-        requirements = _resolve_requirements_policy(
+        # A second LLM pass performs semantic dependency review. It is not a
+        # fixed workflow rewriter: the reviewer derives ordering from the
+        # requested artifacts and the relevant SKILL.md instructions.
+        review_guidance = _load_plan_review_skill_guidance(
+            getattr(self.agent, "skill_registry", None),
+            raw.get("steps"),
             user_query,
-            extra_context,
-            analysis=analysis,
-            deliverables=deliverables,
         )
+        review_messages = [
+            {"role": "system", "content": _build_plan_review_system_prompt(review_guidance)},
+            {
+                "role": "user",
+                "content": (
+                    f"User request:\n{user_query}\n\n"
+                    f"Session context:\n{extra_context or '(none)'}\n\n"
+                    f"Proposed plan:\n{json.dumps(raw, ensure_ascii=False)}"
+                ),
+            },
+        ]
+        try:
+            reviewed_completion = self.agent._llm_complete_cancellable(
+                review_messages,
+                tools=None,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                enable_thinking=False,
+            )
+            reviewed_raw = _parse_plan_json(str(reviewed_completion.content or ""))
+            if isinstance(reviewed_raw.get("steps"), list) and reviewed_raw["steps"]:
+                raw = reviewed_raw
+        except (ValueError, TypeError, json.JSONDecodeError):
+            # Preserve the primary planner result if the reviewer does not
+            # return valid JSON; the normal skill contracts still apply.
+            pass
+        # The reviewed LLM plan is authoritative for scope and ordering. Code
+        # only normalizes its JSON and preserves optional metadata; it does
+        # not inject, reorder, or delete workflow steps here.
+        steps = _normalize_steps(raw.get("steps"), goal=user_query)
+        plan_goal = str(raw.get("goal") or user_query).strip()
+        analysis = deepcopy(raw.get("analysis")) if isinstance(raw.get("analysis"), dict) else {}
+        deliverables = deepcopy(raw.get("deliverables")) if isinstance(raw.get("deliverables"), dict) else {}
+        requirements = deepcopy(raw.get("requirements")) if isinstance(raw.get("requirements"), dict) else {}
         plan = {
             "goal": plan_goal,
             "steps": steps,
@@ -1483,8 +2238,14 @@ class PlanOrchestrator:
                 f"  reason: {failure_reason or failed_step.get('result') or 'unknown'}\n"
             )
 
+        planning_skill_guidance = _load_planning_skill_guidance(
+            getattr(self.agent, "skill_registry", None), user_query,
+        )
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": _build_replanner_system_prompt(self.skill_overview)},
+            {
+                "role": "system",
+                "content": _build_replanner_system_prompt(self.skill_overview, planning_skill_guidance),
+            },
             {
                 "role": "user",
                 "content": (
@@ -1506,32 +2267,37 @@ class PlanOrchestrator:
             enable_thinking=False,
         )
         raw = _parse_plan_json(str(completion.content or ""))
+        review_guidance = _load_plan_review_skill_guidance(
+            getattr(self.agent, "skill_registry", None), raw.get("steps"), user_query,
+        )
+        try:
+            reviewed_completion = self.agent._llm_complete_cancellable(
+                [
+                    {"role": "system", "content": _build_plan_review_system_prompt(review_guidance)},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User request:\n{user_query}\n\n"
+                            f"Session context:\n{extra_context or '(none)'}\n\n"
+                            f"Proposed revised plan:\n{json.dumps(raw, ensure_ascii=False)}"
+                        ),
+                    },
+                ],
+                tools=None,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                enable_thinking=False,
+            )
+            reviewed_raw = _parse_plan_json(str(reviewed_completion.content or ""))
+            if isinstance(reviewed_raw.get("steps"), list) and reviewed_raw["steps"]:
+                raw = reviewed_raw
+        except (ValueError, TypeError, json.JSONDecodeError):
+            pass
         new_steps = _normalize_steps(raw.get("steps"), goal=plan.get("goal") or user_query)
-        replanned_goal, new_steps = _apply_modality_boundaries(
-            str(raw.get("goal") or plan.get("goal") or user_query),
-            new_steps,
-            user_query=user_query,
-        )
-        new_steps = _expand_plan_prerequisites(
-            new_steps,
-            extra_context=extra_context,
-        )
-        analysis = _resolve_analysis_policy(user_query, extra_context, new_steps)
-        new_steps = _apply_analysis_policy(new_steps, analysis=analysis)
-        deliverables = _resolve_deliverables_policy(user_query, extra_context, new_steps)
-        new_steps = _apply_deliverables_policy(new_steps, deliverables=deliverables)
-        new_steps = _order_de_workflow_steps(new_steps)
-        replanned_goal = _strip_unrequested_html_report(
-            replanned_goal,
-            requested=bool(deliverables.get("html_report_requested")),
-        )
-        analysis["modalities"] = _infer_modalities_from_steps(new_steps) or list(analysis.get("modalities") or [])
-        requirements = _resolve_requirements_policy(
-            user_query,
-            extra_context,
-            analysis=analysis,
-            deliverables=deliverables,
-        )
+        replanned_goal = str(raw.get("goal") or plan.get("goal") or user_query).strip()
+        analysis = deepcopy(raw.get("analysis")) if isinstance(raw.get("analysis"), dict) else {}
+        deliverables = deepcopy(raw.get("deliverables")) if isinstance(raw.get("deliverables"), dict) else {}
+        requirements = deepcopy(raw.get("requirements")) if isinstance(raw.get("requirements"), dict) else {}
 
         # Prerequisite insertion and workflow ordering can change positional
         # IDs.  Match logical steps by skill/modality/title so a completed
@@ -1550,7 +2316,9 @@ class PlanOrchestrator:
             identity = _step_identity(step)
             old = old_by_identity.get(identity)
             replanner_status = str((raw_by_identity.get(identity) or {}).get("status") or "").strip()
-            if replanner_status in {STEP_DONE, STEP_FAILED, STEP_SKIPPED, STEP_PENDING, STEP_RUNNING}:
+            if replanner_status in {
+                STEP_DONE, STEP_FAILED, STEP_SKIPPED, STEP_PENDING, STEP_RUNNING, STEP_AWAITING_APPROVAL,
+            }:
                 step["status"] = replanner_status
             elif old and old.get("status") == STEP_DONE:
                 step["status"] = STEP_DONE
@@ -1617,6 +2385,14 @@ class PlanOrchestrator:
         cancel_event: Optional[Any] = None,
         code_approval_callback: Optional["CodeApprovalCallback"] = None,
     ) -> str:
+        # The plan may have been produced by an LLM or restored from an older
+        # session. Resolve quantitative defaults again from the registered
+        # SKILL.md metadata at the execution boundary.
+        _bind_execution_skill_from_registry(
+            step,
+            getattr(self.agent, "skill_registry", None),
+            history,
+        )
         checkpoint_extra = {"plan": plan, "step_id": step.get("id")}
 
         def scoped_progress(event: Dict[str, Any]) -> None:
@@ -1676,6 +2452,7 @@ class PlanOrchestrator:
             analysis=plan.get("analysis") if isinstance(plan, dict) else None,
             deliverables=plan.get("deliverables") if isinstance(plan, dict) else None,
             requirements=plan.get("requirements") if isinstance(plan, dict) else None,
+            confirmed_approvals=_format_confirmed_approvals(plan),
             skill_prompt=skill_prompt,
             conversation_context=_format_recent_history(history),
         )
@@ -1810,7 +2587,10 @@ class PlanOrchestrator:
             restored_plan = self._load_persisted_plan()
 
         if restored_plan is not None:
-            plan = self._prepare_restored_plan(restored_plan)
+            plan = self._prepare_restored_plan(
+                restored_plan,
+                approval_response=user_query if resume else "",
+            )
             self._emit(
                 on_progress,
                 "plan_restored",
@@ -1837,15 +2617,61 @@ class PlanOrchestrator:
 
         replan_attempts = 0
         steps_list = plan.get("steps") or []
+        if not isinstance(steps_list, list) or not steps_list:
+            # Never turn a planner/policy failure into a successful empty plan.
+            # This used to emit `plan_complete` immediately, even though no
+            # executor had run and no requested artifact could exist.
+            message = "计划生成失败：未生成任何可执行步骤，任务尚未运行。"
+            self._emit(on_progress, "plan_failed", plan=plan, message=message)
+            raise ValueError(message)
         step_total = len(steps_list)
 
         while True:
             self.agent._check_cancelled(cancel_event)
             pending = self._next_pending_step(plan)
             if pending is None:
+                waiting = next(
+                    (
+                        step for step in plan.get("steps") or []
+                        if isinstance(step, dict) and step.get("status") == STEP_AWAITING_APPROVAL
+                    ),
+                    None,
+                )
+                if waiting:
+                    prompt = _build_approval_request(
+                        plan,
+                        waiting,
+                        history=history,
+                        extra_context=extra_context,
+                    )
+                    self._persist_plan(plan)
+                    self._save_step_checkpoint(plan, None)
+                    self._emit(on_progress, "plan_approval_required", plan=plan, stepId=waiting.get("id"), message=prompt)
+                    self._emit(on_progress, "final", content=prompt)
+                    return prompt
                 break
 
             step_index = steps_list.index(pending) + 1
+            if isinstance(pending.get("approval"), dict):
+                pending["status"] = STEP_AWAITING_APPROVAL
+                prompt = _build_approval_request(
+                    plan,
+                    pending,
+                    history=history,
+                    extra_context=extra_context,
+                )
+                self._persist_plan(plan)
+                self._save_step_checkpoint(plan, None)
+                self._emit(
+                    on_progress,
+                    "plan_approval_required",
+                    plan=plan,
+                    stepId=pending.get("id"),
+                    stepIndex=step_index,
+                    message=prompt,
+                )
+                self._emit(on_progress, "final", content=prompt)
+                return prompt
             pending["status"] = STEP_RUNNING
             self._persist_plan(plan)
             self._emit(
@@ -1869,19 +2695,24 @@ class PlanOrchestrator:
             ):
                 resume_messages = checkpoint["messages"]
 
-            result = self._execute_step(
-                pending,
-                step_index=step_index,
-                step_total=step_total,
-                plan_goal=str(plan.get("goal") or ""),
-                user_query=user_query,
-                history=history,
-                plan=plan,
-                resume_messages=resume_messages,
-                on_progress=on_progress,
-                cancel_event=cancel_event,
-                code_approval_callback=code_approval_callback,
-            )
+            try:
+                result = self._execute_step(
+                    pending,
+                    step_index=step_index,
+                    step_total=step_total,
+                    plan_goal=str(plan.get("goal") or ""),
+                    user_query=user_query,
+                    history=history,
+                    plan=plan,
+                    resume_messages=resume_messages,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                    code_approval_callback=code_approval_callback,
+                )
+            except Exception as exc:  # noqa: BLE001 - persist the failed step before replanning
+                if type(exc).__name__ == "AgentCancelledError":
+                    raise
+                result = f"STEP_EXECUTION_ERROR: {type(exc).__name__}: {exc}"
 
             if _step_failed(result):
                 pending["status"] = STEP_FAILED
@@ -1904,7 +2735,7 @@ class PlanOrchestrator:
                         on_progress=on_progress,
                         cancel_event=cancel_event,
                     )
-                    self._emit(on_progress, "plan_complete", plan=plan, message=summary)
+                    self._emit(on_progress, "plan_incomplete", plan=plan, message=summary)
                     self._emit(on_progress, "final", content=summary)
                     return summary
 
@@ -1956,6 +2787,11 @@ class PlanOrchestrator:
         # checkpoint so a later "继续" request is interpreted as a new
         # follow-up instead of replaying the finished plan.
         self.agent._clear_run_checkpoint(self.chat_id)
-        self._emit(on_progress, "plan_complete", plan=plan, message=summary)
+        terminal_event = (
+            "plan_incomplete"
+            if any(step.get("status") == STEP_FAILED for step in plan.get("steps") or [])
+            else "plan_complete"
+        )
+        self._emit(on_progress, terminal_event, plan=plan, message=summary)
         self._emit(on_progress, "final", content=summary)
         return summary

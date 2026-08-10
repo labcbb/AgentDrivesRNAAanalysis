@@ -1,16 +1,20 @@
 ---
 name: samtools_idxstats
-title: Small-RNA BAM quantification with samtools idxstats
-description: "Quantify reads per small-RNA reference sequence from BAM files using samtools idxstats, writing counts into AnnData."
+slug: samtools_idxstats
+title: Default piRNA quantification with samtools idxstats
+description: "Default method for piRNA quantification: count reads per piRNA FASTA reference sequence from BAM files using samtools idxstats, writing counts into AnnData."
+default_for: pirna_quantification
 ---
 
-# Small-RNA BAM Quantification with samtools idxstats
+# Default piRNA Quantification with samtools idxstats
 
 ## Overview
 
 Use `sa.quant.idxstats` to quantify reads mapped to small-RNA reference sequences in BAM files.
 
-> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
+**Default method rule:** for piRNA quantification, use this skill with a piRNA FASTA reference. Do not switch to `feature_count` unless the user explicitly requests featureCounts.
+
+> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData。piRNA、miRNA 与 tRNA/tRF 定量共享同一个 `srna` AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
 
 This skill is for BAM files produced by aligning reads to a **small-RNA FASTA reference index** such as piRBase piRNA sequences, Ensembl ncRNA sequences, mature tRNAs, miRNAs, or other transcript-level sequences.
 
@@ -118,7 +122,7 @@ adata = sa.quant.idxstats(
 )
 ```
 
-> ⚡ **批量样本时务必使用 `jobs=N` 并行**：`sa.quant.idxstats` 支持 `jobs` 参数控制同时处理的 BAM 数（多线程池，每个 BAM 一个 `samtools idxstats` 进程）。样本多时（比如 >3 个），设置 `jobs=4` 可显著缩短总耗时；内存吃紧时降低到 `jobs=2`。如果用户没指定并行数，**根据样本量主动选一个合理的 `jobs` 值**。
+> ⚡ **批量样本时务必使用 `jobs=N` 并行**：`sa.quant.idxstats` 支持 `jobs` 参数控制同时处理的 BAM 数（多线程池，每个 BAM 一个 `samtools idxstats` 进程）。样本多时（比如 >3 个），设置 `jobs=4` 可显著缩短总耗时；内存吃紧时降低到 `jobs=2`。如果用户没指定并行数，**根据样本量主动选一个合理的 `jobs` 值**。内置并行会在每个 BAM 返回时输出统一的 `progress: N/M` 和 `inflight:` 事件；调用 API 时不要额外包线程池。
 
 ## Outputs
 

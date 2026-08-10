@@ -38,6 +38,7 @@ Aligned SAM file → downstream analysis (miRNA quantification, etc.)
 > `sa.alignment.bowtie` 支持 `jobs` 参数控制并行比对的样本数（通过线程池，每个样本一个 bowtie 进程）。
 > 样本多时（比如 >3 个），设置 `jobs=4` 可显著缩短总耗时。
 > 如果用户没主动提并行数，**agent 应该根据样本量推荐一个合理的 `jobs` 值**。
+> 内置样本级并行统一使用 `run_threads`，会自动发出 UI 可识别的 `progress: N/M` 和 `inflight:`。调用本 API 时只传 `jobs`，不要额外手写线程池包装它。
 
 ## Instructions
 
@@ -61,6 +62,8 @@ sa.alignment.bowtie_build(
 ```
 
 > **注意：** bowtie-build 只需要一次。索引构建完成后，后续比对直接引用 `"grch38"` 这个 basename 即可。
+
+> **RNA FASTA 自动规范化：** Bowtie 不会将 RNA 字母 `U` 自动视为 `T`；它会丢弃 `U`，导致索引序列缩短。`sa.alignment.bowtie_build` 会检测序列中的 `U/u`，保留原文件并在同目录生成 `<stem>.dna.fa`（仅 `U/u -> T/t`），再用该 DNA FASTA 构建索引。返回值中的 `reference_used`、`rna_to_dna_normalized` 和 `reference_manifest` 必须登记到后续分析的 `uns` / manifest；同时会写出 `<index_basename>.reference.json`，供后续代码跨会话定位实际参考。比对后的坐标体系以 `reference_used` 为准。
 
 ### 2. sRNA-seq 单端比对
 

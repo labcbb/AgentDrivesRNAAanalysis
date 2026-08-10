@@ -82,6 +82,12 @@ if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
 import sRNAgent as sa
 try:
+    import pandas as pd
+    pd.options.future.infer_string = False
+    pd.options.mode.string_storage = "python"
+except Exception:
+    pass
+try:
     import matplotlib
     matplotlib.use("Agg")
 except Exception:

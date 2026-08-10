@@ -1,6 +1,6 @@
 # featureCounts Quick Reference
 
-## Quantify miRNA with default settings (TruSeq stranded)
+## Quantify miRNA after an explicit featureCounts request (TruSeq stranded)
 
 ```python
 import sRNAgent as sa

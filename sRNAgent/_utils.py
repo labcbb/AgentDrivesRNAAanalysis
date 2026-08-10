@@ -6,7 +6,7 @@ import shlex
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Sequence, TypeVar
@@ -173,6 +173,11 @@ def run_cli_cmd(
         bufsize=1,
     )
     assert proc.stdout is not None
+    # This import is intentionally local: CLI helpers are also used outside
+    # agent runs, where no task supervisor is active.
+    from .agent.task_supervisor import report_subprocess_finished, report_subprocess_started
+
+    report_subprocess_started(cmd, proc.pid)
 
     stop = threading.Event()
     error_box: List[Optional[str]] = [None]
@@ -201,6 +206,7 @@ def run_cli_cmd(
             watcher.join(timeout=2.0)
 
     ret = proc.wait()
+    report_subprocess_finished(proc.pid, ret)
     if error_box[0]:
         raise RuntimeError(error_box[0])
     if ret != 0:
@@ -219,7 +225,7 @@ def run_threads(items: List[T], worker: Callable[[T], R], jobs: int) -> List[R]:
     Prints ``progress: N/M`` after each item finishes so the agent execution
     layer can surface cumulative sample progress (parsed by
     ``_parse_progress_output`` into "已完成 N/M 样本").
-    Also prints ``inflight: <names...>`` with the items still running, so the
+    Also prints ``inflight: <names...>`` with actual active workers, so the
     UI can show "进行中: SRR1, SRR2, …" alongside the cumulative count.
     """
     n = len(items)
@@ -235,33 +241,44 @@ def run_threads(items: List[T], worker: Callable[[T], R], jobs: int) -> List[R]:
     max_workers = max(1, min(jobs, n))
     results: List[Optional[R]] = [None] * n
     done = 0
-    count_lock = threading.Lock()
     inflight: List[str] = []
     inflight_lock = threading.Lock()
 
     def _emit_status() -> None:
-        with count_lock:
-            d = done
         with inflight_lock:
             names = list(inflight)
-        print(f"progress: {d}/{n}", flush=True)
+        print(f"progress: {done}/{n}", flush=True)
         print(f"inflight: {','.join(names)}", flush=True)
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
-        for i, item in enumerate(items):
+        pending: dict[Any, tuple[int, str]] = {}
+        next_index = 0
+
+        def submit_next() -> bool:
+            nonlocal next_index
+            if next_index >= n:
+                return False
+            index = next_index
+            item = items[index]
+            next_index += 1
             name = str(item)
+            pending[pool.submit(worker, item)] = (index, name)
             with inflight_lock:
                 inflight.append(name)
-            futures[pool.submit(worker, item)] = (i, name)
+            return True
+
+        while len(pending) < max_workers and submit_next():
+            pass
         _emit_status()
-        for fut in as_completed(futures):
-            idx, name = futures[fut]
-            with inflight_lock:
-                if name in inflight:
-                    inflight.remove(name)
-            results[idx] = fut.result()
-            with count_lock:
+        while pending:
+            completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in completed:
+                idx, name = pending.pop(fut)
+                with inflight_lock:
+                    if name in inflight:
+                        inflight.remove(name)
+                results[idx] = fut.result()
                 done += 1
-            _emit_status()
+                submit_next()
+                _emit_status()
     return [r for r in results if r is not None]

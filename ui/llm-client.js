@@ -195,6 +195,32 @@
     const decoder = new TextDecoder();
     let buffer = "";
     let finalResult = null;
+    let terminalEventSeen = false;
+
+    const consumeEvent = (event) => {
+      onEvent?.(event);
+      if (event.type === "final" && event.content && !finalResult) {
+        finalResult = { text: event.content, meta: {} };
+      }
+      if (event.type === "done") {
+        terminalEventSeen = true;
+        finalResult = {
+          text: event.text || finalResult?.text || "",
+          meta: event.meta || finalResult?.meta || {},
+        };
+      }
+      if (event.type === "cancelled") {
+        terminalEventSeen = true;
+        const err = new Error(event.message || "已停止生成");
+        err.name = "AgentCancelledError";
+        throw err;
+      }
+      if (event.type === "error") {
+        terminalEventSeen = true;
+        throw new Error(event.message || "Agent 执行失败");
+      }
+      return event.type === "stream_end";
+    };
 
     try {
       while (true) {
@@ -204,28 +230,24 @@
         const parsed = parseSseChunk(buffer);
         buffer = parsed.rest;
         for (const event of parsed.events) {
-          onEvent?.(event);
-          if (event.type === "final" && event.content && !finalResult) {
-            finalResult = { text: event.content, meta: {} };
-          }
-          if (event.type === "done") {
-            finalResult = {
-              text: event.text || finalResult?.text || "",
-              meta: event.meta || finalResult?.meta || {},
+          if (consumeEvent(event)) {
+            return {
+              ...(finalResult || { text: "", meta: {} }),
+              incomplete: !terminalEventSeen,
             };
           }
-          if (event.type === "cancelled") {
-            const err = new Error(event.message || "已停止生成");
-            err.name = "AgentCancelledError";
-            throw err;
-          }
-          if (event.type === "error") {
-            throw new Error(event.message || "Agent 执行失败");
-          }
-          if (event.type === "stream_end") {
-            finalResult = finalResult || { text: "", meta: {} };
-            return finalResult;
-          }
+        }
+      }
+      // A reader can close immediately after the final write. Flush the
+      // decoder before deciding that the terminal frame was lost.
+      buffer += decoder.decode();
+      const parsed = parseSseChunk(`${buffer}\n\n`);
+      for (const event of parsed.events) {
+        if (consumeEvent(event)) {
+          return {
+            ...(finalResult || { text: "", meta: {} }),
+            incomplete: !terminalEventSeen,
+          };
         }
       }
     } catch (error) {
@@ -233,8 +255,8 @@
       throw error;
     }
 
-    if (finalResult) return finalResult;
-    throw new Error("Agent 流式响应异常结束（可能是 LLM API 配置错误或 serve.py 已断开，请检查 Config 中的 API Key / Base URL）");
+    if (finalResult) return { ...finalResult, incomplete: !terminalEventSeen };
+    return { text: "", meta: {}, incomplete: true };
   }
 
   async function cancelAgentRun(runId, chatId) {
@@ -266,6 +288,17 @@
     const data = await response.json().catch(() => ({}));
     if (!response.ok || data.ok === false) {
       return { ok: false, error: data.error || `run-status HTTP ${response.status}` };
+    }
+    return data;
+  }
+
+  async function fetchChatSessionDetail(chatId) {
+    if (!chatId) return { ok: false, error: "chatId 不能为空" };
+    const qs = `?chatId=${encodeURIComponent(chatId)}`;
+    const response = await fetch(`${PROXY_BASE}/api/sessions/detail${qs}`);
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || data.ok === false) {
+      return { ok: false, error: data.error || `session detail HTTP ${response.status}` };
     }
     return data;
   }
@@ -531,6 +564,7 @@
   window.cancelAgentRun = cancelAgentRun;
   window.approveAgentCode = approveAgentCode;
   window.fetchAgentRunStatus = fetchAgentRunStatus;
+  window.fetchChatSessionDetail = fetchChatSessionDetail;
   window.fetchAgentStatus = fetchAgentStatus;
   window.fetchKernelEnvironment = fetchKernelEnvironment;
   window.fetchKernelFigures = fetchKernelFigures;
