@@ -1,0 +1,4 @@
+interface:
+  display_name: "Scientific Plotting"
+  short_description: "Plot AnnData analyses in CNS style"
+  default_prompt: "Use $plotting to generate grouped, publication-ready plots from existing AnnData analysis results."

@@ -17,6 +17,7 @@ from .context import (
     bounded_tool_result,
     compact_messages,
     messages_tokens,
+    normalize_text_payload,
     should_compact,
 )
 from .execution import ExecutionBackend, initialize_execution_backend
@@ -114,7 +115,7 @@ def _summarize_tool_call(name: str, arguments: Dict[str, Any]) -> str:
         preview = code.split("\n", 1)[0][:80]
         return f"execute_code — {preview}{'…' if len(code) > 80 else ''}"
     if name == "finish":
-        msg = str(arguments.get("message") or "")
+        msg = normalize_text_payload(arguments.get("message"))
         preview = msg[:120] + ("…" if len(msg) > 120 else "")
         return f"finish — {preview}"
     return name
@@ -1653,7 +1654,7 @@ class SRNAgent:
                     )
 
                     if call.name == "finish":
-                        message = str(call.arguments.get("message", "Task completed."))
+                        message = normalize_text_payload(call.arguments.get("message")) or "Task completed."
                         message = self._ensure_user_facing_reply(
                             messages,
                             message,

@@ -248,7 +248,7 @@ def _prepare_genomefile_for_maketrnadb(genomefile: str, work_dir: Path) -> str:
     produces={"uns": ["trax_gtf"]},
 )
 def download_trax_human_gtf(
-    output_dir: str = ".",
+    output_dir: str = "references",
     output_name: str = "hg38-genes.gtf",
     assembly: Optional[str] = "GRCh38",
     jobs: int = 4,
@@ -319,7 +319,7 @@ build_trax_human_gtf = download_trax_human_gtf
     produces={"uns": ["trnascan_hg38_files"]},
 )
 def download_trnascan_hg38(
-    output_dir: str = ".",
+    output_dir: str = "references",
     assembly: Optional[str] = "hg38",
     jobs: int = 4,
     force: bool = False,

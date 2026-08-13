@@ -29,6 +29,19 @@ OPERATOR_LEASE_FILE = "operator_lease.json"
 
 # Soft write lease TTL; renewed while an operator run is alive.
 LEASE_TTL_SEC = 180
+_MAX_ASSISTANT_MESSAGE_CHARS = 16_000
+_MAX_THINKING_BODY_CHARS = 8_000
+
+
+def _truncate_for_ui(value: str, limit: int) -> str:
+    """Keep an oversized persisted response from freezing chat hydration."""
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    marker = "\n\n…[回复已截断；完整执行细节保留在运行记录中]…\n\n"
+    head = max((limit - len(marker)) * 2 // 3, 1)
+    tail = max(limit - len(marker) - head, 1)
+    return f"{text[:head]}{marker}{text[-tail:]}"
 
 
 class SessionStoreError(ValueError):
@@ -104,7 +117,7 @@ def _canonicalize_thinking_steps(steps: Any) -> list[Dict[str, Any]]:
             "id": str(raw.get("id") or "").strip(),
             "kind": str(raw.get("kind") or "tool"),
             "title": str(raw.get("title") or ""),
-            "body": str(raw.get("body") or ""),
+            "body": _truncate_for_ui(str(raw.get("body") or ""), _MAX_THINKING_BODY_CHARS),
             "data": raw.get("data") if isinstance(raw.get("data"), (dict, list)) else None,
             "roundId": str(raw.get("roundId") or "").strip(),
         }
@@ -176,6 +189,10 @@ def _canonicalize_chat_messages(messages: Any) -> list[Dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         message = dict(raw)
+        if message.get("role") == "assistant":
+            message["content"] = _truncate_for_ui(
+                str(message.get("content") or ""), _MAX_ASSISTANT_MESSAGE_CHARS,
+            )
         if message.get("role") == "assistant" and isinstance(message.get("thinkingSteps"), list):
             steps = _canonicalize_thinking_steps(message["thinkingSteps"])
             message["thinkingSteps"] = steps

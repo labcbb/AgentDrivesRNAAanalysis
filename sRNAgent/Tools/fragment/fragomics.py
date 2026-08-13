@@ -435,7 +435,7 @@ def _build_fragmentomics_adata(
 def fragomics(
     adata: AnnData,
     genome_fasta: Optional[str] = None,
-    output_dir: str = "fragmentomics_out",
+    output_dir: str = "results/fragmentomics",
     *,
     motif_k: int = 6,
     region_size: int = 5_000_000,

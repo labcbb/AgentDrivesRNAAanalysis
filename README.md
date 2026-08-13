@@ -45,7 +45,7 @@ import sRNAgent as sa
 
 sa.list_functions()
 sa.find_function("fastq download")
-sa.fastq.fastq_dl("SRR26304152", output_dir="srna_fastq")
+sa.fastq.fastq_dl("SRR26304152", output_dir="data/raw/fastq")
 ```
 
 ## Skill registry
@@ -61,6 +61,30 @@ from sRNAgent.skill_registry import build_skill_registry
 registry = build_skill_registry()
 print(list(registry.skill_metadata.keys()))  # ['fastq-dl-srna', 'fastq-qc']
 ```
+
+## Workspace layout
+
+Use one workspace per analysis project. The built-in default output locations keep raw inputs, references, intermediate files, and deliverables separate:
+
+```text
+data/raw/fastq/              Raw FASTQ and download metadata
+data/processed/trimmed/      Trimmed FASTQ
+data/processed/collapsed/    Collapsed read FASTQ
+references/                  Genome, annotations, and other reference resources
+results/qc/                  FastQC and MultiQC reports
+results/alignment/           SAM/BAM files and alignment logs
+results/quantification/      miRDeep2, mirtop, tRAX, idxstats, featureCounts outputs
+results/differential/        Differential-expression tables and manifests
+results/fragmentomics/       Fragmentomics output
+results/targets/             Target-analysis output
+results/models/              Classification and Cox models
+results/plots/               Publication figures
+results/report/              HTML report and bundled assets
+results/adata/               Persisted AnnData files
+sessions/                    UI session state (system managed)
+```
+
+Keep custom output paths under the matching `data/`, `references/`, or `results/` branch. Do not place analysis files in the workspace root or in `sessions/`.
 
 ## Web UI
 

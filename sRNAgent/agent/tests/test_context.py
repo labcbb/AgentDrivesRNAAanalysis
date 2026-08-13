@@ -12,6 +12,7 @@ from sRNAgent.agent.context import (  # noqa: E402
     compact_messages,
     estimate_tokens,
     messages_tokens,
+    normalize_text_payload,
     should_compact,
     truncate_text,
 )
@@ -76,6 +77,13 @@ def test_bounded_tool_result_keeps_error_tail():
     out = bounded_tool_result(head + filler + tail, 8000)
     assert len(out) <= 8000
     assert out.endswith(tail)
+
+
+def test_normalize_text_payload_unwraps_provider_fragments_and_legacy_repr():
+    wrapped = {"$text": "第一行\n", "SRR": {"$text": "第二行"}}
+
+    assert normalize_text_payload(wrapped) == "第一行\nSRR第二行"
+    assert normalize_text_payload(repr(wrapped)) == "第一行\nSRR第二行"
 
 
 def test_progress_parser_preserves_fragomics_log_prefix():

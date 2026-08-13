@@ -303,7 +303,7 @@ def list_species() -> List[str]:
 )
 def download_genome(
     species: str = "homo_sapiens",
-    output_dir: str = ".",
+    output_dir: str = "references",
     assembly: Optional[str] = None,
     jobs: int = 4,
     force: bool = False,
@@ -398,7 +398,7 @@ def download_genome(
 )
 def download_gtf(
     species: str = "homo_sapiens",
-    output_dir: str = ".",
+    output_dir: str = "references",
     assembly: Optional[str] = None,
     jobs: int = 4,
     force: bool = False,
@@ -462,7 +462,7 @@ def download_gtf(
 )
 def download_ncrna(
     species: str = "homo_sapiens",
-    output_dir: str = ".",
+    output_dir: str = "references",
     jobs: int = 4,
     force: bool = False,
 ) -> Dict[str, str]:

@@ -8,8 +8,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from session_memory import append_work_log, build_session_memory_context, load_session_memory, record_stream_event, remember_user_query  # noqa: E402
+from session_memory import append_work_log, build_session_memory_context, build_workspace_manifest, load_session_memory, record_stream_event, remember_user_query, save_session_memory  # noqa: E402
 from session_plan import save_plan  # noqa: E402
+from session_plan import normalize_plan, plan_progress_summary  # noqa: E402
 from session_store import ensure_session_dir, is_orphan_session, load_chat_record, save_chat_record  # noqa: E402
 from work_space import configure_work_space  # noqa: E402
 
@@ -69,6 +70,26 @@ def test_chat_persistence_counts_legacy_tool_decisions_after_reload():
         assert message["thinkingRoundCount"] == 2
         assert all("roundId" in step for step in message["thinkingSteps"])
         assert message["thinkingSteps"][0]["roundId"] == message["thinkingSteps"][1]["roundId"]
+
+
+def test_chat_persistence_bounds_oversized_assistant_messages_for_ui():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        save_chat_record(
+            CHAT_ID,
+            {
+                "id": CHAT_ID,
+                "title": "large reply",
+                "messages": [{"role": "assistant", "content": "x" * 50_000}],
+            },
+            force=True,
+        )
+
+        loaded = load_chat_record(CHAT_ID)
+
+        content = loaded["messages"][0]["content"]
+        assert len(content) <= 16_000
+        assert "回复已截断" in content
 
 
 def test_session_memory_extracts_facts_and_artifacts():
@@ -451,6 +472,60 @@ def test_completed_plan_is_not_presented_as_unfinished_context():
         )
         context = build_session_memory_context(CHAT_ID, user_query="继续在刚才的片段组学结果上做总结")
         assert "当前未完成计划" not in context
+
+
+def test_normalized_plan_preserves_approval_and_dependency_metadata():
+    raw = {
+        "goal": "质控",
+        "steps": [{
+            "id": "trim",
+            "title": "确认 adapter",
+            "status": "awaiting_approval",
+            "depends_on": ["download"],
+            "approval": {"id": "confirm-adapter-before-trimming"},
+            "reviewed": {"adapter_3": "TGGAATTCTCGGGTGCCAAGG"},
+        }],
+    }
+
+    normalized = normalize_plan(raw)
+
+    step = normalized["steps"][0]
+    assert step["status"] == "awaiting_approval"
+    assert step["depends_on"] == ["download"]
+    assert step["approval"]["id"] == "confirm-adapter-before-trimming"
+    assert plan_progress_summary(normalized) == "等待确认：确认 adapter"
+
+
+def test_session_memory_context_has_a_hard_budget_and_keeps_latest_intent():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        save_session_memory(
+            CHAT_ID,
+            {
+                "steps": [{"summary": "step " + ("x" * 700)} for _ in range(20)],
+                "facts": ["fact " + ("y" * 700) for _ in range(20)],
+                "artifacts": [f"results/file_{index}.tsv" for index in range(30)],
+            },
+        )
+
+        context = build_session_memory_context(CHAT_ID, user_query="继续当前任务并只确认接头")
+
+        assert len(context) <= 10_000
+        assert "会话记忆已截断" in context
+        assert "继续当前任务并只确认接头" in context
+
+
+def test_workspace_manifest_has_a_file_scan_budget():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        result_dir = Path(tmp) / "results"
+        result_dir.mkdir()
+        for index in range(5):
+            (result_dir / f"result_{index}.tsv").write_text("x", encoding="utf-8")
+
+        manifest = build_workspace_manifest(max_files=10, max_scan_files=3)
+
+        assert "工作区清单扫描在 3 个文件处停止" in manifest
 
 
 if __name__ == "__main__":

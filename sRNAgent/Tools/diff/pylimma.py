@@ -191,7 +191,7 @@ def _persist_de_results(
         'adata = sa.diff.de_analysis(adata)',
         'adata = sa.diff.de_analysis(adata, group_col="condition")',
         'adata = sa.diff.de_analysis(adata, control_group="Ctrl")',
-        'adata = sa.diff.de_analysis(adata, output_dir="de_results")',
+        'adata = sa.diff.de_analysis(adata, output_dir="results/differential")',
     ],
     related=[
         "diff.filter_low_expression", "quant.normalize_cpm",
@@ -205,7 +205,7 @@ def de_analysis(
     adata: AnnData,
     group_col: Optional[str] = None,
     control_group: Optional[str] = None,
-    output_dir: Optional[str] = None,
+    output_dir: Optional[str] = "results/differential",
     force: bool = False,
 ) -> AnnData:
     """Differential expression analysis using limma-voom (pylimma).

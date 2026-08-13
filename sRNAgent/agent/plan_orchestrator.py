@@ -10,17 +10,20 @@ import re
 from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
+from .plan_state import (
+    PlanGraph,
+    STEP_AWAITING_APPROVAL,
+    STEP_DONE,
+    STEP_FAILED,
+    STEP_PENDING,
+    STEP_RUNNING,
+    STEP_SKIPPED,
+)
+from .context import normalize_text_payload
 from .tools import list_available_skills, rank_skill_matches, resolve_skill_query
 
 if TYPE_CHECKING:
     from .srn_agent import SRNAgent, ProgressCallback, CodeApprovalCallback
-
-STEP_PENDING = "pending"
-STEP_RUNNING = "running"
-STEP_DONE = "done"
-STEP_FAILED = "failed"
-STEP_SKIPPED = "skipped"
-STEP_AWAITING_APPROVAL = "awaiting_approval"
 
 _APPROVAL_ACCEPT_RE = re.compile(
     r"^\s*(?:可以|确认(?:使用|执行|继续)?|同意|继续|按(?:此|上述)|采用|yes|ok|okay)(?:\s|[，,。.!！]|$)",
@@ -31,10 +34,16 @@ _APPROVAL_REJECT_RE = re.compile(
     re.I,
 )
 _APPROVAL_ASSIGNMENT_RE = re.compile(
-    r"(?:adapter(?:_3)?|strandedness|group(?:_col)?|control_group|design|min_length|max_length)\s*=\s*\S+",
+    r"(?:adapter(?:_3)?|strandedness|group(?:_col)?|control_group|design|min_length|max_length|"
+    r"quality_cutoff|error_rate|min_overlap|no_indels|times|trim_n|poly_a|output_dir|json_report)\s*=\s*\S+",
     re.I,
 )
 _APPROVAL_EXPLICIT_VALUE_RE = re.compile(r"\b(?:unstranded|forward|reverse|paired|unpaired)\b|\b[ACGTUN]{8,}\b", re.I)
+_APPROVAL_AFFIRMATION_RE = re.compile(
+    r"^\s*(?:可以(?:的|啊|呀)?|可(?:以|行)|好(?:的|啊|呀)?|没问题|行|同意|确认|"
+    r"ok(?:ay)?|yes|yep|sure|go\s+ahead)\s*[，,。.!！]?\s*$",
+    re.I,
+)
 _GROUP_CONFIRMATION_RE = re.compile(
     r"(?:确认|同意|采用|按|根据|使用).{0,24}(?:分组|组别|group)|"
     r"(?:分组|组别|group).{0,24}(?:确认|同意|采用|继续)",
@@ -49,7 +58,6 @@ _NATURAL_DESIGN_RE = re.compile(
     r"(?:design|设计)\s*(?:为|是|=|:|：)?\s*`?((?:un)?paired|配对|非配对|不配对)`?",
     re.I,
 )
-
 _MAX_REPLAN_ATTEMPTS = 8
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _PIPELINE_KEYWORDS_RE = re.compile(
@@ -1486,7 +1494,11 @@ def _build_planner_system_prompt(skill_overview: str, workflow_guidance: str = "
         "15. Default small-RNA quantification methods: for piRNA use `samtools_idxstats` after alignment to a "
         "piRNA FASTA reference; do not use featureCounts unless the user explicitly requests featureCounts. "
         "For miRNA quantification use `mirdeep2-mirna` / miRDeep2; do not substitute featureCounts unless "
-        "the user explicitly requests it.\n\n"
+        "the user explicitly requests it.\n"
+        "16. A plan is a revisable working model, not a commitment to a fixed workflow. When the user adds a "
+        "constraint, correction, priority, or requested prerequisite, revise ordering and scope around that newest "
+        "instruction while preserving completed artifacts. Infer the requested action from the user's words; do not "
+        "force it into a prewritten menu or ask for approval when the user has already specified what to investigate.\n\n"
         "## Registered skills\n"
         f"{skills_block}\n"
         f"{workflow_block}"
@@ -1560,6 +1572,14 @@ def _build_replanner_system_prompt(skill_overview: str, workflow_guidance: str =
         "- Keep completed steps as status \"done\" with their results.\n"
         "- Mark failed steps as \"failed\" or replace them with smaller retry steps.\n"
         "- Add new steps only if needed; remove redundant pending steps.\n"
+        "- Treat the newest user instruction as a change request to the plan, including an instruction to perform "
+        "a prerequisite investigation before an earlier approval. Preserve completed work, but reorder, replace, "
+        "or remove pending steps when that is necessary to satisfy the new instruction.\n"
+        "- This replanning pass also runs after successful steps. Treat their result as newly observed evidence, "
+        "not merely a completion note. Before retaining each pending step, decide whether its required artifact "
+        "already exists, is compatible with the requested analysis, and can be safely reused. Skip or replace "
+        "redundant work; keep validation when compatibility is uncertain. In particular, never rebuild or download "
+        "a high-cost reference/index solely because the original plan said to do so after evidence shows a usable one.\n"
         "- Output the FULL updated plan JSON (all steps with status).\n"
     )
 
@@ -1766,6 +1786,26 @@ def _approval_value_from_context(source: str, context: str, plan: Dict[str, Any]
         design = str(analysis.get("design") or "").strip()
         reason = str(analysis.get("reason") or "").strip()
         return f"{design}{f' ({reason})' if reason else ''}" if design else ""
+    # Read-only preflight steps emit one canonical value per line.  Parse
+    # these first so a detected cutadapt configuration supersedes a proposed
+    # default shown at the approval gate.
+    canonical_sources = {
+        "input_fastq", "sample_count", "library_kit", "adapter_3", "min_length",
+        "max_length", "quality_cutoff", "error_rate", "min_overlap", "no_indels",
+        "times", "trim_n", "poly_a", "output_dir", "json_report",
+    }
+    if normalized in canonical_sources:
+        canonical_labels = "|".join(re.escape(item.upper()) for item in canonical_sources)
+        match = re.search(
+            rf"\b{re.escape(normalized.upper())}\s*[:=：]\s*(.+?)"
+            rf"(?=\s+(?:{canonical_labels})\s*[:=：]|$)",
+            text,
+            re.I | re.S,
+        )
+        # Approval fields are human-readable configuration, never a place to
+        # surface an arbitrary session transcript. A malformed legacy result
+        # must not turn into megabytes of user-facing text.
+        return match.group(1).strip()[:240] if match else ""
     labels = {
         "group_column": r"GROUP_COLUMN\s*[:=：]\s*(.+?)(?=\s+(?:GROUP_COUNTS|CONTROL_GROUP|DESIGN)\s*[:=：]|$)",
         "group_counts": r"GROUP_COUNTS\s*[:=：]\s*(.+?)(?=\s+(?:CONTROL_GROUP|DESIGN)\s*[:=：]|$)",
@@ -1812,7 +1852,7 @@ def _format_completed_approval_evidence(plan: Dict[str, Any], step: Dict[str, An
     for prior in reversed(steps[:current_index]):
         if not isinstance(prior, dict) or prior.get("status") != STEP_DONE:
             continue
-        result = re.sub(r"\s+", " ", str(prior.get("result") or "")).strip()
+        result = re.sub(r"\s+", " ", normalize_text_payload(prior.get("result"))).strip()
         if not result:
             continue
         title = str(prior.get("title") or prior.get("id") or "已完成检查").strip()
@@ -1820,6 +1860,35 @@ def _format_completed_approval_evidence(plan: Dict[str, Any], step: Dict[str, An
         if len(evidence) >= 2:
             break
     return list(reversed(evidence))
+
+
+def _approval_review_context(
+    plan: Dict[str, Any],
+    step: Dict[str, Any],
+    history: List[Dict[str, str]],
+) -> str:
+    """Use only bounded, relevant data to populate an approval form.
+
+    Session memory can contain prior rendered replies and workspace listings.
+    Feeding it back into the form parser made a malformed legacy value expand
+    into the complete session transcript on every confirmation attempt.
+    """
+    steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+    try:
+        current_index = steps.index(step)
+    except ValueError:
+        current_index = len(steps)
+    values = [
+        normalize_text_payload(prior.get("result")).strip()[:8000]
+        for prior in steps[:current_index]
+        if isinstance(prior, dict) and prior.get("status") == STEP_DONE
+    ]
+    values.extend(
+        str(item.get("content") or "").strip()[:2000]
+        for item in history[-8:]
+        if isinstance(item, dict) and str(item.get("role") or "").lower() == "user"
+    )
+    return "\n".join(value for value in values if value)
 
 
 def _build_approval_request(
@@ -1832,12 +1901,7 @@ def _build_approval_request(
     """Render a reviewable approval request instead of a blind yes/no gate."""
     approval = step.get("approval") if isinstance(step.get("approval"), dict) else {}
     review = approval.get("review") if isinstance(approval.get("review"), dict) else {}
-    conversation = "\n".join(
-        str(item.get("content") or "")
-        for item in history
-        if isinstance(item, dict)
-    )
-    context = "\n".join((conversation, extra_context, "\n".join(_format_completed_approval_evidence(plan, step))))
+    context = _approval_review_context(plan, step, history)
     lines = [f"配置审阅（尚未执行）：{step.get('title') or step.get('goal') or '当前配置'}", "", "当前已知信息与拟使用配置："]
     fields = review.get("fields") if isinstance(review.get("fields"), list) else []
     reviewed = approval.setdefault("reviewed", {})
@@ -1851,13 +1915,24 @@ def _build_approval_request(
         value = str(field.get("value") or "").strip()
         source = str(field.get("source") or "").strip()
         if source:
-            value = _approval_value_from_context(source, context, plan) or value
+            detected = _approval_value_from_context(source, context, plan)
+            # A preflight may correctly report no historical configuration.
+            # In that case keep the skill-declared proposal visible rather
+            # than replacing it with an unhelpful "未记录".
+            if detected and detected.strip().casefold() not in {
+                "未记录", "unknown", "none", "null", "n/a", "na", "-",
+            }:
+                value = detected
+        unknown = str(field.get("unknown") or "未记录").strip()
         if not value:
-            value = str(field.get("unknown") or "未记录").strip()
+            value = unknown
         lines.append(f"- {label}: {value}")
         key = str(field.get("key") or source or label).strip()
-        if key and value and value != str(field.get("unknown") or "").strip():
+        if key and value and value != unknown:
             reviewed[key] = value
+        elif key:
+            # Remove stale values produced by a previous malformed render.
+            reviewed.pop(key, None)
 
     evidence = _format_completed_approval_evidence(plan, step)
     if evidence:
@@ -1907,10 +1982,28 @@ def _format_confirmed_approvals(plan: Dict[str, Any]) -> str:
         if response:
             title = str(step.get("title") or step.get("id") or "确认项").strip()
             reviewed = approval.get("reviewed") if isinstance(approval.get("reviewed"), dict) else {}
-            reviewed_text = ", ".join(f"{key}={value}" for key, value in reviewed.items())
+            reviewed_text = ", ".join(
+                f"{key}={re.sub(r'\s+', ' ', str(value)).strip()[:240]}"
+                for key, value in reviewed.items()
+            )
             suffix = f"; 已知配置: {reviewed_text}" if reviewed_text else ""
             lines.append(f"- {title}: 用户回复={response}{suffix}")
     return "\n".join(lines)
+
+
+def _sanitize_restored_approval(approval: Dict[str, Any]) -> None:
+    """Discard corrupted persisted review fields before a plan is resumed."""
+    reviewed = approval.get("reviewed")
+    if isinstance(reviewed, dict):
+        approval["reviewed"] = {
+            str(key): str(value).strip()
+            for key, value in reviewed.items()
+            if len(str(value or "").strip()) <= 240
+        }
+    for key in ("lastResponse", "response"):
+        value = str(approval.get(key) or "").strip()
+        if len(value) > 1_000:
+            approval[key] = value[:1_000] + "…"
 
 
 def _build_final_summary(plan: Dict[str, Any]) -> str:
@@ -1953,14 +2046,25 @@ def _build_final_summary(plan: Dict[str, Any]) -> str:
 
 
 def approval_response_is_actionable(response: str) -> bool:
-    """True only for an explicit approval or a concrete parameter change."""
+    """True for an unambiguous approval or a concrete parameter change."""
     text = str(response or "").strip()
     if not text or _APPROVAL_REJECT_RE.search(text):
         return False
     return bool(
         _APPROVAL_ACCEPT_RE.search(text)
+        or _APPROVAL_AFFIRMATION_RE.search(text)
         or _APPROVAL_ASSIGNMENT_RE.search(text)
         or _APPROVAL_EXPLICIT_VALUE_RE.search(text)
+    )
+
+
+def _approval_response_requests_followup(response: str) -> bool:
+    """Whether a non-approval reply should be handled as a requested prerequisite."""
+    text = str(response or "").strip()
+    return bool(
+        text
+        and not _APPROVAL_REJECT_RE.search(text)
+        and not approval_response_is_actionable(text)
     )
 
 
@@ -2059,12 +2163,11 @@ class PlanOrchestrator:
     ) -> Dict[str, Any]:
         """Make an interrupted plan executable without changing its agreed scope."""
         restored = deepcopy(plan)
+        PlanGraph(restored).reset_interrupted(running=STEP_RUNNING, pending=STEP_PENDING)
         for index, step in enumerate(restored.get("steps") or []):
-            if isinstance(step, dict) and step.get("status") == STEP_RUNNING:
-                # No process is still executing after a resume request.  Treat
-                # its interrupted step as the next pending unit of work.
-                step["status"] = STEP_PENDING
-            elif (
+            if isinstance(step, dict) and isinstance(step.get("approval"), dict):
+                _sanitize_restored_approval(step["approval"])
+            if (
                 isinstance(step, dict)
                 and step.get("status") == STEP_AWAITING_APPROVAL
                 and approval_response.strip()
@@ -2095,7 +2198,64 @@ class PlanOrchestrator:
                         approval.pop("lastResponse", None)
                     else:
                         approval["lastResponse"] = approval_response.strip()
+                        if _approval_response_requests_followup(approval_response):
+                            approval["followupRequest"] = approval_response.strip()[:800]
         return restored
+
+    @staticmethod
+    def _materialize_approval_followup(plan: Dict[str, Any]) -> bool:
+        """Turn a fact-finding reply at a gate into one read-only subtask."""
+        steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
+        for index, gate in enumerate(steps):
+            if not isinstance(gate, dict) or gate.get("status") != STEP_AWAITING_APPROVAL:
+                continue
+            approval = gate.get("approval") if isinstance(gate.get("approval"), dict) else {}
+            request = str(approval.pop("followupRequest", "") or "").strip()
+            if not request:
+                continue
+            gate_id = str(gate.get("id") or index + 1).strip()
+            followup_base_id = f"{gate_id}-clarify"
+            existing_ids = {
+                str(step.get("id") or "")
+                for step in steps
+                if isinstance(step, dict)
+            }
+            followup_id = followup_base_id
+            sequence = 2
+            while followup_id in existing_ids:
+                followup_id = f"{followup_base_id}-{sequence}"
+                sequence += 1
+            title = "响应用户的前置核查请求"
+            goal = (
+                f"用户在当前审批前要求优先处理：{request}\n"
+                "将这条反馈视为对计划的有效修改，而不是要求用户重复确认旧计划。结合完整对话和已有 "
+                "结果，推断用户要先核对的对象、来源和交付内容，并立即完成该只读核查。用户已经指定 "
+                "来源或顺序时，直接使用该来源和顺序；不要把请求改写为固定的来源菜单，也不要要求用户 "
+                "再次选择来源。给出可核验的证据、映射或缺失项；完成后再回到仍然相关的审批步骤。"
+                "禁止运行 cutadapt、FastQC、比对、定量或修改任何数据/文件。"
+            )
+            contracts = [{
+                "id": "approval-followup-read-only",
+                "instructions": (
+                    "Treat the user's latest feedback as a concrete change to the plan. Perform the requested "
+                    "read-only investigation now, following any source and priority the user named. Do not replace "
+                    "it with a generic options list or ask for another source approval. Do not transform data or "
+                    "write files."
+                ),
+            }]
+            followup = _make_plan_step(
+                step_id=followup_id,
+                title=title,
+                goal=goal,
+                # A follow-up may concern any modality or external source;
+                # inheriting an unrelated pipeline skill biases the executor.
+                skill="",
+                auto_inserted=True,
+                execution_contracts=contracts,
+            )
+            steps.insert(index, followup)
+            return True
+        return False
 
     def _save_step_checkpoint(
         self,
@@ -2219,6 +2379,7 @@ class PlanOrchestrator:
         extra_context: str,
         failed_step: Optional[Dict[str, Any]] = None,
         failure_reason: str = "",
+        completed_step: Optional[Dict[str, Any]] = None,
         history: Optional[List[Dict[str, Any]]] = None,
         on_progress: Optional["ProgressCallback"] = None,
         cancel_event: Optional[Any] = None,
@@ -2237,6 +2398,13 @@ class PlanOrchestrator:
                 f"  id={failed_step.get('id')} title={failed_step.get('title')}\n"
                 f"  reason: {failure_reason or failed_step.get('result') or 'unknown'}\n"
             )
+        completed_block = ""
+        if completed_step:
+            completed_block = (
+                "\n\nNew evidence from the just-completed step:\n"
+                f"  id={completed_step.get('id')} title={completed_step.get('title')}\n"
+                f"  result: {normalize_text_payload(completed_step.get('result'))[:8000]}\n"
+            )
 
         planning_skill_guidance = _load_planning_skill_guidance(
             getattr(self.agent, "skill_registry", None), user_query,
@@ -2254,6 +2422,7 @@ class PlanOrchestrator:
                     f"{conversation_block}"
                     f"Current plan:\n{current_plan_text}"
                     f"{failure_block}\n\n"
+                    f"{completed_block}\n"
                     "Revise the plan. Output full updated JSON."
                 ),
             },
@@ -2481,10 +2650,11 @@ class PlanOrchestrator:
 
     @staticmethod
     def _next_pending_step(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        for step in plan.get("steps") or []:
-            if step.get("status") == STEP_PENDING:
-                return step
-        return None
+        """Return the first pending step whose declared prerequisites are complete."""
+        return PlanGraph(plan).next_runnable_pending(
+            pending=STEP_PENDING,
+            completed={STEP_DONE, STEP_SKIPPED},
+        )
 
     def run(
         self,
@@ -2505,7 +2675,7 @@ class PlanOrchestrator:
             checkpoint = self._load_checkpoint()
 
         # Greetings / short chat: skip planning, reply like normal agent.
-        if _is_conversational_query(user_query):
+        if _is_conversational_query(user_query) and not resume:
             self._emit(on_progress, "status", message="正在回复…")
             result = self.agent.run_with_history(
                 history,
@@ -2528,7 +2698,7 @@ class PlanOrchestrator:
         # directly. Planning them as a new pipeline causes prerequisite
         # expansion (QC, reference preparation, reports) and makes a simple
         # summary appear to restart the previous analysis.
-        if _is_read_only_query(user_query):
+        if _is_read_only_query(user_query) and not resume:
             self._emit(on_progress, "status", message="正在读取已有结果…")
             result = self.agent.run_with_history(
                 history,
@@ -2616,6 +2786,9 @@ class PlanOrchestrator:
             )
 
         replan_attempts = 0
+        if self._materialize_approval_followup(plan):
+            self._persist_plan(plan)
+            self._save_step_checkpoint(plan, None)
         steps_list = plan.get("steps") or []
         if not isinstance(steps_list, list) or not steps_list:
             # Never turn a planner/policy failure into a successful empty plan.
@@ -2630,13 +2803,8 @@ class PlanOrchestrator:
             self.agent._check_cancelled(cancel_event)
             pending = self._next_pending_step(plan)
             if pending is None:
-                waiting = next(
-                    (
-                        step for step in plan.get("steps") or []
-                        if isinstance(step, dict) and step.get("status") == STEP_AWAITING_APPROVAL
-                    ),
-                    None,
-                )
+                graph = PlanGraph(plan)
+                waiting = graph.first_with_status(STEP_AWAITING_APPROVAL)
                 if waiting:
                     prompt = _build_approval_request(
                         plan,
@@ -2649,6 +2817,20 @@ class PlanOrchestrator:
                     self._emit(on_progress, "plan_approval_required", plan=plan, stepId=waiting.get("id"), message=prompt)
                     self._emit(on_progress, "final", content=prompt)
                     return prompt
+                blocked = graph.blocked_pending(
+                    pending=STEP_PENDING,
+                    completed={STEP_DONE, STEP_SKIPPED},
+                )
+                if blocked:
+                    labels = "; ".join(
+                        f"{step.get('title') or step.get('id') or '未命名步骤'}"
+                        f" <- {', '.join(graph.unmet_dependencies(step, {STEP_DONE, STEP_SKIPPED})) or '未知依赖'}"
+                        for step in blocked[:3]
+                    )
+                    message = f"计划被未完成或缺失的依赖阻塞，尚未执行：{labels}。"
+                    self._emit(on_progress, "plan_failed", plan=plan, message=message)
+                    self._emit(on_progress, "final", content=message)
+                    return message
                 break
 
             step_index = steps_list.index(pending) + 1
@@ -2775,6 +2957,45 @@ class PlanOrchestrator:
                 result=result[:600] if result else "",
                 message=f"步骤 {step_index}/{step_total} 完成",
             )
+
+            # A successful inspection often changes the need for later work:
+            # for example, it can reveal a compatible reference/index or a
+            # completed count matrix. Re-evaluate the remaining plan before
+            # allowing a stale high-cost step to start.
+            if any(
+                isinstance(step, dict) and step.get("status") in {STEP_PENDING, STEP_AWAITING_APPROVAL}
+                for step in plan.get("steps") or []
+            ):
+                try:
+                    plan = self._replan(
+                        plan,
+                        user_query=user_query,
+                        extra_context=extra_context,
+                        completed_step=pending,
+                        history=history,
+                        on_progress=on_progress,
+                        cancel_event=cancel_event,
+                    )
+                except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                    # Evidence-driven revision improves the plan but must not
+                    # invalidate already persisted work if the planner is down.
+                    self._emit(
+                        on_progress,
+                        "plan_revision_skipped",
+                        plan=plan,
+                        message=f"无法根据新证据修订计划，沿用当前计划：{exc}",
+                    )
+                else:
+                    steps_list = plan.get("steps") or []
+                    step_total = len(steps_list)
+                    self._persist_plan(plan)
+                    self._save_step_checkpoint(plan, None)
+                    self._emit(
+                        on_progress,
+                        "plan_revised",
+                        plan=plan,
+                        message=f"已依据步骤结果更新计划（第 {plan.get('version')} 版）",
+                    )
 
         summary = self._ensure_user_facing_reply(
             user_query,

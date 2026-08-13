@@ -460,7 +460,7 @@ def _run_bowtie_one(
 def bowtie(
     adata: AnnData,
     index_basename: str = "index",
-    output_dir: str = "aligned",
+    output_dir: str = "results/alignment",
     # Input format
     input_format: str = "fastq",
     trim5: Optional[int] = None,

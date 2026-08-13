@@ -13,6 +13,7 @@ which eventually overflow the LLM context window. This module provides:
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 from typing import Any, Callable, Dict, List, Optional
@@ -22,6 +23,50 @@ _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _TRUNCATED_MARKER = "\n…[内容已截断]"
 _SUMMARY_ROLE = "assistant"
 _SUMMARY_PREFIX = "[会话摘要（早期对话已压缩，保留关键决策、路径、参数与结果）]"
+
+
+def normalize_text_payload(value: Any) -> str:
+    """Render provider text-wrapper objects as ordinary text.
+
+    Some OpenAI-compatible providers emit a string tool argument as an object
+    containing ``$text`` fragments.  Passing that object through ``str`` leaks
+    its Python representation into the chat and turns newlines into ``\\n``.
+    A previous run may already have persisted that representation, so accept a
+    safely parseable literal form too.
+    """
+    candidate = value
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+        if stripped.startswith("{") and "'$text'" in stripped:
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (SyntaxError, ValueError):
+                parsed = candidate
+            if isinstance(parsed, dict):
+                candidate = parsed
+
+    def flatten(item: Any) -> str:
+        if isinstance(item, str):
+            return item
+        if isinstance(item, dict):
+            parts: List[str] = []
+            for key in ("$text", "text"):
+                if key in item:
+                    parts.append(flatten(item[key]))
+            for key, nested in item.items():
+                if key not in {"$text", "text"}:
+                    # Malformed provider payloads sometimes split ordinary
+                    # text across object keys; retain those fragments in order.
+                    parts.append(str(key))
+                    parts.append(flatten(nested))
+            return "".join(parts)
+        if isinstance(item, (list, tuple)):
+            return "".join(flatten(part) for part in item)
+        if item is None:
+            return ""
+        return str(item)
+
+    return flatten(candidate)
 
 
 def estimate_tokens(text: str) -> int:

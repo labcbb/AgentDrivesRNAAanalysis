@@ -159,7 +159,7 @@ def list_pirna_species() -> Dict[str, str]:
 )
 def download_pirna(
     code: str,
-    output_dir: str = ".",
+    output_dir: str = "references",
     gold: bool = False,
     jobs: int = 4,
     force: bool = False,

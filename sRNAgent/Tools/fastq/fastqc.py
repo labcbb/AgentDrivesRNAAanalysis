@@ -195,7 +195,7 @@ def _run_fastqc_one(
 )
 def fastqc(
     adata: AnnData,
-    output_dir: str = "fastqc_out",
+    output_dir: str = "results/qc/fastqc",
     format: Optional[str] = None,
     threads: int = 2,
     contaminants: Optional[str] = None,

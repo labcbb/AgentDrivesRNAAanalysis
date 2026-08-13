@@ -114,7 +114,7 @@ def list_mirtarbase_species() -> Dict[str, str]:
 )
 def download_mirtarbase(
     code: str = "hsa",
-    output_dir: str = ".",
+    output_dir: str = "references",
     jobs: int = 4,
     force: bool = False,
 ) -> Dict[str, str]:

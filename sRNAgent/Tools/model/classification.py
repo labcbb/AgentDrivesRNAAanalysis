@@ -28,6 +28,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.svm import SVC
 
 from ..._registry import register_function
+from .featureselection import prepare_feature_matrix, select_features
 
 
 CLASSIFICATION_UNS_KEY = "classification"
@@ -225,17 +226,19 @@ def _performance_rows(details: Mapping[str, Mapping[str, Any]]) -> pd.DataFrame:
         "classification", "classification_model", "classifier", "svm_classification",
         "random_forest_classification", "xgboost_classification", "分类模型", "分类建模",
     ],
-    category="prediction",
+    category="model",
     description=(
         "Train SVM, random forest, XGBoost, and/or logistic-regression classifiers from selected AnnData features "
         "and group labels. With model=None, evaluate all four models for comparison; a specified model evaluates only "
-        "that model. Supports fitting on all samples, stratified train/test splitting, and stratified cross-validation. "
-        "Performance, selected features, labels, and persisted final-model paths are stored in adata.uns['classification']."
+        "that model. Supports clinical covariates with categorical encoding, missing-value preprocessing, supervised "
+        "feature selection, stratified train/test splitting, and stratified cross-validation. Performance, selected "
+        "features, labels, and persisted final-model paths are stored in adata.uns['classification']."
     ),
     examples=[
-        "adata = sa.prediction.classification(adata, ['hsa-miR-490-3p'], 'group')",
-        "adata = sa.prediction.classification(adata, top5, 'group', split_data=True, cross_validate=True)",
-        "adata = sa.prediction.classification(adata, top5, 'group', model='xgboost')",
+        "adata = sa.model.classification(adata, ['hsa-miR-490-3p'], 'group')",
+        "adata = sa.model.classification(adata, top5, 'group', split_data=True, cross_validate=True)",
+        "adata = sa.model.classification(adata, top5, 'group', model='xgboost')",
+        "adata = sa.model.classification(adata, genes, 'group', obs_features=['Stage'], feature_selection='mutual_info', selection_top_k=20)",
     ],
     related=["diff.de_analysis", "target.enrichr"],
     produces={"uns": [CLASSIFICATION_UNS_KEY]},
@@ -245,13 +248,19 @@ def classification(
     features: str | Sequence[str],
     group_col: str | Sequence[Any],
     *,
+    obs_features: Optional[str | Sequence[str]] = None,
     layer: Optional[str] = None,
+    feature_selection: Optional[str] = None,
+    selection_top_k: Optional[int] = None,
+    missing_threshold: float = 0.20,
+    imputation: str = "median",
+    variance_threshold: float = 0.0,
     split_data: bool = False,
     test_size: float = 0.2,
     model: Optional[str | Sequence[str]] = None,
     cross_validate: bool = False,
     cv_folds: int = 5,
-    output_dir: str = "classification_models",
+    output_dir: str = "results/models/classification",
     random_state: int = 0,
     force: bool = False,
 ) -> AnnData:
@@ -271,8 +280,19 @@ def classification(
 
     feature_names = _normalise_features(features)
     selected_models = _normalise_models(model)
-    matrix, layer_name = _resolve_matrix(adata, feature_names, layer)
     raw_labels, group_source = _resolve_groups(adata, group_col)
+    matrix, feature_names, layer_name, preprocessing = prepare_feature_matrix(
+        adata, feature_names, obs_features=obs_features, layer=layer,
+        missing_threshold=missing_threshold, imputation=imputation,
+        variance_threshold=variance_threshold,
+    )
+    if feature_selection:
+        matrix, feature_names, selection_table = select_features(
+            matrix, feature_names, raw_labels, method=feature_selection,
+            top_k=selection_top_k, de_results=adata.uns.get("de_results"),
+            random_state=int(random_state),
+        )
+        preprocessing["selection_table"] = selection_table
     encoder = LabelEncoder()
     labels = encoder.fit_transform(raw_labels)
     class_codes = np.unique(labels)
@@ -286,7 +306,13 @@ def classification(
         "features": feature_names,
         "group_source": group_source,
         "group_labels": raw_labels.tolist(),
+        "obs_features": list(obs_features) if obs_features is not None else [],
         "layer": layer_name,
+        "feature_selection": feature_selection,
+        "selection_top_k": selection_top_k,
+        "missing_threshold": float(missing_threshold),
+        "imputation": imputation,
+        "variance_threshold": float(variance_threshold),
         "split_data": bool(split_data),
         "test_size": float(test_size),
         "models": selected_models,
@@ -361,6 +387,7 @@ def classification(
         "input_layer": layer_name,
         "class_labels": encoder.classes_.astype(str).tolist(),
         "feature_names": feature_names,
+        "preprocessing": preprocessing,
         "feature_selection_note": (
             "Features are supplied by the caller. If they were selected using all samples and their labels "
             "(for example, global DE top features), holdout and cross-validation metrics may be optimistically biased."

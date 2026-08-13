@@ -181,7 +181,7 @@ def _parse_summary(summary_path: Path) -> Dict[str, Dict[str, int]]:
 def feature_count(
     adata: AnnData,
     annotation: str,
-    output_dir: str = "fc_out",
+    output_dir: str = "results/quantification/featurecounts",
     *,
     rna_type: str = "miRNA",
     feature_type: str = "miRNA",

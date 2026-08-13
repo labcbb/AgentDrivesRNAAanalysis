@@ -23,7 +23,7 @@ __version__ = "0.1.0"
 
 
 def __getattr__(name: str):
-    if name in {"alignment", "diff", "download", "fastq", "fragment", "prediction", "quant", "reference", "target"}:
+    if name in {"alignment", "diff", "download", "fastq", "fragment", "model", "plot", "quant", "reference", "report", "target"}:
         return import_module(f".Tools.{name}", __name__)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -34,7 +34,9 @@ __all__ = [
     "download",
     "fastq",
     "fragment",
-    "prediction",
+    "model",
+    "plot",
+    "report",
     "quant",
     "reference",
     "target",

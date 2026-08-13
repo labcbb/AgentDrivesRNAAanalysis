@@ -112,7 +112,7 @@ def _parse_idxstats_file(path: str | Path) -> pd.DataFrame:
 )
 def idxstats(
     adata: AnnData,
-    output_dir: str = "idxstats_out",
+    output_dir: str = "results/quantification/idxstats",
     *,
     bam_col: str = "bam_path",
     create_index: bool = True,

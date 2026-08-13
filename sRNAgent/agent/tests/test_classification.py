@@ -12,9 +12,9 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from sRNAgent.Tools.prediction import classification
+from sRNAgent.Tools.model import classification
 
-classification_module = importlib.import_module("sRNAgent.Tools.prediction.classification")
+classification_module = importlib.import_module("sRNAgent.Tools.model.classification")
 
 
 def _adata() -> ad.AnnData:

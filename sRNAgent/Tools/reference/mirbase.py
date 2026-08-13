@@ -187,7 +187,7 @@ def list_mirbase_codes(
 )
 def download_mirbase(
     species: Optional[str] = None,
-    output_dir: str = ".",
+    output_dir: str = "references",
     jobs: int = 4,
     force: bool = False,
     download_fasta: bool = True,

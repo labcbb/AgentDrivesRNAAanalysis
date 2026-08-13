@@ -69,9 +69,9 @@ Each sample in `adata.obs.index` becomes a row that the pipeline populates with 
 > sRNA-seq 文库构建时，3' adapter 被连接在 insert 两端，测序后 adapter 直接跟在 insert 后面。
 > **如果 adapter 序列给错，cutadapt 无法正确切除接头，大部分 reads 无法比对到基因组，整个分析失败。**
 >
-> **Agent 行动要求：不要默认使用 TruSeq 的 adapter！必须先问用户：**
-> 1. 询问用户使用的建库试剂盒名称
-> 2. 让用户确认是否使用下面的默认序列，还是自己指定
+> **Agent 行动要求：把 TruSeq 默认值作为待确认提案，而不是当作已知事实。必须在运行前向用户展示：**
+> 1. 当前检测到的建库试剂盒名称；没有记录时明确说明默认提案是 TruSeq Small RNA
+> 2. 3' adapter、最小/最大长度、质量阈值、匹配参数及输出/JSON 留痕设置，让用户确认或逐项修改
 > 3. 如果用户不确定，让对方查一下实验方法的 "Library preparation" 部分
 > 4. 如果完全无法确定，可以建议先跑 FastQC 查看 Overrepresented Sequences
 >

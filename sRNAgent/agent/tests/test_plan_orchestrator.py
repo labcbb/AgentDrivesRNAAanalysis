@@ -19,6 +19,7 @@ from sRNAgent.agent.plan_orchestrator import (  # noqa: E402
     _approval_value_from_context,
     _format_confirmed_approvals,
     approval_response_is_actionable,
+    _approval_response_requests_followup,
     _build_planner_system_prompt,
     _context_has_counts_for_modality,
     _expand_plan_prerequisites,
@@ -424,6 +425,108 @@ def test_approval_response_unblocks_only_the_waiting_plan_step():
     assert restored["steps"][1]["status"] == "pending"
 
 
+def test_plain_chinese_affirmation_confirms_an_explicitly_presented_configuration():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认 GEO 预后字段抓取范围",
+            "status": "awaiting_approval",
+            "approval": {
+                "id": "geo-prognosis",
+                "review": {"fields": [{"key": "fetch_scope", "value": "当前 16 个样本"}]},
+            },
+        }]
+    }
+
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以的")
+
+    assert approval_response_is_actionable("可以的") is True
+    assert restored["steps"][0]["status"] == "done"
+    assert restored["steps"][0]["approval"]["response"] == "可以的"
+
+
+def test_downstream_step_cannot_bypass_an_unconfirmed_adapter_gate():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "1", "title": "下载 FASTQ", "status": "done"},
+            {
+                "id": "2",
+                "title": "确认 3' adapter",
+                "status": "awaiting_approval",
+                "approval": {"id": "confirm-adapter-before-trimming"},
+                "depends_on": ["1"],
+            },
+            {
+                "id": "3",
+                "title": "FastQC + MultiQC",
+                "status": "pending",
+                "depends_on": ["2"],
+            },
+        ]
+    }
+
+    assert PlanOrchestrator._next_pending_step(plan) is None
+
+    plan["steps"][1]["status"] = "done"
+    assert PlanOrchestrator._next_pending_step(plan) is plan["steps"][2]
+
+
+def test_adapter_gate_executes_any_user_requested_prerequisite_before_confirmation():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "trim",
+            "title": "确认 adapter",
+            "skill": "fastq-qc",
+            "status": "awaiting_approval",
+            "approval": {"id": "confirm-adapter-before-trimming", "followupRequest": "先找到对应的 GSM 编号"},
+        }]
+    }
+
+    assert _approval_response_requests_followup("你要先找到对应的GSM编号，然后GSM的信息里面有") is True
+    assert _approval_response_requests_followup("我还不确定，先解释这个字段的影响") is True
+    assert PlanOrchestrator._materialize_approval_followup(plan) is True
+    followup = plan["steps"][0]
+    assert followup["status"] == "pending"
+    assert followup["title"] == "响应用户的前置核查请求"
+    assert followup["skill"] == ""
+    assert "先找到对应的 GSM 编号" in followup["goal"]
+    assert "推断用户要先核对的对象、来源和交付内容" in followup["goal"]
+    assert followup["executionContracts"][0]["id"] == "approval-followup-read-only"
+    assert "禁止运行 cutadapt" in followup["goal"]
+    assert plan["steps"][1]["status"] == "awaiting_approval"
+
+    followup["status"] = "done"
+    plan["steps"][1]["approval"]["followupRequest"] = "先核对文献中报告的建库试剂盒"
+    assert PlanOrchestrator._materialize_approval_followup(plan) is True
+    assert plan["steps"][1]["id"] == "trim-clarify-2"
+
+
+def test_resume_discards_corrupted_approval_values_before_execution():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认 adapter",
+            "status": "awaiting_approval",
+            "approval": {
+                "id": "confirm-adapter-before-trimming",
+                "reviewed": {"min_length": "corrupted " * 100},
+            },
+        }]
+    }
+
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="先解释参数")
+
+    assert "min_length" not in restored["steps"][0]["approval"]["reviewed"]
+
+
 def test_non_confirmation_keeps_approval_gate_closed():
     from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
 
@@ -546,6 +649,102 @@ def test_adapter_approval_renders_actual_input_adapter_and_length_values():
     message = _build_approval_request(plan, gate, history=[], extra_context="")
 
     assert "摘要：将对 `adata.obs['fastq_path']` 中的 30 个样本使用 3' adapter `TGGAATTCTCGGGTGCCAAGG`，长度过滤为 `18`-40 nt。" in message
+
+
+def test_adapter_approval_shows_complete_defaults_when_no_prior_trim_is_recorded():
+    preflight = {
+        "id": "1",
+        "title": "读取现有 FASTQ 修剪配置",
+        "status": "done",
+        "result": "INPUT_FASTQ: adata.obs['fastq_path']\nSAMPLE_COUNT: 12\nADAPTER_3: 未记录\nMAX_LENGTH: 未记录",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 sRNA-seq 3' adapter",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-adapter-before-trimming",
+            "review": {
+                "fields": [
+                    {"label": "adapter（TruSeq 默认提案）", "source": "adapter_3", "value": "TGGAATTCTCGGGTGCCAAGG", "unknown": "未记录"},
+                    {"label": "最小长度", "source": "min_length", "value": "18", "unknown": "未记录"},
+                    {"label": "最大长度", "source": "max_length", "value": "36", "unknown": "未记录"},
+                    {"label": "质量阈值", "source": "quality_cutoff", "value": "20", "unknown": "未记录"},
+                    {"label": "错误率", "source": "error_rate", "value": "0.1", "unknown": "未记录"},
+                    {"label": "最小重叠", "source": "min_overlap", "value": "3", "unknown": "未记录"},
+                    {"label": "输出", "source": "output_dir", "value": "trimmed", "unknown": "未记录"},
+                    {"label": "JSON 报告", "source": "json_report", "value": "true", "unknown": "未记录"},
+                ]
+            },
+        },
+    }
+
+    message = _build_approval_request({"steps": [preflight, gate]}, gate, history=[], extra_context="")
+
+    assert "adapter（TruSeq 默认提案）: TGGAATTCTCGGGTGCCAAGG" in message
+    assert "最小长度: 18" in message
+    assert "最大长度: 36" in message
+    assert "质量阈值: 20" in message
+    assert "错误率: 0.1" in message
+    assert "最小重叠: 3" in message
+    assert "输出: trimmed" in message
+    assert "JSON 报告: true" in message
+
+
+def test_adapter_approval_accepts_extended_trim_parameter_overrides():
+    assert approval_response_is_actionable("quality_cutoff=25, error_rate=0.05, trim_n=true") is True
+
+
+def test_adapter_approval_does_not_echo_session_memory_into_config_fields():
+    preflight = {
+        "id": "1",
+        "title": "读取现有 FASTQ 修剪配置",
+        "status": "done",
+        "result": "INPUT_FASTQ: adata.obs['fastq_path']\nSAMPLE_COUNT: 20\nADAPTER_3: TGGAATTCTCGGGTGCCAAGG\nMIN_LENGTH: 18\nMAX_LENGTH: 36",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 sRNA-seq 3' adapter",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-adapter-before-trimming",
+            "reviewed": {"min_length": "stale value"},
+            "review": {
+                "fields": [
+                    {"label": "输入", "source": "input_fastq", "unknown": "未记录"},
+                    {"label": "最小长度", "source": "min_length", "unknown": "未记录"},
+                    {"label": "最大长度", "source": "max_length", "unknown": "未记录"},
+                ]
+            },
+        },
+    }
+    noisy_memory = "MIN_LENGTH: " + ("session-memory-noise " * 1000)
+
+    message = _build_approval_request(
+        {"steps": [preflight, gate]}, gate, history=[], extra_context=noisy_memory,
+    )
+
+    assert "最小长度: 18" in message
+    assert "session-memory-noise" not in message
+    assert gate["approval"]["reviewed"]["min_length"] == "18"
+
+
+def test_confirmed_approval_context_is_bounded_for_legacy_corruption():
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认 adapter",
+            "status": "done",
+            "approval": {
+                "response": "可以",
+                "reviewed": {"min_length": "legacy-noise " * 1000},
+            },
+        }]
+    }
+
+    rendered = _format_confirmed_approvals(plan)
+
+    assert len(rendered) < 400
 
 
 def test_executor_receives_confirmed_approval_and_user_override_rule():
@@ -762,6 +961,77 @@ def test_replan_matches_completed_steps_by_identity_not_shifted_id():
     assert by_title["miRNA 定量"]["status"] == "done"
     assert by_title["miRNA 定量"]["result"] == "old completed result"
     assert by_title["isomiR 定量"]["status"] == "pending"
+
+
+def test_successful_step_evidence_replans_away_redundant_pending_work():
+    class Completion:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeAgent:
+        system_prompt = "system"
+        skill_registry = None
+
+        def __init__(self):
+            self.events = []
+            self.executed = []
+            self.requests = []
+            self.responses = [
+                Completion(
+                    '{"goal":"reuse reference","steps":[{"id":"1","title":"核对现有参考","goal":"inspect reference","skill":""}]}'
+                ),
+                Completion(
+                    '{"goal":"reuse reference","steps":[{"id":"1","title":"核对现有参考","goal":"inspect reference","skill":""}]}'
+                ),
+            ]
+
+        def _emit_progress(self, callback, event_type, **payload):
+            self.events.append(event_type)
+
+        def _persist_checkpoint(self, payload, chat_id):
+            return None
+
+        def _clear_run_checkpoint(self, chat_id):
+            return None
+
+        def _check_cancelled(self, cancel_event):
+            return None
+
+        def _llm_complete_cancellable(self, messages, **kwargs):
+            self.requests.append(messages)
+            return self.responses.pop(0)
+
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    agent = FakeAgent()
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = agent
+    orchestrator.chat_id = "chat-evidence-replan"
+    orchestrator._save_plan = lambda chat_id, plan: None
+    orchestrator._load_plan = None
+    orchestrator.max_replan_attempts = 0
+    orchestrator.skill_overview = ""
+    orchestrator._create_plan = lambda *args, **kwargs: {
+        "goal": "检查并完成 miRNA 定量",
+        "steps": [
+            {"id": "1", "title": "核对现有参考", "goal": "inspect reference", "status": "pending"},
+            {"id": "2", "title": "构建 Bowtie index", "goal": "build a genome index", "status": "pending"},
+        ],
+    }
+    orchestrator._execute_step = lambda step, **kwargs: (
+        "已找到完整且兼容的 GRCh38 Bowtie index：ref/grch38.{1,2,3,4,rev.1,rev.2}.ebwt"
+        if step["id"] == "1"
+        else (_ for _ in ()).throw(AssertionError("redundant index build must not execute"))
+    )
+    orchestrator._ensure_user_facing_reply = lambda user_query, text, **kwargs: text
+
+    result = orchestrator.run([{"role": "user", "content": "检查并完成 miRNA 定量"}])
+
+    assert "完整且兼容的 GRCh38 Bowtie index" in result
+    assert "plan_revised" in agent.events
+    replanner_request = agent.requests[0][1]["content"]
+    assert "New evidence from the just-completed step" in replanner_request
+    assert "完整且兼容的 GRCh38 Bowtie index" in replanner_request
 
 
 def test_existing_result_summary_is_read_only_and_skips_new_pipeline():

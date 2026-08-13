@@ -61,18 +61,50 @@ if "trimmed_path" not in adata.obs_keys():
 
 ## 结果持久化：分析结果必须落盘，能跨会话查询
 
+## 工作区目录规范：所有分析产物按用途归档
+
+工作区根目录不得直接堆放下载文件、比对文件、图表或分析结果。除非用户明确指定其他位置，所有 `output_dir`、保存的 `.h5ad` 和自定义导出必须使用以下目录：
+
+```text
+data/
+  raw/fastq/                 # 原始 FASTQ 与下载元数据
+  processed/trimmed/         # 去接头后的 FASTQ
+  processed/collapsed/       # isomiR 序列折叠结果
+references/                  # 基因组、注释、miRBase、piRBase、tRNAdb、MSigDB 等参考资源
+results/
+  qc/fastqc/                 # 单样本 FastQC
+  qc/multiqc/                # MultiQC 聚合报告
+  alignment/                 # SAM/BAM/BAI 与比对日志
+  quantification/            # mirdeep2、mirtop、trax、idxstats、featurecounts
+  differential/              # DE 表和 manifest
+  fragmentomics/             # 片段组学样本表和合并矩阵
+  targets/starbase/          # starBase 靶标 TSV
+  models/classification/     # 分类模型和指标
+  models/cox/                # Cox 模型和指标
+  plots/                     # 所有图（按类别分子目录）
+  report/                    # HTML 报告、表格和随附资源
+  adata/                     # 持久化的 srna/fragmentomics/isomir/rna .h5ad
+sessions/                    # UI 会话状态（由系统管理，禁止放分析产物）
+```
+
+- 同一分析运行只复用上述目录，不得在工作区根目录新建 `trimmed`、`aligned`、`mirdeep2`、`plots` 等同类散落目录。
+- 参考资源一律放 `references/`；原始数据一律放 `data/raw/`；可交付结果一律放 `results/`。
+- `output_dir` 显式传参时也遵循该布局。例如 `output_dir="results/quantification/mirdeep2"`、`output_dir="results/plots"`。
+- 保存 AnnData 时使用 `results/adata/<modality>.h5ad`，例如 `results/adata/srna.h5ad` 和 `results/adata/fragmentomics.h5ad`；不要把 `.h5ad` 放在工作区根目录。
+- `sessions/` 与系统缓存不属于分析结果，不要移动、删除或写入分析文件。
+
 分析完成（尤其是差异分析 DE、定量、比对）后，**结果必须持久化**，否则新会话/新提问无法直接查询，被迫重算（历史上因此出现过单个查询跑 103 轮的案例）：
 
-1. **保存带结果的 adata**：把包含 `uns['de_results']` / `uns['de_params']` 等结果的 adata 用 `write_h5ad` 覆盖保存回原 h5ad（或显式命名的新文件），保存后 `read_h5ad` 验证结果仍在。
+1. **保存带结果的 adata**：把包含 `uns['de_results']` / `uns['de_params']` 等结果的 adata 保存为对应模态的 `results/adata/<modality>.h5ad`，保存后 `read_h5ad` 验证结果仍在。
 2. **登记结果位置**：在工作区记录结果文件路径（例如 `de_analysis(output_dir=...)` 生成的 `de_results.csv` / `de_results_manifest.json`），让后续会话能通过文件快速查到结果，无需加载整个 adata。
-3. **DE 推荐带 `output_dir`**：`sa.diff.de_analysis(adata, output_dir="de_results")` 会自动把全表写到 `de_results/de_results.csv` 并登记 `de_results_manifest.json`（含 group_col / treatment / control / n_features）。
+3. **DE 推荐带 `output_dir`**：`sa.diff.de_analysis(adata, output_dir="results/differential")` 会自动把全表写到 `results/differential/de_results.csv` 并登记 `de_results_manifest.json`（含 group_col / treatment / control / n_features）。
 
 ## 查询纪律：只读查询先查已有结果，禁止重跑
 
 回答"某某结果是什么样的 / 有没有跑过 X"这类**只读查询**时，按此顺序查找，找到即止：
 
 1. `adata.uns` / `adata.obs` / `adata.layers`（加载 h5ad 后直接看，不重算）
-2. 工作区已登记的结果文件（`de_results_manifest.json`、`de_results.csv`、`de_locations_manifest.json` 等）
+2. 工作区已登记的结果文件（例如 `results/differential/de_results_manifest.json`、`results/differential/de_results.csv`、`de_locations_manifest.json`）
 3. 旧 session 目录（`sessions/*/run_report.json`、`chat.json`）里的已完成记录
 
 **只有全部找不到、且用户明确要求重新分析时，才允许重跑**；重跑前先向用户说明"已有结果不存在，需要重算"。禁止为了回答一个查询问题而重跑昂贵的 limma-voom / 定量 / 比对流程。
@@ -124,7 +156,7 @@ UI 左侧的 **Branch Chat（监管者）** 是**旁路只读 Agent**，与当�
 - **批量工具一次 `execute_code` 处理全部样本**，不要按样本拆 N 次 cell：
   按样本拆 cell 会让 Jupyter 内核反复重启（import + 读 h5ad 开销叠加），且与前一次手动 stop 留下的内核残留锁叠加，容易在下一步 `read_h5ad` 死锁。正确做法：`sa.quant.trax_quant(adata, ...)`、`sa.alignment.bowtie(adata, ...)`、`sa.quant.feature_count(adata, ...)`、`sa.quant.quantify_mirna(adata, ...)` 都接受整个 adata，在**一次调用**里处理 `adata.obs` 里的全部样本（工具内部 Pool/run_threads 已处理并发）。
 - **优先读取已落盘产物**，不重算：
-  - 合并 counts → 读 `trax_out/<exp>-trnacounts.txt` / `mirna_expression_counts.csv` / `de_results_all.csv` / `*_manifest.json`
+  - 合并 counts → 读 `results/quantification/trax/<exp>-trnacounts.txt` / `results/quantification/mirdeep2/mirna_expression_counts.csv` / `results/differential/de_results.csv` / `*_manifest.json`
   - 查询差异结果 → 读 `adata.uns['de_results']` / `adata.uns['de_top']`（**不要为了查 miR-21 重跑 limma-voom**）
   - 跑前先 `Path(...).exists()` 确认产物齐全；齐全就直接用，不存在再调用工具
 - 工具自带的幂等（`pylimma.de_analysis` 缓存命中、`tRAX.trax_quant` trnacounts 已存在则跳过）会自动复用结果，**优先信任缓存，不要主动 force=True**。
@@ -134,7 +166,7 @@ UI 左侧的 **Branch Chat（监管者）** 是**旁路只读 Agent**，与当�
 用户的定量/比对/分析任务**必须严格按 skill 执行**，这是"智能"的第一条标准：
 
 - **定量默认方法固定如下**：piRNA 默认使用 `samtools_idxstats`（先比对到 piRNA FASTA reference，再以 `samtools idxstats` 计数），不得默认改用 `feature_count`；miRNA 默认使用 `mirdeep2-mirna` / `sa.quant.quantify_mirna`。只有用户明确指定 featureCounts 时，才为 miRNA 或 piRNA 使用 `feature_count`。
-- **目录名、参数、函数**一律采用 skill 里写明的（如比对一律 `output_dir="aligned"`；定量用 `mirdeep2` / `trax_quant` / `idxstats` / `feature_count`，各自 output_dir 见对应 skill）。**禁止发明** skill 外的目录/变体（历史上出现过 agent 自创 `aligned_perm`、`aligned_strict`，skill 里根本没有）。
+- **目录名、参数、函数**一律采用 skill 里写明的流程，输出目录统一映射到本规范（如比对使用 `output_dir="results/alignment"`）。**禁止发明**规范外的目录/变体（历史上出现过 agent 自创 `aligned_perm`、`aligned_strict`，skill 里根本没有）。
 - skill 里的**概念说明**（如"stringent/permissive mapping"）只是备选信息，**不是要求跑两条独立流程**；除非用户明确要对比两种模式，否则按 skill 主流程**一次完成**。
 - 执行前先加载对应 skill 的 SKILL.md，确认里面**有**这个操作；skill 没有覆盖的需求 → **先向用户报告缺口并询问**，不要自由发挥。
 - 不要因为"觉得更严谨"就额外加步骤、加目录、加参数。多做的、skill 没有的，就是偏离。

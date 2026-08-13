@@ -205,7 +205,13 @@ def test_tool_loop_normalizes_provider_text_object_before_dispatch():
                 )
             return ChatCompletion(
                 content="",
-                tool_calls=[ToolCall(id="finish-dict", name="finish", arguments={"message": "完成"})],
+                tool_calls=[
+                    ToolCall(
+                        id="finish-dict",
+                        name="finish",
+                        arguments={"message": {"$text": "第一行\n第二行"}},
+                    )
+                ],
             )
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -223,7 +229,7 @@ def test_tool_loop_normalizes_provider_text_object_before_dispatch():
             chat_id="chat-dict-code",
         )
 
-    assert result.startswith("完成")
+    assert result.startswith("第一行\n第二行")
     assert seen["code"] == "print('ok')"
 
 

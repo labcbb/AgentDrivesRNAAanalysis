@@ -398,7 +398,7 @@ def mirtop_quant(
     adata: AnnData,
     gff: str,
     hairpin: str,
-    output_dir: str = "mirtop_out",
+    output_dir: str = "results/quantification/mirtop",
     *,
     bam_col: str = "bam_path",
     species: str = "hsa",

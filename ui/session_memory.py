@@ -20,6 +20,7 @@ _MAX_STEPS = 48
 _MAX_ARTIFACTS = 64
 _MAX_FACTS = 32
 _MAX_WORK_LOG_LINES = 200
+_MAX_PROMPT_CONTEXT_CHARS = 10_000
 
 _ARTIFACT_RE = re.compile(
     r"(?:[\w./-]+/)?[\w.-]+\.(?:"
@@ -465,13 +466,14 @@ def _format_bytes(value: int) -> str:
     return f"{value} B"
 
 
-def build_workspace_manifest(*, max_files: int = 36) -> str:
+def build_workspace_manifest(*, max_files: int = 36, max_scan_files: int = 2_000) -> str:
     root = get_work_space()
     if not root.is_dir():
         return ""
 
     entries: List[tuple[str, int]] = []
     seen: set[str] = set()
+    scan_limit_reached = False
 
     def add_file(path: Path) -> None:
         rel = str(path.relative_to(root))
@@ -493,8 +495,13 @@ def build_workspace_manifest(*, max_files: int = 36) -> str:
         for path in sorted(base.rglob("*")):
             if path.is_file():
                 add_file(path)
+                if len(seen) >= max_scan_files:
+                    scan_limit_reached = True
+                    break
+        if scan_limit_reached:
+            break
 
-    for pattern in (
+    for pattern in (() if scan_limit_reached else (
         "**/fastq-run-info.tsv",
         "**/*run-info*.tsv",
         "**/*.fa.gz",
@@ -510,10 +517,15 @@ def build_workspace_manifest(*, max_files: int = 36) -> str:
         "**/*.xlsx",
         "**/*counts*.csv",
         "**/*de_results*.csv",
-    ):
+    )):
         for path in sorted(root.glob(pattern)):
             if path.is_file():
                 add_file(path)
+                if len(seen) >= max_scan_files:
+                    scan_limit_reached = True
+                    break
+        if scan_limit_reached:
+            break
 
     entries.sort(key=lambda item: item[0].lower())
     if not entries:
@@ -524,6 +536,8 @@ def build_workspace_manifest(*, max_files: int = 36) -> str:
         lines.append(f"- {rel} ({_format_bytes(size)})")
     if len(entries) > max_files:
         lines.append(f"- … 另有 {len(entries) - max_files} 个文件")
+    if scan_limit_reached:
+        lines.append(f"- … 工作区清单扫描在 {max_scan_files} 个文件处停止")
     return "\n".join(lines)
 
 
@@ -731,8 +745,8 @@ def build_session_memory_context(chat_id: str, *, user_query: str = "") -> str:
     analysis = memory.get("analysis") or {}
     deliverables = memory.get("deliverables") or {}
     requirements = memory.get("requirements") or {}
-    manifest = build_workspace_manifest()
-    errors_context = build_session_errors_context(chat_id)
+    manifest = build_workspace_manifest(max_files=24)
+    errors_context = build_session_errors_context(chat_id, max_events=6)
     plan = load_plan(chat_id)
     if not analysis and isinstance(plan, dict) and isinstance(plan.get("analysis"), dict):
         analysis = dict(plan.get("analysis") or {})
@@ -847,7 +861,13 @@ def build_session_memory_context(chat_id: str, *, user_query: str = "") -> str:
         lines.append("### 用户当前意图（最新一条 user 原文，记住后不要再问）")
         lines.append(f"> {str(user_query).strip()[:400]}")
 
-    return "\n".join(lines).strip()
+    context = "\n".join(lines).strip()
+    if len(context) <= _MAX_PROMPT_CONTEXT_CHARS:
+        return context
+    marker = "\n\n…[会话记忆已截断；保留开头的约束和结尾的当前意图]…\n\n"
+    tail_chars = 2_400
+    head_chars = _MAX_PROMPT_CONTEXT_CHARS - len(marker) - tail_chars
+    return f"{context[:head_chars]}{marker}{context[-tail_chars:]}"
 
 
 def _work_log_path(chat_id: str) -> Path:

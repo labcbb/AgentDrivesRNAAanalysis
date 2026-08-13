@@ -10,16 +10,16 @@
       "fallback_before_skill": "fastq-qc",
       "step": {
         "title": "确认 sRNA-seq 3' adapter",
-        "goal": "展示拟使用的 3' adapter、建库来源和长度过滤范围；未确认前不得运行 cutadapt。",
+        "goal": "展示下载后的 FASTQ 及完整的拟用 cutadapt 配置（包括默认 3' adapter、长度、质量、匹配和留痕设置）；未确认前不得运行 cutadapt。",
         "skill": "fastq-qc"
       },
       "preflight": {
         "title": "读取现有 FASTQ 修剪配置",
-        "goal": "只读检查当前 AnnData、cutadapt JSON/log 和 FASTQ 元数据。finish 回复必须逐行输出 `INPUT_FASTQ: <路径/obs 列或未记录>`、`SAMPLE_COUNT: <数量或未记录>`、`ADAPTER_3: <序列或未记录>`、`MIN_LENGTH: <值或未记录>`、`MAX_LENGTH: <值或未记录>`。不得运行 cutadapt、不得修改 adata 或文件。",
+        "goal": "只读检查当前 AnnData、cutadapt JSON/log 和 FASTQ 元数据。finish 回复必须逐行输出 `INPUT_FASTQ: <路径/obs 列或未记录>`、`SAMPLE_COUNT: <数量或未记录>`、`LIBRARY_KIT: <建库试剂盒或未记录>`、`ADAPTER_3: <序列或未记录>`、`MIN_LENGTH: <值或未记录>`、`MAX_LENGTH: <值或未记录>`、`QUALITY_CUTOFF: <值或未记录>`、`ERROR_RATE: <值或未记录>`、`MIN_OVERLAP: <值或未记录>`、`NO_INDELS: <true/false 或未记录>`、`TIMES: <值或未记录>`、`TRIM_N: <true/false 或未记录>`、`POLY_A: <true/false 或未记录>`、`OUTPUT_DIR: <路径或未记录>`、`JSON_REPORT: <true/false 或未记录>`。不得运行 cutadapt、不得修改 adata 或文件。",
         "skill": "fastq-qc"
       },
       "approval": {
-        "prompt": "上述值是下一步 cutadapt 将使用的配置；不会默认采用 TruSeq 或其他 adapter。",
+        "prompt": "上述值是下一步 cutadapt 将使用的拟定配置。没有既有记录时会提出 TruSeq Small RNA 默认 adapter（不是已验证的建库事实）；请确认或调整后才会运行。",
         "review": {
           "fields": [
             {
@@ -33,22 +33,85 @@
               "unknown": "未记录，不能据此执行"
             },
             {
-              "label": "拟使用 3' adapter",
+              "label": "拟使用 3' adapter（TruSeq Small RNA 默认提案）",
               "source": "adapter_3",
+              "value": "TGGAATTCTCGGGTGCCAAGG",
               "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "建库试剂盒来源",
+              "source": "library_kit",
+              "value": "未记录；默认提案为 TruSeq Small RNA（也常见于 NEXTflex，须确认）",
+              "unknown": "未记录"
             },
             {
               "label": "拟使用最小长度",
               "source": "min_length",
+              "value": "18",
               "unknown": "未记录，不能据此执行"
             },
             {
               "label": "拟使用最大长度",
               "source": "max_length",
+              "value": "36",
               "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "质量修剪阈值",
+              "source": "quality_cutoff",
+              "value": "20",
+              "unknown": "未记录"
+            },
+            {
+              "label": "adapter 最大错误率",
+              "source": "error_rate",
+              "value": "0.1",
+              "unknown": "未记录"
+            },
+            {
+              "label": "adapter 最小重叠长度",
+              "source": "min_overlap",
+              "value": "3",
+              "unknown": "未记录"
+            },
+            {
+              "label": "adapter 比对不允许 indel",
+              "source": "no_indels",
+              "value": "false",
+              "unknown": "未记录"
+            },
+            {
+              "label": "每条 read 最多修剪次数",
+              "source": "times",
+              "value": "1",
+              "unknown": "未记录"
+            },
+            {
+              "label": "修剪两端 N 碱基",
+              "source": "trim_n",
+              "value": "false",
+              "unknown": "未记录"
+            },
+            {
+              "label": "修剪 poly-A/poly-T 尾巴",
+              "source": "poly_a",
+              "value": "false",
+              "unknown": "未记录"
+            },
+            {
+              "label": "修剪输出目录与记录",
+              "source": "output_dir",
+              "value": "trimmed",
+              "unknown": "未记录"
+            },
+            {
+              "label": "JSON 修剪报告与运行日志",
+              "source": "json_report",
+              "value": "true",
+              "unknown": "未记录"
             }
           ],
-          "edit_hint": "请回复“可以”采用上述配置；回复“不可以”并说明问题；或直接回复“adapter_3=新序列，min_length=值，max_length=值”更改。"
+          "edit_hint": "请回复“可以”采用上述配置；回复“不可以”并说明问题；或直接用 `adapter_3=新序列，min_length=值，max_length=值，quality_cutoff=值，error_rate=值，min_overlap=值，no_indels=true/false，times=值，trim_n=true/false，poly_a=true/false，output_dir=路径，json_report=true/false` 调整。"
         }
       }
     }

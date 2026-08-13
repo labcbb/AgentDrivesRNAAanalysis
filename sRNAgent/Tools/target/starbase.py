@@ -164,7 +164,7 @@ def _query_signature(params: Mapping[str, Any]) -> str:
 def starbase_mirna_targets(
     adata: AnnData,
     mirnas: Optional[str | Sequence[str]] = None,
-    output_dir: str = "starbase_targets",
+    output_dir: str = "results/targets/starbase",
     *,
     assembly: str = "hg38",
     gene_type: str = "mRNA",

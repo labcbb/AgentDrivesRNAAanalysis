@@ -231,7 +231,7 @@ _INSTALL_HINTS = {
 def fastq_dl(
     adata: AnnData,
     accessions: Union[str, Sequence[str]],
-    output_dir: str = "fastq",
+    output_dir: str = "data/raw/fastq",
     provider: str = "ena",
     protocol: str = "ftp",
     group_by: Optional[str] = None,

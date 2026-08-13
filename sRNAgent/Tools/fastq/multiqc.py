@@ -252,7 +252,7 @@ def _extract_raw_qc(
 )
 def multiqc(
     adata: AnnData,
-    output_dir: str = ".",
+    output_dir: str = "results/qc/multiqc",
     filename: Optional[str] = None,
     force: bool = False,
     modules: Optional[Union[str, List[str]]] = None,

@@ -128,7 +128,7 @@ def list_msigdb_collections(
 )
 def download_msigdb(
     species: str = "human",
-    output_dir: str = "msigdb",
+    output_dir: str = "references/msigdb",
     *,
     collection: Optional[str] = None,
     release: str = DEFAULT_RELEASE,

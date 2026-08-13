@@ -62,7 +62,7 @@ def _compress_fastq(raw_path: Path) -> Path:
 )
 def seqcluster_collapse(
     adata: AnnData,
-    output_dir: str = "collapsed_out",
+    output_dir: str = "data/processed/collapsed",
     *,
     input_col: str = "trimmed_path",
     minimum: int = 1,

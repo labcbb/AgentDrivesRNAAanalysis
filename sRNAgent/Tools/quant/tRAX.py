@@ -353,7 +353,7 @@ def trax_quant(
     *,
     fastq_dir: Optional[str] = None,
     databasename: str,
-    output_dir: str = "trax_out",
+    output_dir: str = "results/quantification/trax",
     experiment_name: str = "trax_quant",
     ensemblgtf: Optional[str] = None,
     bedfiles: Optional[Sequence[str]] = None,

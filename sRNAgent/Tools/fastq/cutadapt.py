@@ -393,7 +393,7 @@ def _run_cutadapt(
 )
 def cutadapt(
     adata: AnnData,
-    output_dir: str = "trimmed",
+    output_dir: str = "data/processed/trimmed",
     # Adapter options — 3' (most common for sRNA-seq)
     adapter_3: Optional[Union[str, List[str]]] = None,
     adapter_5: Optional[Union[str, List[str]]] = None,

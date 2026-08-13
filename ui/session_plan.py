@@ -2,20 +2,24 @@
 from __future__ import annotations
 
 import threading
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from sRNAgent.agent.plan_state import (
+    PLAN_STEP_STATUSES,
+    STEP_AWAITING_APPROVAL,
+    STEP_DONE,
+    STEP_FAILED,
+    STEP_PENDING,
+    STEP_RUNNING,
+    STEP_SKIPPED,
+)
 from session_store import _read_json, _write_json, ensure_session_dir, sanitize_chat_id
 
 _PLAN_FILE = "plan.json"
 _LOCK = threading.RLock()
-
-STEP_PENDING = "pending"
-STEP_RUNNING = "running"
-STEP_DONE = "done"
-STEP_FAILED = "failed"
-STEP_SKIPPED = "skipped"
 
 
 def _plan_path(chat_id: str) -> Path:
@@ -78,9 +82,13 @@ def normalize_plan(raw: Dict[str, Any], *, goal: str = "") -> Dict[str, Any]:
         step_goal = str(item.get("goal") or title).strip()
         skill = str(item.get("skill") or "").strip()
         status = str(item.get("status") or STEP_PENDING)
-        if status not in {STEP_PENDING, STEP_RUNNING, STEP_DONE, STEP_FAILED, STEP_SKIPPED}:
+        if status not in PLAN_STEP_STATUSES:
             status = STEP_PENDING
-        steps.append(
+        # The UI may normalize a plan produced by the agent, but it must not
+        # discard orchestration metadata such as approval gates or dependency
+        # edges.  Losing either makes a restored plan unsafe to resume.
+        normalized = deepcopy(item)
+        normalized.update(
             {
                 "id": step_id,
                 "title": title,
@@ -90,6 +98,7 @@ def normalize_plan(raw: Dict[str, Any], *, goal: str = "") -> Dict[str, Any]:
                 "result": str(item.get("result") or "").strip(),
             }
         )
+        steps.append(normalized)
     plan_goal = str(raw.get("goal") or goal or "").strip()
     return {
         "goal": plan_goal,
@@ -109,6 +118,9 @@ def plan_progress_summary(plan: Dict[str, Any]) -> str:
     running = next((s for s in steps if s.get("status") == STEP_RUNNING), None)
     if running:
         return f"步骤 {done + 1}/{total}：{running.get('title') or '执行中'}"
+    waiting = next((s for s in steps if s.get("status") == STEP_AWAITING_APPROVAL), None)
+    if waiting:
+        return f"等待确认：{waiting.get('title') or '配置审阅'}"
     if done == total:
         return f"全部 {total} 个步骤已完成"
     return f"进度 {done}/{total}"
