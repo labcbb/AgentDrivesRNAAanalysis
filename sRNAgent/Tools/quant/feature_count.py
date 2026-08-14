@@ -308,7 +308,7 @@ def feature_count(
     # Remove .sorted / .bam suffixes for matching
     fc_cols = list(counts_df.columns)
 
-    # Build matrix aligned to adata.obs_names order
+    # Build matrix aligned to adata.obs_names order (rows = samples, cols = features)
     n_features = len(counts_df)
     matrix = [[0.0] * n_features for _ in range(len(sample_names))]
 
@@ -320,10 +320,10 @@ def feature_count(
                 col_map[fc_name] = i
                 break
 
-    for j, fc_name in enumerate(fc_cols):
-        i = col_map.get(fc_name)
-        if i is not None:
-            matrix[i][j] = float(counts_df.iloc[j])
+    for fc_name, i in col_map.items():
+        # df[fc_name] is the column of counts for this sample across all features;
+        # assign it as the i-th row so matrix[i][j] == count of feature j in sample i.
+        matrix[i] = counts_df[fc_name].tolist()
 
     # Build var DataFrame
     var = pd.DataFrame(index=counts_df.index)
