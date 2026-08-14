@@ -10,6 +10,7 @@ from sRNAgent.Tools.plot import available, generate
 from sRNAgent.Tools.plot.differential import volcano
 from sRNAgent.Tools.plot.expression import pca
 from sRNAgent.Tools.plot.fragmentomics import fragment_profile
+from sRNAgent.Tools.plot.model import candidate_priorities
 from sRNAgent.Tools.plot.target import target_network
 
 
@@ -56,3 +57,25 @@ def test_fragment_profile_and_target_network_use_existing_results(tmp_path):
     adata.uns["starbase_mirna_targets"] = {"last_run": {"records": [{"miRNA": "hsa-miR-1", "tsv": str(tsv)}]}}
     target_network(adata, output_dir=str(tmp_path))
     assert (tmp_path / "target" / "mirna_target_network.graphml").exists()
+
+
+def test_candidate_priority_plot_uses_existing_audit_and_marks_hard_gates(tmp_path):
+    adata = _adata()
+    adata.uns["candidate_prioritization"] = {
+        "audit": pd.DataFrame({
+            "candidate": ["miR-good", "miR-excluded"],
+            "priority_score": [0.78, 0.42],
+            "D_differential": [0.9, 0.8],
+            "R_reproducibility": [0.7, 0.2],
+            "C_clinical": [0.8, 0.0],
+            "B_biological": [0.6, 0.3],
+            "Q_technical": [0.9, 0.8],
+            "eligible": [True, False],
+        }),
+    }
+
+    assert available(adata)["candidate_priorities"]["available"] is True
+    candidate_priorities(adata, output_dir=str(tmp_path))
+
+    assert (tmp_path / "candidate_prioritization" / "candidate_priorities.png").exists()
+    assert adata.uns["plots"]["candidate_priorities"]["source"] == "adata.uns['candidate_prioritization']['audit']"

@@ -96,6 +96,35 @@ def test_progress_parser_preserves_fragomics_log_prefix():
     ]
 
 
+def test_download_progress_uses_fastq_output_dir_and_beats_stale_worker_counter(tmp_path: Path):
+    fastq_dir = tmp_path / "data" / "raw" / "fastq"
+    fastq_dir.mkdir(parents=True)
+    (fastq_dir / "SRR000001.fastq.gz").write_bytes(b"a" * 100)
+    (fastq_dir / "SRR000002.fastq.gz").write_bytes(b"b" * 50)
+    (fastq_dir / "fastq-runs-run-info.tsv").write_text(
+        "run_accession\tfastq_bytes\nSRR000001\t100\nSRR000002\t200\n",
+        encoding="utf-8",
+    )
+
+    progress = _parse_progress_output(
+        "progress: 0/2\ninflight: SRR000001,SRR000002",
+        workspace=tmp_path,
+        code=(
+            'sa.fastq.fastq_dl(adata, accessions=missing, '
+            'output_dir="data/raw/fastq", jobs=2)'
+        ),
+    )
+
+    assert progress["progressRun"] == "SRR000002"
+    assert progress["progressFileIndex"] == 2
+    assert progress["progressFileTotal"] == 2
+    assert progress["progressBytes"] == 50
+    assert progress["progressBytesTotal"] == 200
+    assert progress["progressOverallPct"] == 50.0
+    assert progress["progressCompletedFiles"] == 1
+    assert progress["progressStage"] == "下载文件已落盘 1/2 · 进行中: SRR000002"
+
+
 def test_should_compact_threshold():
     small = [{"role": "user", "content": "hi"}]
     assert not should_compact(small, 48000)

@@ -1,4 +1,4 @@
-"""Model-result plots for classification and Cox proportional-hazards analysis."""
+"""Model-result plots for classification, Cox, and candidate prioritization."""
 
 from __future__ import annotations
 
@@ -11,6 +11,17 @@ from anndata import AnnData
 
 from ..._registry import register_function
 from .common import PALETTE, apply_style, save_figure
+
+
+def _priority_audit(adata: AnnData) -> pd.DataFrame:
+    state = adata.uns.get("candidate_prioritization") or {}
+    table = state.get("audit") if isinstance(state, dict) else None
+    required = {"candidate", "priority_score", "eligible"}
+    if not isinstance(table, pd.DataFrame) or table.empty or not required.issubset(table.columns):
+        raise KeyError(
+            "adata.uns['candidate_prioritization']['audit'] with candidate, priority_score, and eligible is required"
+        )
+    return table.copy()
 
 
 @register_function(aliases=["plot_classification_performance", "classification_plot", "分类模型性能图"], category="plot", description="Plot stored classification holdout/cross-validation performance metrics for each evaluated model.", examples=["sa.plot.classification_performance(adata)"], requires={"uns": ["classification"]}, produces={"uns": ["plots"]})
@@ -83,4 +94,56 @@ def cox_cross_validation(adata: AnnData, *, output_dir: str = "results/plots") -
     return adata
 
 
-__all__ = ["classification_performance", "cox_forest", "cox_cross_validation"]
+@register_function(
+    aliases=["plot_candidate_priorities", "candidate_priority_plot", "candidate_ranking_plot", "候选优先级图", "候选排序图"],
+    category="plot",
+    description="Plot deterministic candidate-prioritization scores, evidence dimensions, and hard-gate eligibility from stored audit results.",
+    examples=["sa.plot.candidate_priorities(adata, top_n=20)"],
+    requires={"uns": ["candidate_prioritization"]},
+    produces={"uns": ["plots"]},
+)
+def candidate_priorities(adata: AnnData, *, top_n: int = 20, include_excluded: bool = True, output_dir: str = "results/plots") -> AnnData:
+    """Render fixed D/R/C/B/Q evidence contributions without changing ranks."""
+    if int(top_n) < 1:
+        raise ValueError("top_n must be positive")
+    audit = _priority_audit(adata)
+    dimensions = ["D_differential", "R_reproducibility", "C_clinical", "B_biological", "Q_technical"]
+    missing = [column for column in dimensions if column not in audit.columns]
+    if missing:
+        raise KeyError(f"Candidate audit is missing score columns: {missing}")
+    frame = audit.copy()
+    if not include_excluded:
+        frame = frame[frame["eligible"].astype(bool)]
+    frame = frame.sort_values(["eligible", "priority_score", "candidate"], ascending=[False, False, True], kind="stable").head(int(top_n))
+    if frame.empty:
+        raise ValueError("No candidates satisfy the requested plotting scope")
+
+    weights = {"D_differential": 0.30, "R_reproducibility": 0.25, "C_clinical": 0.20, "B_biological": 0.15, "Q_technical": 0.10}
+    labels = {"D_differential": "D differential", "R_reproducibility": "R reproducibility", "C_clinical": "C clinical", "B_biological": "B biological", "Q_technical": "Q technical"}
+    apply_style()
+    fig, ax = plt.subplots(figsize=(7.2, max(3.4, len(frame) * 0.38 + 1.7)))
+    y = np.arange(len(frame))
+    left = np.zeros(len(frame))
+    for index, column in enumerate(dimensions):
+        contribution = pd.to_numeric(frame[column], errors="coerce").fillna(0).clip(0, 1).to_numpy(float) * weights[column]
+        ax.barh(y, contribution, left=left, color=PALETTE[index + 1], edgecolor="white", linewidth=0.45, label=labels[column])
+        left += contribution
+    excluded = ~frame["eligible"].astype(bool).to_numpy()
+    ax.scatter(left[excluded], y[excluded], marker="x", s=24, color="#555555", linewidths=1.1, zorder=3, label="excluded by hard gate")
+    ax.set(yticks=y, yticklabels=frame["candidate"].astype(str), xlabel="Priority score", title="Candidate prioritization")
+    ax.invert_yaxis()
+    ax.set_xlim(0, max(1.0, float(left.max()) * 1.08))
+    ax.legend(loc="lower right", frameon=False, ncol=2)
+    save_figure(
+        adata,
+        fig,
+        "candidate_priorities",
+        category="candidate_prioritization",
+        output_dir=output_dir,
+        parameters={"top_n": int(top_n), "include_excluded": bool(include_excluded), "weights": weights},
+        source="adata.uns['candidate_prioritization']['audit']",
+    )
+    return adata
+
+
+__all__ = ["candidate_priorities", "classification_performance", "cox_forest", "cox_cross_validation"]

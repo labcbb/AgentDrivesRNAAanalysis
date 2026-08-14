@@ -40,7 +40,7 @@ When a grouped result is reported, use a known `group_col` from each modality's 
 ## Before Reporting
 
 1. Use existing figures in `adata.uns["plots"]`. Generate additional figures explicitly with the `plotting` skill before reporting when required.
-2. Verify essential upstream results with small slices only. Examples: `de_results`, `enrichr["results"]`, `classification["performance"]`, or `cox["multivariate_results"]`.
+2. Verify essential upstream results with small slices only. Examples: `de_results`, `enrichr["results"]`, `candidate_prioritization["audit"]`, `classification["performance"]`, or `cox["multivariate_results"]`.
 3. Save all supplied AnnData objects after report generation so their `uns["report"]` provenance persists.
 
 Do not confuse the following outputs:
@@ -53,9 +53,9 @@ Do not confuse the following outputs:
 
 | Level | Default included sections |
 |---|---|
-| `minimal` | Expression, DE, classification/Cox, artifacts |
-| `standard` | QC, alignment, expression, DE, enrichment, fragmentomics, target network, modeling, artifacts |
-| `publication` | DE, enrichment, target network, classification/Cox, artifacts; use selected figures only |
+| `minimal` | Expression, DE, candidate prioritization, classification/Cox, artifacts |
+| `standard` | QC, alignment, expression, DE, enrichment, fragmentomics, target network, candidate prioritization, modeling, artifacts |
+| `publication` | DE, enrichment, target network, candidate prioritization, classification/Cox, artifacts; use selected figures only |
 
 The report only includes a figure if a registered plot is available. It marks an unavailable section as not executed rather than generating a blank figure or recomputing a result.
 
@@ -71,7 +71,9 @@ assets/artifacts/<modality>/
 tables/
 ```
 
-The report copies registered figures and recorded file artifacts into relative paths, so the output directory can be moved as a self-contained deliverable. It displays at most `top_n=15` rows per table and exports complete CSV tables. It also collects methods/provenance recorded in `de_params`, `fragomics_params`, feature selection, classification, Cox, and upstream tool metadata.
+The report copies registered figures and recorded file artifacts into relative paths, so the output directory can be moved as a self-contained deliverable. It displays at most `top_n=15` rows per table and exports complete CSV tables. It also collects methods/provenance recorded in `de_params`, `fragomics_params`, feature selection, candidate prioritization, classification, Cox, and upstream tool metadata.
+
+When `uns["candidate_prioritization"]` exists, the report includes both the eligible recommendation table and the full audit table. The audit's `exclusion_reasons` and `evidence_gaps` are part of the scientific record and must not be removed in favor of a recommendation-only summary. The report only copies the existing audit CSV/manifest and registered priority figure; it never recomputes DE, models, targets, enrichment, or candidate ranks.
 
 Each supplied AnnData receives:
 
@@ -85,4 +87,4 @@ This records the HTML path, manifest path, report level, group column, included 
 
 Use `include_existing_plots=True` by default. Set it to `False` only for a table-and-provenance report. Do not request missing figures from inside `sa.report.html`; call the appropriate `sa.plot.*` function first, then run the report function again.
 
-For publication composites, use the existing `nature-figure` skill after this tool has exported source figures and tables. The HTML report is an analysis deliverable, not a substitute for a curated manuscript figure.
+For publication composites, use the exported source figures and tables from this report as the basis for external figure assembly. The HTML report is an analysis deliverable, not a substitute for a curated manuscript figure.

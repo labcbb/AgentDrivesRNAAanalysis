@@ -5,7 +5,7 @@ description: "Prepare AnnData expression and clinical variables, select features
 
 # Feature Selection and Modeling
 
-This skill covers two modelling routes on one supplied AnnData: classification and Cox survival analysis. Use `sa.model.feature_selection` before either route when expression or clinical candidates need preprocessing. Store all model records in `adata.uns` and save the completed AnnData H5AD.
+This skill covers classification, Cox survival analysis, and deterministic candidate prioritization on one supplied AnnData. Use `sa.model.feature_selection` before either route when expression or clinical candidates need preprocessing. Store all model records in `adata.uns` and save the completed AnnData H5AD.
 
 ## Common Preparation
 
@@ -90,6 +90,28 @@ Review `adata.uns["cox"]`:
 - `selection_coefficients` and `selected_features`: penalised selection results.
 - `endpoint_validation`: time/status validation, event count, and EPV.
 - `cross_validation`: held-out C-index by fold.
+
+## Candidate Prioritization
+
+Use `sa.model.candidate_prioritization` only after the applicable existing results have been written to the same modality's AnnData. It consumes `de_results` and optionally uses `candidate_replication`, `classification`, `cox`, `starbase_mirna_targets`, and `enrichr`; it never reruns DE, model fitting, target retrieval, or enrichment.
+
+```python
+srna_adata = sa.model.candidate_prioritization(
+    srna_adata,
+    replication_key="candidate_replication",  # optional cross-cohort/resampling table
+    batch_col="batch",
+    depth_col="library_size",
+    output_dir="results/candidate_prioritization",
+)
+```
+
+The score is deterministic: `0.30*D + 0.25*R + 0.20*C + 0.15*B + 0.10*Q`, where D is differential evidence, R is replication, C is cross-validated classification/Cox evidence, B is starBase/Enrichr evidence, and Q is coverage/depth/batch/multi-mapping reliability. Cox contributes to C only when its stored request includes clinical covariates. LLMs may select the existing records to inspect and explain the result, but must not alter scores, weights, or ranks.
+
+Hard gates run before the recommendation list: DE FDR, minimum expression/effect size, observed cross-cohort direction conflicts, missing cross-validation for a model that used the candidate, insufficient validated model performance, and low sample coverage. Candidates that fail a gate remain in `adata.uns["candidate_prioritization"]["audit"]` with `exclusion_reasons`; only eligible candidates are in `...["recommended"]`.
+
+For isomiR, use the dedicated `isomir_adata` and pass `candidate_type="isomir"`. The B dimension then uses `adata.var` seed and target-difference scores (`seed_change_score` and `target_difference_score` by default), preserving absent annotations as evidence gaps rather than inventing them.
+
+Read the exported `candidate_priority_audit.csv`, `candidate_recommendations.csv`, and manifest path in `adata.uns["candidate_prioritization"]["artifacts"]` for a traceable deliverable. Missing evidence is written to `evidence_gaps` and scores zero for that dimension; it must not be reported as negative evidence.
 
 ## Save Results
 

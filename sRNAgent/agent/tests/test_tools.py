@@ -112,6 +112,22 @@ def test_combined_small_rna_query_boosts_both_default_quantification_skills():
     assert {"mirdeep2-mirna", "samtools_idxstats"}.issubset(top_slugs)
 
 
+def test_rank_skill_matches_recognizes_chinese_workflow_aliases():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+
+    assert rank_skill_matches(registry, "我想先去接头再做质控")[0][0].slug == "fastq-qc"
+    assert rank_skill_matches(registry, "查询 miRNA 靶基因")[0][0].slug == "starbase-mirna-targets"
+
+
+def test_rank_skill_matches_prefers_explicit_method_over_biological_default():
+    registry = _DefaultQuantSkillRegistry()
+
+    assert rank_skill_matches(registry, "用 featureCounts 做 miRNA 定量")[0][0].slug == "feature-count"
+
+
 def test_search_skills_returns_best_skill_body():
     registry = _FakeSkillRegistry()
     text = search_skills(registry, "adapter 质控")

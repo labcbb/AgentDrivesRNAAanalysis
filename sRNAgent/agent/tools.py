@@ -14,15 +14,83 @@ _EXPLICIT_QUANT_METHOD_RE = re.compile(
     r"feature[-_ ]?counts?|idxstats?|samtools|mirdeep(?:2)?|mirtop|trax",
     re.IGNORECASE,
 )
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+# The front matter is deliberately brief, so a literal comparison against it
+# misses common user wording (especially Chinese workflow terms).  These are
+# retrieval aliases, not alternative workflows; the corresponding SKILL.md
+# remains the source of truth for execution.
+_SKILL_ALIASES = {
+    "alignment-srna": ("比对", "映射", "bowtie", "bam", "基因组比对"),
+    "differential-analysis": ("差异", "差异表达", "差异分析", "de", "limma", "voom", "分组"),
+    "enrichr-gene-enrichment": ("富集", "通路", "gene set", "enrichr", "gsea", "基因集"),
+    "fastq-dl-srna": ("下载", "fastq下载", "ena", "sra", "geo", "测序数据"),
+    "fastq-qc": ("质控", "去接头", "剪接头", "adapter", "cutadapt", "fastqc", "multiqc"),
+    "feature-count": ("featurecounts", "特征计数", "注释计数", "基因组计数"),
+    "fragment-analysis": ("片段组学", "fragmentomics", "fragomics", "片段特征"),
+    "isomir-quantification": ("isomir", "iso-mir", "异构体", "mirtop"),
+    "mirdeep2-mirna": ("mirna定量", "mirdeep", "已知mirna", "新mirna"),
+    "modeling": ("建模", "分类", "预测", "cox", "生存", "特征选择"),
+    "plotting": ("绘图", "作图", "可视化", "图表", "plot"),
+    "reference-download": ("参考基因组", "参考下载", "gencode", "ensembl", "mirbase"),
+    "reporting": ("报告", "html报告", "分析报告", "结果汇总"),
+    "samtools_idxstats": ("pirna定量", "pirna计数", "idxstats", "samtools"),
+    "starbase-mirna-targets": ("靶基因", "靶标", "mirna靶标", "starbase", "encori"),
+    "trna-fragment-quantification-with-trax": ("trna定量", "trf", "tdr", "trna片段", "trax"),
+}
 
 
 def _tokenize(text: str) -> List[str]:
     return [token.lower() for token in _TOKEN_RE.findall(str(text or "")) if token.strip()]
 
 
+def _normalize(text: str) -> str:
+    """Normalize spelling variants that should not affect skill retrieval."""
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", str(text or "").lower())
+
+
+def _cjk_ngrams(text: str) -> set[str]:
+    """Return informative CJK fragments without needing a Chinese tokenizer."""
+    grams: set[str] = set()
+    for run in _CJK_RUN_RE.findall(str(text or "")):
+        for width in range(2, min(4, len(run)) + 1):
+            grams.update(run[index:index + width] for index in range(len(run) - width + 1))
+    return grams
+
+
+def _field_score(query: str, query_tokens: List[str], query_grams: set[str], field: str, *, weight: int) -> int:
+    """Score one searchable field with bounded lexical and CJK overlap."""
+    if not field:
+        return 0
+    normalized_query = _normalize(query)
+    normalized_field = _normalize(field)
+    score = 0
+    if normalized_query and normalized_query == normalized_field:
+        score += weight * 12
+    elif normalized_query and len(normalized_query) >= 4 and normalized_query in normalized_field:
+        score += weight * 5
+
+    field_tokens = set(_tokenize(field))
+    for token in query_tokens:
+        if len(token) < 2:
+            continue
+        if token in field_tokens:
+            score += weight * 2
+        elif len(token) >= 4 and token in normalized_field:
+            score += weight
+
+    common_grams = query_grams & _cjk_ngrams(field)
+    # Longer overlaps are more specific; the cap prevents verbose text from
+    # overwhelming an exact slug or explicit method match.
+    score += min(weight * 4, sum((len(gram) - 1) * weight for gram in common_grams))
+    return score
+
+
 def _default_quantification_skills(query: str) -> set[str]:
     """Return independent defaults when a request contains multiple RNA types."""
     lowered = str(query or "").lower()
+    if not any(term in lowered for term in ("quantif", "quantify", "定量", "计数", "count")):
+        return set()
     if _EXPLICIT_QUANT_METHOD_RE.search(lowered):
         return set()
     defaults: set[str] = set()
@@ -31,6 +99,23 @@ def _default_quantification_skills(query: str) -> set[str]:
     if "mirna" in lowered or "micro-rna" in lowered or "microrna" in lowered:
         defaults.add("mirdeep2-mirna")
     return defaults
+
+
+def _explicit_method_skills(query: str, skill_registry: SkillRegistry) -> set[str]:
+    """Resolve a named method before applying broad biological defaults."""
+    lowered = str(query or "").lower()
+    method_slugs = {
+        "feature-count": r"feature[-_ ]?counts?",
+        "samtools_idxstats": r"idxstats?|samtools",
+        "mirdeep2-mirna": r"mirdeep(?:2)?",
+        "isomir-quantification": r"mirtop",
+        "trna-fragment-quantification-with-trax": r"trax",
+    }
+    available = {slug.lower() for slug in skill_registry.skill_metadata}
+    return {
+        slug for slug, pattern in method_slugs.items()
+        if slug in available and re.search(pattern, lowered, re.IGNORECASE)
+    }
 
 
 def rank_skill_matches(
@@ -43,9 +128,10 @@ def rank_skill_matches(
     if not raw_query:
         return []
 
-    query_lower = raw_query.lower()
     query_tokens = _tokenize(raw_query)
+    query_grams = _cjk_ngrams(raw_query)
     default_skills = _default_quantification_skills(raw_query)
+    explicit_method_slugs = _explicit_method_skills(raw_query, skill_registry)
     scored: List[Tuple[SkillMetadata, int]] = []
 
     for meta in skill_registry.skill_metadata.values():
@@ -53,31 +139,29 @@ def rank_skill_matches(
         slug = meta.slug.lower()
         name = meta.name.lower()
         description = meta.description.lower()
-        searchable = f"{slug} {name} {description}"
-        meta_tokens = set(_tokenize(searchable))
+        aliases = " ".join(_SKILL_ALIASES.get(slug, ()))
 
-        if query_lower == slug:
-            score += 120
-        if query_lower == name:
-            score += 100
-        if slug.startswith(query_lower):
-            score += 60
-        if query_lower and query_lower in searchable:
-            score += 35
+        # Identity signals are intentionally much stronger than words in a
+        # prose description.  An explicitly requested skill/method must win.
+        if _normalize(raw_query) == _normalize(slug):
+            score += 1_200
+        if _normalize(raw_query) == _normalize(name):
+            score += 1_000
+        if _normalize(slug).startswith(_normalize(raw_query)):
+            score += 250
 
-        for token in query_tokens:
-            if token == slug:
-                score += 40
-            elif token in meta_tokens:
-                score += 18
-            elif token in searchable:
-                score += 10
+        score += _field_score(raw_query, query_tokens, query_grams, slug, weight=40)
+        score += _field_score(raw_query, query_tokens, query_grams, name, weight=32)
+        score += _field_score(raw_query, query_tokens, query_grams, description, weight=12)
+        score += _field_score(raw_query, query_tokens, query_grams, aliases, weight=28)
 
         # Biological defaults are stronger than generic keyword overlap.  This
         # keeps piRNA requests on FASTA-level idxstats and miRNA requests on
         # miRDeep2, while an explicitly named method remains authoritative.
         if slug in default_skills:
-            score += 200
+            score += 500
+        if slug in explicit_method_slugs:
+            score += 2_000
 
         if score > 0:
             scored.append((meta, score))

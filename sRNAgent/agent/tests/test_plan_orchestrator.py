@@ -22,6 +22,8 @@ from sRNAgent.agent.plan_orchestrator import (  # noqa: E402
     _approval_response_requests_followup,
     _build_planner_system_prompt,
     _context_has_counts_for_modality,
+    _derive_requested_scope,
+    _enforce_requested_scope,
     _expand_plan_prerequisites,
     _load_planning_skill_guidance,
     _load_skill_plan_contracts,
@@ -32,6 +34,65 @@ from sRNAgent.agent.plan_orchestrator import (  # noqa: E402
     _is_read_only_query,
     _strip_unrequested_html_report,
 )
+
+
+def test_requested_scope_drops_unsolicited_fragmentomics_and_pirna_steps():
+    query = "完成 miRNA 和 tRNA 定量、差异分析、miRNA 靶标网络和报告"
+    scope = _derive_requested_scope(query)
+    goal, steps = _enforce_requested_scope(
+        "miRNA、piRNA、tRNA 与片段组学分析",
+        [
+            {"id": "1", "title": "miRNA 定量", "goal": "运行 miRDeep2", "skill": "mirdeep2-mirna"},
+            {"id": "2", "title": "tRNA 定量", "goal": "运行 tRAX", "skill": "trax_quantification"},
+            {"id": "3", "title": "piRNA 定量", "goal": "运行 idxstats", "skill": "samtools_idxstats"},
+            {"id": "4", "title": "片段组学", "goal": "全基因组 Bowtie 比对后提取 FSD", "skill": "fragment-analysis"},
+        ],
+        scope=scope,
+        fallback_goal=query,
+    )
+
+    assert scope["requested_assays"] == ["mirna", "trna"]
+    assert [step["skill"] for step in steps] == ["mirdeep2-mirna", "trax_quantification"]
+    assert "片段组学" not in goal
+    assert "piRNA" not in goal
+
+
+def test_scope_contract_is_injected_and_enforced_after_llm_review():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    class Completion:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeAgent:
+        system_prompt = "system"
+        skill_registry = None
+
+        def __init__(self):
+            self.messages = []
+            response = (
+                '{"goal":"miRNA、piRNA 和片段组学分析","steps":['
+                '{"id":"1","title":"miRNA 定量","goal":"miRDeep2","skill":"mirdeep2-mirna"},'
+                '{"id":"2","title":"piRNA 定量","goal":"idxstats","skill":"samtools_idxstats"},'
+                '{"id":"3","title":"片段组学","goal":"全基因组比对","skill":"fragment-analysis"}]}'
+            )
+            self.responses = [Completion(response), Completion(response)]
+
+        def _llm_complete_cancellable(self, messages, **kwargs):
+            self.messages.append(messages)
+            return self.responses.pop(0)
+
+    agent = FakeAgent()
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = agent
+    orchestrator.skill_overview = ""
+    query = "完成 miRNA 和 tRNA 定量"
+    plan = orchestrator._create_plan(query, "历史产物中有 fragmentomics 特征")
+
+    assert plan["analysis"]["requested_assays"] == ["mirna", "trna"]
+    assert [step["skill"] for step in plan["steps"]] == ["mirdeep2-mirna"]
+    assert "fragmentomics" not in plan["goal"].lower()
+    assert "requested assays: [mirna, trna]" in agent.messages[0][1]["content"]
 
 
 def test_mirna_trna_and_fragmentomics_are_two_modalities():

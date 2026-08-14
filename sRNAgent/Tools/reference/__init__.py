@@ -5,6 +5,8 @@ Provides functions to download reference genomes and annotation from
 (other species), and miRNA data from `miRBase <https://www.mirbase.org/download/>`_.
 """
 
+from importlib import import_module
+
 from .genome import download_genome, download_gtf, download_ncrna, list_species
 from .mir_target import download_mirtarbase, list_mirtarbase_species
 from .mirbase import download_mirbase, list_mirbase_codes
@@ -16,11 +18,14 @@ from .tRNAdb import (
     download_trnascan_hg38,
 )
 
+extract_three_prime_utr = import_module(".3UTR", __name__).extract_three_prime_utr
+
 __all__ = [
     "list_species",
     "download_genome",
     "download_gtf",
     "download_ncrna",
+    "extract_three_prime_utr",
     "list_mirbase_codes",
     "download_mirbase",
     "list_pirna_species",

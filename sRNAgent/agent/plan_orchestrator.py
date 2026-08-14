@@ -130,6 +130,7 @@ _ISOMIR_REBUILD_RE = re.compile(
 )
 _FRAGMENTOMICS_RE = re.compile(r"fragmentomics|fragomics|fragment-analysis|片段组学|FSD|FSC|RCD|EDM|BPM", re.I)
 _UNIFIED_RE = re.compile(r"统一做|统一跑|都跑|一起跑|两组学|两种组学|miRNA\s*\+\s*fragmentomics", re.I)
+_CONTINUATION_RE = re.compile(r"继续|接着|刚才|前面|上一(?:个|轮|次)?|上次|之前|在此基础|resume|continue", re.I)
 _HTML_REPORT_RE = re.compile(
     r"html\s*报告|html report|report\.html|生成.*html|写.*html|报告|"
     r"(?:re[- ]?write|rewrite|re[- ]?style|restyle|finali[sz]e).{0,40}\bhtml\b|"
@@ -598,12 +599,117 @@ def _step_identity(step: Dict[str, Any]) -> str:
     return "|".join((skill, _step_modality(step), title))
 
 
-def _requires_srna_and_fragmentomics(user_query: str, steps: List[Dict[str, Any]]) -> bool:
-    step_text = "\n".join(
-        " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
-        for step in steps
+def _scope_request_text(user_query: str, history: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Keep the user's stated assay scope separate from generated plan text."""
+    messages = [
+        str(item.get("content") or "").strip()
+        for item in (history or [])
+        if isinstance(item, dict) and str(item.get("role") or "").lower() == "user"
+    ]
+    messages.append(str(user_query or "").strip())
+    return "\n".join(message for message in messages if message)
+
+
+def _derive_requested_scope(user_text: str) -> Dict[str, Any]:
+    """Build a deterministic assay allowlist from user-authored text only."""
+    text = str(user_text or "")
+    assays = {
+        "mirna": bool(_MIRNA_RE.search(text)),
+        "pirna": bool(_PIRNA_RE.search(text)),
+        "trna": bool(_TRNA_RE.search(text)),
+        "isomir": bool(_ISOMIR_RE.search(text)),
+        "fragmentomics": bool(_FRAGMENTOMICS_RE.search(text)),
+    }
+    requested = [name for name, enabled in assays.items() if enabled]
+    modalities: List[str] = []
+    if any(assays[name] for name in ("mirna", "pirna", "trna")):
+        modalities.append("srna")
+    if assays["isomir"]:
+        modalities.append("isomir")
+    if assays["fragmentomics"]:
+        modalities.append("fragmentomics")
+    return {
+        "requested_assays": requested,
+        "requested_modalities": modalities,
+        # An empty allowlist means the request did not name an assay. Keep
+        # generic planning available rather than guessing an exclusion.
+        "restricted": bool(requested),
+    }
+
+
+def _scope_block(scope: Dict[str, Any]) -> str:
+    assays = ", ".join(scope.get("requested_assays") or []) or "unspecified"
+    modalities = ", ".join(scope.get("requested_modalities") or []) or "unspecified"
+    return (
+        "Authorized analysis scope (derived only from user-authored requests):\n"
+        f"- requested assays: [{assays}]\n"
+        f"- requested modalities: [{modalities}]\n"
+        "Do not add an assay, modality, or its prerequisites merely because it appears in session context, "
+        "a skill description, or a draft plan. Expansion requires an explicit user request."
     )
-    combined = f"{user_query}\n{step_text}"
+
+
+def _enforce_requested_scope(
+    goal: str,
+    steps: List[Dict[str, Any]],
+    *,
+    scope: Dict[str, Any],
+    fallback_goal: str,
+) -> tuple[str, List[Dict[str, Any]]]:
+    """Reject planner-introduced assays before they can become future context."""
+    if not scope.get("restricted"):
+        return str(goal or fallback_goal).strip(), [dict(step) for step in steps if isinstance(step, dict)]
+
+    requested = set(scope.get("requested_assays") or [])
+    keep: List[Dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        text = _plan_step_text(step)
+        skill = str(step.get("skill") or "").strip().lower()
+        is_fragment = bool(_FRAGMENTOMICS_RE.search(text)) or skill == "fragment-analysis"
+        is_pirna = skill == "samtools_idxstats" or bool(
+            _PIRNA_RE.search(text) and (_QUANTIFICATION_RE.search(text) or _QUANT_METHOD_TEXT_RE.search(text))
+        )
+        is_isomir = skill == "isomir-quantification" or bool(
+            _ISOMIR_RE.search(text) and _QUANTIFICATION_RE.search(text)
+        )
+        is_whole_genome_fragment_prereq = bool(
+            re.search(r"whole[- ]?genome|全基因组", text, re.I)
+            and re.search(r"align|alignment|比对|bowtie|bam", text, re.I)
+        )
+        if (
+            (is_fragment and "fragmentomics" not in requested)
+            or (is_pirna and "pirna" not in requested)
+            or (is_isomir and "isomir" not in requested)
+            or (is_whole_genome_fragment_prereq and "fragmentomics" not in requested)
+        ):
+            continue
+        cleaned = dict(step)
+        # Shared reference checks may list an unrequested assay. Retain the
+        # common assets but remove that assay from its executable instruction.
+        for key in ("title", "goal"):
+            value = str(cleaned.get(key) or "")
+            if "pirna" not in requested:
+                value = re.sub(r"(?:\s*[、,/+，]\s*)?(?:piRNA|piRBase)(?:\s*\([^)]*\))?", "", value, flags=re.I)
+            if "isomir" not in requested:
+                value = re.sub(r"(?:\s*[、,/+，]\s*)?(?:iso[- ]?miR|isomiR|mirtop)(?:\s*\([^)]*\))?", "", value, flags=re.I)
+            cleaned[key] = re.sub(r"\s{2,}", " ", value).strip(" 、,，/+；;")
+        keep.append(cleaned)
+
+    goal_text = str(goal or "").strip()
+    if (
+        ("fragmentomics" not in requested and _FRAGMENTOMICS_RE.search(goal_text))
+        or ("pirna" not in requested and _PIRNA_RE.search(goal_text))
+        or ("isomir" not in requested and _ISOMIR_RE.search(goal_text))
+    ):
+        goal_text = str(fallback_goal or goal_text).strip()
+    return goal_text, keep
+
+
+def _requires_srna_and_fragmentomics(user_query: str, steps: List[Dict[str, Any]]) -> bool:
+    # Never let model-generated step text expand the requested modality set.
+    combined = str(user_query or "")
     return bool(
         (_MIRNA_RE.search(combined) or _PIRNA_RE.search(combined) or _TRNA_RE.search(combined))
         and _FRAGMENTOMICS_RE.search(combined)
@@ -2289,6 +2395,7 @@ class PlanOrchestrator:
         cancel_event: Optional[Any] = None,
     ) -> Dict[str, Any]:
         recent_history = _format_recent_history(history)
+        scope = _derive_requested_scope(_scope_request_text(user_query, history))
         planning_skill_guidance = _load_planning_skill_guidance(
             getattr(self.agent, "skill_registry", None), user_query,
         )
@@ -2306,6 +2413,7 @@ class PlanOrchestrator:
                 "role": "user",
                 "content": (
                     f"User request:\n{user_query}\n\n"
+                    f"{_scope_block(scope)}\n\n"
                     f"{conversation_block}"
                     f"Session context:\n{extra_context or '(none)'}"
                 ),
@@ -2333,6 +2441,7 @@ class PlanOrchestrator:
                 "role": "user",
                 "content": (
                     f"User request:\n{user_query}\n\n"
+                    f"{_scope_block(scope)}\n\n"
                     f"Session context:\n{extra_context or '(none)'}\n\n"
                     f"Proposed plan:\n{json.dumps(raw, ensure_ascii=False)}"
                 ),
@@ -2356,9 +2465,14 @@ class PlanOrchestrator:
         # The reviewed LLM plan is authoritative for scope and ordering. Code
         # only normalizes its JSON and preserves optional metadata; it does
         # not inject, reorder, or delete workflow steps here.
-        steps = _normalize_steps(raw.get("steps"), goal=user_query)
-        plan_goal = str(raw.get("goal") or user_query).strip()
+        plan_goal, scoped_steps = _enforce_requested_scope(
+            str(raw.get("goal") or user_query), raw.get("steps") or [],
+            scope=scope, fallback_goal=user_query,
+        )
+        steps = _normalize_steps(scoped_steps, goal=user_query)
         analysis = deepcopy(raw.get("analysis")) if isinstance(raw.get("analysis"), dict) else {}
+        analysis["requested_assays"] = scope["requested_assays"]
+        analysis["requested_modalities"] = scope["requested_modalities"]
         deliverables = deepcopy(raw.get("deliverables")) if isinstance(raw.get("deliverables"), dict) else {}
         requirements = deepcopy(raw.get("requirements")) if isinstance(raw.get("requirements"), dict) else {}
         plan = {
@@ -2386,6 +2500,14 @@ class PlanOrchestrator:
     ) -> Dict[str, Any]:
         current_plan_text = _format_plan_for_planner(plan)
         recent_history = _format_recent_history(history)
+        prior_scope = plan.get("analysis") if isinstance(plan.get("analysis"), dict) else {}
+        scope = {
+            "requested_assays": list(prior_scope.get("requested_assays") or []),
+            "requested_modalities": list(prior_scope.get("requested_modalities") or []),
+            "restricted": bool(prior_scope.get("requested_assays")),
+        }
+        if not scope["restricted"]:
+            scope = _derive_requested_scope(_scope_request_text(user_query, history))
         conversation_block = (
             f"\n\nRecent conversation:\n{recent_history}"
             if recent_history
@@ -2418,6 +2540,7 @@ class PlanOrchestrator:
                 "role": "user",
                 "content": (
                     f"User request:\n{user_query}\n\n"
+                    f"{_scope_block(scope)}\n\n"
                     f"Session context:\n{extra_context or '(none)'}\n\n"
                     f"{conversation_block}"
                     f"Current plan:\n{current_plan_text}"
@@ -2447,6 +2570,7 @@ class PlanOrchestrator:
                         "role": "user",
                         "content": (
                             f"User request:\n{user_query}\n\n"
+                            f"{_scope_block(scope)}\n\n"
                             f"Session context:\n{extra_context or '(none)'}\n\n"
                             f"Proposed revised plan:\n{json.dumps(raw, ensure_ascii=False)}"
                         ),
@@ -2462,9 +2586,14 @@ class PlanOrchestrator:
                 raw = reviewed_raw
         except (ValueError, TypeError, json.JSONDecodeError):
             pass
-        new_steps = _normalize_steps(raw.get("steps"), goal=plan.get("goal") or user_query)
-        replanned_goal = str(raw.get("goal") or plan.get("goal") or user_query).strip()
+        replanned_goal, scoped_steps = _enforce_requested_scope(
+            str(raw.get("goal") or plan.get("goal") or user_query), raw.get("steps") or [],
+            scope=scope, fallback_goal=str(plan.get("goal") or user_query),
+        )
+        new_steps = _normalize_steps(scoped_steps, goal=plan.get("goal") or user_query)
         analysis = deepcopy(raw.get("analysis")) if isinstance(raw.get("analysis"), dict) else {}
+        analysis["requested_assays"] = scope["requested_assays"]
+        analysis["requested_modalities"] = scope["requested_modalities"]
         deliverables = deepcopy(raw.get("deliverables")) if isinstance(raw.get("deliverables"), dict) else {}
         requirements = deepcopy(raw.get("requirements")) if isinstance(raw.get("requirements"), dict) else {}
 
@@ -2761,6 +2890,34 @@ class PlanOrchestrator:
                 restored_plan,
                 approval_response=user_query if resume else "",
             )
+            # Older persisted plans predate the scope contract.  Reconstruct
+            # it from the user conversation before any pending step can run.
+            existing_analysis = plan.get("analysis") if isinstance(plan.get("analysis"), dict) else {}
+            scope = {
+                "requested_assays": list(existing_analysis.get("requested_assays") or []),
+                "requested_modalities": list(existing_analysis.get("requested_modalities") or []),
+                "restricted": bool(existing_analysis.get("requested_assays")),
+            }
+            if not scope["restricted"]:
+                scope_text = _scope_request_text(user_query, history)
+                scope = _derive_requested_scope(scope_text)
+                if not scope["restricted"] and _CONTINUATION_RE.fullmatch(str(user_query or "").strip()):
+                    # Legacy plans may lack a recorded contract. A bare
+                    # "continue" cannot narrow their original scope.
+                    scope = {"requested_assays": [], "requested_modalities": [], "restricted": False}
+            scoped_goal, scoped_steps = _enforce_requested_scope(
+                str(plan.get("goal") or user_query), plan.get("steps") or [],
+                scope=scope, fallback_goal=user_query,
+            )
+            plan["goal"] = scoped_goal
+            # Preserve restored statuses and identities. `_normalize_steps`
+            # intentionally creates a fresh pending plan, which is correct
+            # for LLM output but wrong for an interrupted persisted plan.
+            plan["steps"] = scoped_steps
+            analysis = dict(existing_analysis)
+            analysis["requested_assays"] = scope["requested_assays"]
+            analysis["requested_modalities"] = scope["requested_modalities"]
+            plan["analysis"] = analysis
             self._emit(
                 on_progress,
                 "plan_restored",

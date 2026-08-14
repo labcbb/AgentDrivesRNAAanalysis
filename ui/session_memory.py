@@ -222,6 +222,10 @@ def _save_analysis_memory(chat_id: str, analysis: Dict[str, Any]) -> None:
         ]
         if modalities:
             merged["modalities"] = modalities
+        for key in ("requested_assays", "requested_modalities"):
+            values = [str(item).strip() for item in (analysis.get(key) or []) if str(item).strip()]
+            if values:
+                merged[key] = values
         if merged != current:
             memory["analysis"] = merged
             save_session_memory(chat_id, memory)
@@ -780,6 +784,12 @@ def build_session_memory_context(chat_id: str, *, user_query: str = "") -> str:
             joined = ", ".join(str(item) for item in modalities if str(item).strip())
             if joined:
                 lines.append(f"- analysis.modalities = [{joined}]")
+        requested_assays = analysis.get("requested_assays") or []
+        if requested_assays:
+            lines.append(f"- analysis.requested_assays = [{', '.join(str(item) for item in requested_assays)}]")
+        requested_modalities = analysis.get("requested_modalities") or []
+        if requested_modalities:
+            lines.append(f"- analysis.requested_modalities = [{', '.join(str(item) for item in requested_modalities)}]")
         if analysis.get("paired_feasible") is not None:
             lines.append(f"- analysis.paired_feasible = {str(bool(analysis.get('paired_feasible'))).lower()}")
         source = str(analysis.get("source") or "").strip()

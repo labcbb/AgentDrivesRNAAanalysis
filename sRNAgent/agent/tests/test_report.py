@@ -27,8 +27,14 @@ def _adata(tmp_path: Path, name: str) -> AnnData:
     return adata
 
 
-def test_html_report_is_result_only_and_copies_assets(tmp_path):
+def test_html_report_is_result_only_and_records_artifact_source_paths(tmp_path):
     adata = _adata(tmp_path, "source")
+    fastq = tmp_path / "sample.fastq.gz"
+    fastq.write_bytes(b"fastq")
+    fasta = tmp_path / "reference.fa"
+    fasta.write_text(">chr1\nACGT\n", encoding="utf-8")
+    adata.obs["fastq_path"] = [str(fastq)] * adata.n_obs
+    adata.uns["genome_fasta"] = str(fasta)
     result = html(adata, output_dir=str(tmp_path / "report"), group_col="condition")
     assert result is adata
     report_dir = tmp_path / "report"
@@ -39,6 +45,32 @@ def test_html_report_is_result_only_and_copies_assets(tmp_path):
     text = (report_dir / "report.html").read_text(encoding="utf-8")
     assert "Differential expression" in text
     assert "assets/plots/srna/source.png" in text
+    assert str(fastq.resolve()) in text
+    assert str(fasta.resolve()) in text
+    assert not (report_dir / "assets" / "artifacts").exists()
+
+
+def test_html_report_includes_candidate_priority_audit_and_artifacts(tmp_path):
+    adata = _adata(tmp_path, "priority")
+    audit_path = tmp_path / "candidate_priority_audit.csv"
+    audit_path.write_text("candidate,eligible\nmiR-1,True\n", encoding="utf-8")
+    manifest_path = tmp_path / "candidate_priority_manifest.json"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    adata.uns["candidate_prioritization"] = {
+        "recommended": pd.DataFrame({"candidate": ["miR-1"], "priority_score": [0.8], "eligible": [True]}),
+        "audit": pd.DataFrame({"candidate": ["miR-1", "miR-2"], "priority_score": [0.8, 0.3], "eligible": [True, False], "exclusion_reasons": ["", "DE FDR exceeds 0.05"], "evidence_gaps": ["", "replication unavailable"]}),
+        "artifacts": {"audit_csv": str(audit_path), "manifest": str(manifest_path)},
+    }
+
+    html(adata, output_dir=str(tmp_path / "priority-report"), level="publication")
+    report_dir = tmp_path / "priority-report"
+    text = (report_dir / "report.html").read_text(encoding="utf-8")
+
+    assert "Candidate prioritization" in text
+    assert "Candidate prioritization audit" in text
+    assert (report_dir / "tables" / "srna_candidate_prioritization.audit.csv").exists()
+    assert str(audit_path.resolve()) in text
+    assert not (report_dir / "assets" / "artifacts").exists()
 
 
 def test_multi_modality_report_preserves_separate_ann_data(tmp_path):

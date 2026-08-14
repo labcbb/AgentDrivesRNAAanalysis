@@ -1,6 +1,6 @@
 ---
 name: plotting
-description: "Generate grouped, publication-ready CNS-style plots from existing AnnData results using sRNAgent plot tools. Use for QC, alignment, expression, differential expression, enrichment, small-RNA/isomiR, fragmentomics, miRNA-target networks, classification, or Cox visualisation, including batch plot discovery and export."
+description: "Generate grouped, publication-ready CNS-style plots from existing AnnData results using sRNAgent plot tools. Use for QC, alignment, expression, differential expression, enrichment, small-RNA/isomiR, fragmentomics, miRNA-target networks, deterministic candidate prioritization, classification, or Cox visualisation, including batch plot discovery and export."
 ---
 
 # Scientific Plotting
@@ -58,6 +58,7 @@ Do not override the palette with unrelated colours. `group_col` maps sorted grou
 | Fragmentomics | `sa.plot.fragment_profile`, `sa.plot.fragment_heatmap` | fragmentomics `var["type"]`, `layers["CPM"]` |
 | Target network | `sa.plot.target_network` | cached starBase target TSV records |
 | Classification | `sa.plot.classification_performance` | `uns["classification"]["performance"]` |
+| Candidate prioritization | `sa.plot.candidate_priorities` | `uns["candidate_prioritization"]["audit"]` |
 | Cox | `sa.plot.cox_forest`, `sa.plot.cox_cross_validation` | `uns["cox"]` result tables |
 
 ## Grouped Figures
@@ -103,10 +104,15 @@ sa.plot.target_network(adata, top_mirnas=10, top_targets=15)
 sa.plot.classification_performance(adata, metric="roc_auc")
 sa.plot.cox_forest(adata, result="multivariate", top_n=25)
 sa.plot.cox_cross_validation(adata)
+
+# Existing deterministic candidate-priority audit only; no ranking is recomputed.
+sa.plot.candidate_priorities(adata, top_n=20, include_excluded=True)
 ```
+
+`candidate_priorities` draws the fixed D/R/C/B/Q score contributions and marks candidates rejected by a hard gate. It reads only `uns["candidate_prioritization"]["audit"]`; do not use plotting to modify weights, eligibility, exclusion reasons, or evidence gaps. Use `include_excluded=False` only for a recommendation-focused figure, and retain the full audit table in the report or supplement.
 
 The target-network tool writes the displayed network plus a complete edge table (`.edges.tsv`) and Cytoscape-compatible (`.graphml`) graph beside the figure. Keep `top_mirnas` and `top_targets` bounded for an interpretable manuscript figure; use the exported network files for exhaustive exploration.
 
 ## Output Discipline
 
-Use a named `output_dir` for each analysis. Do not use generated pictures as proof that upstream analysis succeeded; always inspect the corresponding stored result table. For a manuscript composite or a custom multi-panel figure beyond the registered plots, use the `nature-figure` skill after these source figures have been generated.
+Use a named `output_dir` for each analysis. Do not use generated pictures as proof that upstream analysis succeeded; always inspect the corresponding stored result table. For a manuscript composite or custom multi-panel figure beyond the registered plots, export the source figures and tables from this skill first.

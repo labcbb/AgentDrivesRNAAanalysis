@@ -26,6 +26,8 @@ _TABLE_KEYS = {
     "cox.selection_coefficients": "Feature selection",
     "cox.cross_validation": "Cox cross-validation",
     "feature_selection.metadata.selection_table": "Feature selection",
+    "candidate_prioritization.recommended": "Candidate prioritization",
+    "candidate_prioritization.audit": "Candidate prioritization audit",
 }
 _PATH_KEY_RE = re.compile(r"(?:path|file|html|tsv|csv|bam|sam|fasta|fa|gff|gtf|joblib|graphml|output|dir)$", re.I)
 
@@ -75,7 +77,16 @@ def _copy_file(source: str | Path, report_dir: Path, relative_dir: str) -> Optio
     return target.relative_to(report_dir).as_posix()
 
 
-def _table_entry(table: pd.DataFrame, title: str, key: str, report_dir: Path, modality: str, top_n: int) -> dict[str, Any]:
+def _table_entry(
+    table: pd.DataFrame,
+    title: str,
+    key: str,
+    report_dir: Path,
+    modality: str,
+    top_n: int,
+    *,
+    section: str = "",
+) -> dict[str, Any]:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{modality}_{key}").strip("_") or "table"
     table_dir = report_dir / "tables"
     table_dir.mkdir(parents=True, exist_ok=True)
@@ -85,6 +96,7 @@ def _table_entry(table: pd.DataFrame, title: str, key: str, report_dir: Path, mo
     display_columns = [str(column) for column in display.columns]
     return {
         "title": title,
+        "section": section,
         "key": key,
         "modality": modality,
         "n_rows": int(len(table)),
@@ -100,7 +112,8 @@ def _collect_tables(adata: AnnData, modality: str, report_dir: Path, top_n: int)
     for key, title in _TABLE_KEYS.items():
         value = _get_nested(adata.uns, key)
         if isinstance(value, pd.DataFrame) and not value.empty:
-            tables.append(_table_entry(value, title, key, report_dir, modality, top_n))
+            section = "candidate_prioritization" if key.startswith("candidate_prioritization.") else ""
+            tables.append(_table_entry(value, title, key, report_dir, modality, top_n, section=section))
     return tables
 
 
@@ -123,6 +136,7 @@ def _collect_plots(adata: AnnData, modality: str, report_dir: Path) -> list[dict
 
 
 def _collect_artifacts(adata: AnnData, modality: str, report_dir: Path) -> list[dict[str, str]]:
+    """Record source artifacts without copying bulky inputs into the report."""
     artifacts: list[dict[str, str]] = []
     seen: set[str] = set()
     def visit(value: Any, key_hint: str = "") -> None:
@@ -133,10 +147,13 @@ def _collect_artifacts(adata: AnnData, modality: str, report_dir: Path) -> list[
             for item in value[:100]:
                 visit(item, key_hint)
         elif isinstance(value, (str, Path)) and _PATH_KEY_RE.search(key_hint):
-            copied = _copy_file(value, report_dir, f"artifacts/{modality}")
-            if copied and copied not in seen:
-                seen.add(copied)
-                artifacts.append({"key": key_hint, "path": copied, "modality": modality})
+            path = Path(str(value)).expanduser()
+            if not path.exists() or not path.is_file():
+                return
+            source = str(path.resolve())
+            if source not in seen:
+                seen.add(source)
+                artifacts.append({"key": key_hint, "path": source, "modality": modality})
     visit(adata.uns)
     for column in adata.obs.columns:
         if _PATH_KEY_RE.search(str(column)):
@@ -186,17 +203,22 @@ _TEMPLATE = Template(r"""<!doctype html>
 <div class="summary"><div class="metric"><strong>{{ totals.samples }}</strong><span>Total samples across supplied modalities</span></div><div class="metric"><strong>{{ totals.features }}</strong><span>Total stored features</span></div><div class="metric"><strong>{{ totals.plots }}</strong><span>Registered figures included</span></div><div class="metric"><strong>{{ totals.tables }}</strong><span>Result tables exported</span></div></div>
 <nav class="toc"><strong>Contents</strong><br>{% for section in sections %}<a href="#{{ section.id }}">{{ section.title }}</a>{% endfor %}</nav>
 <section class="section" id="overview"><h2>1. Analysis overview</h2><p class="note">This report summarizes data and artifacts already present in the supplied AnnData objects. It does not rerun upstream analyses or contact external services.</p><div class="grid">{% for modality in modalities %}<div class="figure"><h3>{{ modality.name }}</h3><p>{{ modality.n_samples }} samples · {{ modality.n_features }} features</p><p class="note">Layers: {{ modality.layers|join(', ') or 'none' }}<br>Stored results: {{ modality.uns_keys|join(', ') or 'none' }}</p>{% if modality.group_col %}<p><span class="status">{{ modality.group_status }}</span> {{ modality.group_col }}: {{ modality.groups }}</p>{% endif %}</div>{% endfor %}</div></section>
-{% for section in sections if section.id != 'overview' %}<section class="section" id="{{ section.id }}"><h2>{{ loop.index + 1 }}. {{ section.title }}</h2>{% if section.note %}<p class="note">{{ section.note }}</p>{% endif %}{% for modality in modalities if modality.plots|selectattr('category','equalto',section.category)|list or modality.tables|selectattr('title','equalto',section.title)|list %}<h3>{{ modality.name }}</h3>{% set plots = modality.plots|selectattr('category','equalto',section.category)|list %}{% if plots %}<div class="grid">{% for plot in plots %}<figure class="figure"><a href="{{ plot.path_png or plot.path_svg or plot.path_pdf }}"><img src="{{ plot.path_png or plot.path_svg }}" alt="{{ plot.name }}"></a><figcaption class="caption"><strong>{{ plot.name }}</strong> · source: {{ plot.source }}<br><a class="download" href="{{ plot.path_pdf }}">PDF</a><a class="download" href="{{ plot.path_svg }}">SVG</a></figcaption></figure>{% endfor %}</div>{% endif %}{% set tables = modality.tables|selectattr('title','equalto',section.title)|list %}{% for table in tables %}<h3>{{ table.title }} <a class="download" href="{{ table.csv }}">full CSV ({{ table.n_rows }} rows)</a></h3><table><thead><tr>{% for column in table.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>{% for row in table.rows %}<tr>{% for column in table.columns %}<td>{{ row.get(column, '') }}</td>{% endfor %}</tr>{% endfor %}</tbody></table>{% endfor %}{% endfor %}{% if section.empty %}<div class="missing">No stored plots or result tables were available for this section. The report did not rerun analysis.</div>{% endif %}</section>{% endfor %}
-<section class="section" id="artifacts"><h2>Artifacts and provenance</h2>{% for modality in modalities %}<h3>{{ modality.name }}</h3>{% if modality.artifacts %}<ul>{% for artifact in modality.artifacts %}<li><a class="download" href="{{ artifact.path }}">{{ artifact.key }}</a></li>{% endfor %}</ul>{% else %}<p class="note">No additional file artifacts were found in stored metadata.</p>{% endif %}{% endfor %}</section>
+{% for section in sections if section.id != 'overview' %}<section class="section" id="{{ section.id }}"><h2>{{ loop.index + 1 }}. {{ section.title }}</h2>{% if section.note %}<p class="note">{{ section.note }}</p>{% endif %}{% for modality in modalities if modality.plots|selectattr('category','equalto',section.category)|list or modality.tables|selectattr('section','equalto',section.category)|list %}<h3>{{ modality.name }}</h3>{% set plots = modality.plots|selectattr('category','equalto',section.category)|list %}{% if plots %}<div class="grid">{% for plot in plots %}<figure class="figure"><a href="{{ plot.path_png or plot.path_svg or plot.path_pdf }}"><img src="{{ plot.path_png or plot.path_svg }}" alt="{{ plot.name }}"></a><figcaption class="caption"><strong>{{ plot.name }}</strong> · source: {{ plot.source }}<br><a class="download" href="{{ plot.path_pdf }}">PDF</a><a class="download" href="{{ plot.path_svg }}">SVG</a></figcaption></figure>{% endfor %}</div>{% endif %}{% set tables = modality.tables|selectattr('section','equalto',section.category)|list %}{% for table in tables %}<h3>{{ table.title }} <a class="download" href="{{ table.csv }}">full CSV ({{ table.n_rows }} rows)</a></h3><table><thead><tr>{% for column in table.columns %}<th>{{ column }}</th>{% endfor %}</tr></thead><tbody>{% for row in table.rows %}<tr>{% for column in table.columns %}<td>{{ row.get(column, '') }}</td>{% endfor %}</tr>{% endfor %}</tbody></table>{% endfor %}{% endfor %}{% if section.empty %}<div class="missing">No stored plots or result tables were available for this section. The report did not rerun analysis.</div>{% endif %}</section>{% endfor %}
+<section class="section" id="artifacts"><h2>Artifacts and provenance</h2>{% for modality in modalities %}<h3>{{ modality.name }}</h3>{% if modality.artifacts %}<ul>{% for artifact in modality.artifacts %}<li><strong>{{ artifact.key }}</strong>: <a class="download" href="{{ artifact.path }}"><code>{{ artifact.path }}</code></a></li>{% endfor %}</ul>{% else %}<p class="note">No additional file artifacts were found in stored metadata.</p>{% endif %}{% endfor %}</section>
 <footer class="footer">Report manifest: <a class="download" href="report_manifest.json">report_manifest.json</a>. Complete result tables are linked as CSV files. Save the corresponding H5AD objects to preserve the in-object provenance.</footer>
 </main></body></html>""")
 
 
 def _section_data(modalities: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    specs = [("qc", "Quality control", "Recorded per-sample QC and alignment metrics."), ("alignment", "Alignment", "Recorded alignment summaries."), ("expression", "Expression and composition", "Expression layers, PCA, correlation, and RNA composition."), ("differential", "Differential expression", "Stored differential-expression results and figures."), ("enrichment", "Enrichment", "Stored enrichment results and figures."), ("fragmentomics", "Fragmentomics", "Fragment-specific feature families from the independent fragmentomics modality."), ("target", "Target network", "Cached target tables and network figures."), ("classification", "Classification", "Stored classification performance."), ("cox", "Cox survival", "Stored Cox results and validation."), ("artifacts", "Artifacts", "Files recorded by upstream tools.")]
+    specs = [("qc", "Quality control", "Recorded per-sample QC and alignment metrics."), ("alignment", "Alignment", "Recorded alignment summaries."), ("expression", "Expression and composition", "Expression layers, PCA, correlation, and RNA composition."), ("differential", "Differential expression", "Stored differential-expression results and figures."), ("enrichment", "Enrichment", "Stored enrichment results and figures."), ("fragmentomics", "Fragmentomics", "Fragment-specific feature families from the independent fragmentomics modality."), ("target", "Target network", "Cached target tables and network figures."), ("candidate_prioritization", "Candidate prioritization", "Deterministic D/R/C/B/Q scores, hard-gate exclusions, and evidence gaps from stored audit results."), ("classification", "Classification", "Stored classification performance."), ("cox", "Cox survival", "Stored Cox results and validation."), ("artifacts", "Artifacts", "Files recorded by upstream tools.")]
     result = []
     for category, title, note in specs:
-        present = any(any(plot.get("category") == category for plot in modality["plots"]) or category == "artifacts" and modality["artifacts"] for modality in modalities)
+        present = any(
+            any(plot.get("category") == category for plot in modality["plots"])
+            or any(table.get("section") == category or table.get("title") == title for table in modality["tables"])
+            or category == "artifacts" and modality["artifacts"]
+            for modality in modalities
+        )
         result.append({"id": category, "category": category, "title": title, "note": note, "empty": not present})
     return result
 
@@ -245,9 +267,9 @@ def html(
             modality["plots"] = []
     sections = _section_data(modalities)
     if level == "minimal":
-        sections = [section for section in sections if section["category"] in {"expression", "differential", "classification", "cox", "artifacts"}]
+        sections = [section for section in sections if section["category"] in {"expression", "differential", "candidate_prioritization", "classification", "cox", "artifacts"}]
     elif level == "publication":
-        sections = [section for section in sections if section["category"] in {"differential", "enrichment", "target", "classification", "cox", "artifacts"}]
+        sections = [section for section in sections if section["category"] in {"differential", "enrichment", "target", "candidate_prioritization", "classification", "cox", "artifacts"}]
     totals = {"samples": sum(item["n_samples"] for item in modalities), "features": sum(item["n_features"] for item in modalities), "plots": sum(len(item["plots"]) for item in modalities), "tables": sum(len(item["tables"]) for item in modalities)}
     context = {"title": str(title), "generated_at": _utc_now(), "modalities": modalities, "sections": [{"id": "overview", "title": "Analysis overview"}] + sections, "totals": totals}
     html_path = report_dir / "report.html"

@@ -211,6 +211,7 @@ function finishChatStream(chatId, options = {}) {
   renderRecentChats();
   if (chatId !== activeChatId) return;
   syncComposerForActiveChat();
+  schedulePendingSendDrain(chatId);
   if (!options.keepBackgroundWatch && window.llmIsLocalServer?.()) {
     if (isActiveChatSending()) {
       window.KernelPanel?.stopPolling?.();
@@ -1276,6 +1277,32 @@ function renderPlanSnapshot(target, assistantEntry, plan) {
   if (target) appendThinkingStep(target, step, { persist: false });
 }
 
+function syncPersistedPlanSnapshot(chatId, status) {
+  if (!status?.plan?.steps?.length) return;
+  const messages = chatId === activeChatId
+    ? chatHistory
+    : (getChatRecord(chatId)?.messages || []);
+  const assistantEntry = [...messages].reverse().find((item) => item?.role === "assistant");
+  if (!assistantEntry) return;
+
+  if (chatId === activeChatId) {
+    renderPlanSnapshot(getLastAssistantGroup(), assistantEntry, status.plan);
+    persistChatMessages(chatId, messages);
+    return;
+  }
+
+  appendThinkingStepToEntry(assistantEntry, {
+    id: "current-plan",
+    kind: "plan",
+    title: resolvePlanSnapshotTitle(status.plan.goal, "plan_revised"),
+    data: buildThinkingPlanData(status.plan, "plan_revised"),
+    body: status.plan.steps
+      .map((step) => `${summarizePlanStepStatus(step.status).mark} ${step.title || step.goal || step.id}`)
+      .join("\n"),
+  });
+  persistChatMessages(chatId, messages);
+}
+
 /** Clear stuck CODE/plan UI without rewriting a good assistant reply. */
 function cleanupDanglingTaskUi(chatId) {
   markRunningExecutionsStopped();
@@ -1323,6 +1350,7 @@ function reconcileStaleTaskUi(chatId, status, options = {}) {
       }
       cleanupDanglingTaskUi(chatId);
       if (persist && chatId) persistChatMessages(chatId, chatHistory);
+      schedulePendingSendDrain(chatId);
       return false;
     }
     return false;
@@ -1361,6 +1389,7 @@ function reconcileStaleTaskUi(chatId, status, options = {}) {
   if (persist && chatId) {
     persistChatMessages(chatId, chatHistory);
   }
+  schedulePendingSendDrain(chatId);
   return true;
 }
 
@@ -1407,6 +1436,8 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
   const elapsedLabel = status?.codeElapsedLabel || formatElapsedLabel(elapsedSec);
   const description = status?.codeDescription || status?.codeSummary || status?.plan?.goal || "";
   const highlights = Array.isArray(status?.codeHighlights) ? status.codeHighlights : [];
+  const isDownloadTask = Boolean(status?.codeIsDownloadTask);
+  const progressStage = status?.codeProgressStage || "";
 
   applyExecutionCardState(
     card,
@@ -1415,7 +1446,7 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
       id: BACKGROUND_EXECUTION_ID,
       title,
       description,
-      stage,
+      stage: progressStage || stage,
       highlights,
       startedAt,
       elapsedSec,
@@ -1423,6 +1454,17 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
       done: false,
       stopped: false,
       hint,
+      isDownloadTask,
+      progressOverallPct: status?.codeProgressOverallPct,
+      progressFilePct: status?.codeProgressFilePct,
+      progressRun: status?.codeProgressRun || "",
+      progressFileIndex: status?.codeProgressFileIndex,
+      progressFileTotal: status?.codeProgressFileTotal,
+      progressBytes: status?.codeProgressBytes,
+      progressBytesTotal: status?.codeProgressBytesTotal,
+      progressLabel: status?.codeProgressLabel || "",
+      progressIndeterminate: Boolean(status?.codeProgressIndeterminate),
+      progressCompletedFiles: status?.codeProgressCompletedFiles,
     },
     { showStop },
   );
@@ -1431,7 +1473,7 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
     id: BACKGROUND_EXECUTION_ID,
     title,
     description,
-    stage,
+    stage: progressStage || stage,
     highlights,
     startedAt,
     elapsedSec,
@@ -1439,6 +1481,17 @@ function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
     done: false,
     stopped: false,
     hint,
+    isDownloadTask,
+    progressOverallPct: status?.codeProgressOverallPct,
+    progressFilePct: status?.codeProgressFilePct,
+    progressRun: status?.codeProgressRun || "",
+    progressFileIndex: status?.codeProgressFileIndex,
+    progressFileTotal: status?.codeProgressFileTotal,
+    progressBytes: status?.codeProgressBytes,
+    progressBytesTotal: status?.codeProgressBytesTotal,
+    progressLabel: status?.codeProgressLabel || "",
+    progressIndeterminate: Boolean(status?.codeProgressIndeterminate),
+    progressCompletedFiles: status?.codeProgressCompletedFiles,
   });
   scrollCodePanelToBottom();
   return card;
@@ -1587,6 +1640,7 @@ async function pollBackgroundRunStatus(chatId) {
         }
       }
     }
+    schedulePendingSendDrain(chatId);
     return;
   }
 
@@ -1632,6 +1686,9 @@ async function resumeBackgroundRunIfNeeded(chatId) {
     reconcileStaleTaskUi(chatId, status, { assistantEntry: lastAssistant || null });
     return;
   }
+  // The execution may have already ended at an approval gate.  In that case
+  // there is no live stream to replace the old plan snapshot after a reload.
+  syncPersistedPlanSnapshot(chatId, status);
   if (!isTaskLikelyActive(status, chatId)) {
     // A finished plan may still have a persisted running CODE card. Reuse the
     // soft cleanup path so a page reload cannot resurrect that stale card.
@@ -1860,7 +1917,10 @@ async function attachLiveEventStream(chatId, status = null) {
       liveFollows.delete(chatId);
       const stream = chatStreams.get(chatId);
       if (stream?.isFollower) chatStreams.delete(chatId);
-      if (chatId === activeChatId) syncComposerForActiveChat();
+      if (chatId === activeChatId) {
+        syncComposerForActiveChat();
+        schedulePendingSendDrain(chatId);
+      }
     }
   })();
 }
@@ -3208,14 +3268,15 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
   const batchProgressDone = batchSummary?.done || 0;
   const batchProgressTotal = batchSummary?.total || 0;
   const batchRunning = batchSummary?.running;
-  if (batchProgressTotal > 0 && !hasPct && filePct == null) {
+  const hasSampleBatchProgress = batchProgressTotal > 0 && !isActiveDownload;
+  if (hasSampleBatchProgress && !hasPct && filePct == null) {
     overallPct = (batchProgressDone / batchProgressTotal) * 100;
     hasPct = true;
   }
   const hasBytes = Number(artifact.progressBytes) > 0;
   const hasProgress =
     (isActiveDownload && isDownloadProgressArtifact(artifact) && (hasPct || hasBytes))
-    || batchProgressTotal > 0;
+    || hasSampleBatchProgress;
   // Batch quantification (e.g. tRAX) reports sample progress rather than
   // download bytes. Do not leave its card saying "等待输出" once a stage or
   // sample counter is available.
@@ -3252,7 +3313,7 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
   const runLabel = artifact.progressRun || "";
   let displayLabel = artifact.progressLabel || artifact.stage || "下载中…";
   // 批量任务进度：显示整体样本完成度，避免把 inflight 原始列表塞进 UI
-  if (batchProgressTotal > 0) {
+  if (hasSampleBatchProgress) {
     displayLabel = `样本进度 ${batchProgressDone}/${batchProgressTotal}（${overallPct.toFixed(1)}%）`;
   }
   if (runLabel && fileIndex && fileTotal && hasPct && filePct != null) {
@@ -3301,7 +3362,7 @@ function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
         barLabel.textContent = displayLabel;
       }
       if (barMeta) {
-        if (batchProgressTotal > 0) {
+        if (hasSampleBatchProgress) {
           barMeta.textContent = [
             `总样本 ${batchProgressTotal}`,
             batchRunning != null ? `运行中 ${batchRunning}` : "",
@@ -3956,6 +4017,7 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     || event.type === "plan_step_start"
     || event.type === "plan_step_done"
     || event.type === "plan_step_failed"
+    || event.type === "plan_approval_required"
     || event.type === "plan_complete"
     || event.type === "plan_incomplete"
     || event.type === "plan_failed"
@@ -4099,6 +4161,7 @@ function handleAgentStreamEvent(group, event) {
     event.type === "plan_step_start" ||
     event.type === "plan_step_done" ||
     event.type === "plan_step_failed" ||
+    event.type === "plan_approval_required" ||
     event.type === "plan_complete" ||
     event.type === "plan_incomplete" ||
     event.type === "plan_failed"
@@ -4788,6 +4851,18 @@ async function drainPendingSends(chatId) {
   }
   if (composer) composer.value = next;
   await handleSend();
+}
+
+/**
+ * A direct SSE stream, background watcher, and live follower can finish in
+ * different orders. Defer queue consumption one tick so all terminal cleanup
+ * has removed its "running" marker before `handleSend` checks it.
+ */
+function schedulePendingSendDrain(chatId) {
+  if (!chatId || chatId !== activeChatId || !(pendingSends.get(chatId)?.length)) return;
+  window.setTimeout(() => {
+    if (!isActiveChatSending()) void drainPendingSends(chatId);
+  }, 0);
 }
 
 function escapeStatusHtml(value) {

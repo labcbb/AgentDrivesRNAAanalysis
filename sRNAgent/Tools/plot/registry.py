@@ -61,6 +61,7 @@ def definitions() -> dict[str, PlotDefinition]:
         "classification_performance": PlotDefinition("classification_performance", "classification", "minimal", _has("uns.classification"), model.classification_performance),
         "cox_multivariate_forest": PlotDefinition("cox_multivariate_forest", "cox", "minimal", _has("uns.cox.multivariate_results"), model.cox_forest),
         "cox_cross_validation": PlotDefinition("cox_cross_validation", "cox", "standard", _has("uns.cox.cross_validation"), model.cox_cross_validation),
+        "candidate_priorities": PlotDefinition("candidate_priorities", "candidate_prioritization", "minimal", _has("uns.candidate_prioritization.audit"), model.candidate_priorities),
     }
 
 

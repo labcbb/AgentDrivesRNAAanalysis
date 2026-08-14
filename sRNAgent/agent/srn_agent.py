@@ -636,7 +636,17 @@ def _ordered_download_targets(
     def add_run(acc: str) -> None:
         if acc in seen:
             return
-        for rel in (f"srna_fastq/{acc}.fastq.gz", f"{acc}.fastq.gz"):
+        # Prefer the output directory from the code being executed.  The
+        # generic legacy locations below are usually absent for agent runs,
+        # whose FASTQs live under e.g. data/raw/fastq/.  Looking there first
+        # lets filesystem telemetry reflect the bytes actually being written.
+        candidates = [
+            str(Path(output_dir) / f"{acc}.fastq.gz")
+            for output_dir in _output_dirs_from_code(code)
+            if output_dir
+        ]
+        candidates.extend((f"srna_fastq/{acc}.fastq.gz", f"{acc}.fastq.gz"))
+        for rel in candidates:
             resolved = _resolve_workspace_path(workspace, rel)
             if resolved is not None:
                 seen.add(acc)
@@ -768,6 +778,18 @@ def _infer_file_download_progress(
             "progressFileTotal": file_total,
             "progressBytes": active_got,
         }
+        completed_files = sum(
+            1
+            for acc, path in targets
+            if (
+                (expected := _expected_download_total(workspace, acc, text, code, filename=path.name)) > 0
+                and _download_bytes_on_disk(path) >= expected * 0.98
+            )
+        )
+        result["progressCompletedFiles"] = completed_files
+        result["progressStage"] = (
+            f"下载文件已落盘 {completed_files}/{file_total} · 进行中: {active_acc}"
+        )
 
         file_pct: Optional[float] = None
         if active_expected > 0:
@@ -894,6 +916,8 @@ def _merge_execution_progress(
             "progressBytesTotal",
             "progressLabel",
             "progressIndeterminate",
+            "progressCompletedFiles",
+            "progressStage",
         ):
             merged.pop(key, None)
         return merged
@@ -911,6 +935,8 @@ def _merge_execution_progress(
                 "progressFileIndex",
                 "progressFileTotal",
                 "progressLabel",
+                "progressCompletedFiles",
+                "progressStage",
             ):
                 if merged.get(key) in (None, "", 0) and file_progress.get(key) not in (None, ""):
                     merged[key] = file_progress[key]
@@ -1368,6 +1394,8 @@ class SRNAgent:
             "progressBytesTotal": parsed.get("progressBytesTotal"),
             "progressLabel": parsed.get("progressLabel"),
             "progressIndeterminate": parsed.get("progressIndeterminate"),
+            "progressCompletedFiles": parsed.get("progressCompletedFiles"),
+            "progressStage": parsed.get("progressStage"),
         }
         if not payload["isDownloadTask"]:
             for key in list(payload.keys()):
@@ -1401,9 +1429,13 @@ class SRNAgent:
         def supervised_progress(raw_stream: str) -> Dict[str, Any]:
             parsed = _parse_progress_output(raw_stream, workspace=workspace, code=code_text)
             observed = supervisor.snapshot()
-            # A tool-provided N/M marker is the most precise signal. Otherwise
-            # use generic process/filesystem telemetry to avoid a blank card.
-            if not _SAMPLE_PROGRESS_RE.search(raw_stream):
+            # Use the tool's N/M counter only when filesystem telemetry cannot
+            # identify the downloaded FASTQ files.  A worker can write a large
+            # file long before its subprocess returns, leaving an old 0/N
+            # marker in the stream indefinitely.
+            if parsed.get("progressStage"):
+                parsed["stage"] = parsed["progressStage"]
+            elif not _SAMPLE_PROGRESS_RE.search(raw_stream):
                 parsed["stage"] = observed["stage"]
                 parsed["detail"] = observed["detail"]
                 parsed["highlights"] = observed["highlights"]
