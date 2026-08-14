@@ -281,4 +281,4 @@ def run_threads(items: List[T], worker: Callable[[T], R], jobs: int) -> List[R]:
                 done += 1
                 submit_next()
                 _emit_status()
-    return [r for r in results if r is not None]
+    return results
