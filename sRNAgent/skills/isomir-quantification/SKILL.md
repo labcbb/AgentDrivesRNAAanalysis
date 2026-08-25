@@ -89,11 +89,11 @@ print(codes)  # 确认目标物种的 3-letter code
 
 result = sa.reference.download_mirbase(species="hsa", output_dir="ref", jobs=4)
 # result["hairpin"]  → ref/hairpin_hsa.fa   （hairpin 前体序列，比对参考）
-# result["gff3"]     → ref/hsa.gff3          （前体 GFF3 注释，mirtop 的 --gtf 输入）
+# result["gff3"]     → ref/hsa.gff3          （miRBase 原始前体 GFF3）
 ```
 
 - `hairpin_hsa.fa` 是 miRBase 原始 RNA 参考；`bowtie_build` 返回的 `reference_used` 是实际的 DNA 比对参考（通常为 `hairpin_hsa.dna.fa`），后续 Bowtie 与 mirtop 都必须使用它。
-- `hsa.gff3` 用作 **`sa.quant.mirtop` 的 `gff` 参数**（前体 + 成熟体坐标）。
+- `hsa.gff3` 可直接传给 **`sa.quant.mirtop` 的 `gff` 参数**。miRBase 的下载版通常只有前体行；工具会用同版本的 `hairpin_hsa.fa` 与 `mature_hsa.fa` 自动生成并验证独立的 `hsa.mirtop.gff3`，补齐成熟 miRNA 在 hairpin 坐标系中的位置及正确的 `Derives_from` 关系。不要手工改写下载的 `hsa.gff3`，也不要仅按名字替换 `Derives_from`。
 
 > ❌ 不要用 `mature_hsa.fa`（成熟体）建索引 —— isomiR 的 5'/3' 修剪需要 reads 落在 **hairpin 前体**上才有上下文。
 
@@ -203,6 +203,8 @@ mirtop stats -o mirtop_out/ mirtop_out/mirtop.gff               # → mirtop_sta
 
 > 幂等：`mirtop.gff` / counts TSV 已覆盖全部样本时自动跳过重跑（`overwrite=False` 默认）。
 
+> 参考预检：`sa.quant.mirtop` 会在调用 CLI 前验证前体 ID、成熟体行和 `Derives_from` 是否能与 hairpin FASTA 一一解析；若不满足，会自动使用 `sa.reference.prepare_mirtop_reference(...)` 生成同目录的 `*.mirtop.gff3`。该路径和修复摘要记录在 `adata.uns["mirtop_result"]["gff_reference"]`，原始下载文件保持不变。
+
 ### 6. 已有 hairpin 比对 BAM：直接从 BAM 往下做
 
 如果用户已有比对好的 BAM（跳过质控/比对），直接构造独立模态并调用 mirtop：
@@ -227,7 +229,7 @@ adata_iso = sa.quant.mirtop(
 
 ```python
 print(adata_iso.shape)                              # (n_samples, n_isomirs)
-print(adata_iso.var[["mirna_id", "rna_type", "variant_type"]].head())
+print(adata_iso.var[["mirna_id", "sequence", "seed_sequence", "variant_type"]].head())
 print(adata_iso.uns["mirtop_result"]["stats_log"])  # 各样本变异类型分布
 
 # 独立模态 → 独立 h5ad
@@ -235,8 +237,8 @@ adata_iso.write("isomir_counts.h5ad")
 ```
 
 - **默认 `granularity="variant"`（不聚合）**：`var_names` 是 isomiR UID（如 `hsa-let-7a-5p|0,0,0,0,0,0`），每个变异一行，保留完整变异信息。
-- **`adata.var` 携带 isomiR 类型信息**（variant 粒度）：`variant_type`（如 `iso_5p` / `iso_3p` / `iso_add3p` / `iso_snp` 或组合）、`reads`（该 isomiR 总读数）、`iso_5p` / `iso_3p` / `iso_add3p` / `iso_snp`（各变异类型计数）、`mirna_id`（成熟体名）。
-- **需要成熟体水平汇总时**才显式传 `granularity="miRNA"`：`var_names` 是成熟体名（如 `hsa-let-7a-5p`），同一 miRNA 的变异求和；此时 `variant_type` 为空、`iso_*` 按成熟体求和。
+- **`adata.var` 携带 isomiR 类型与序列信息**（variant 粒度）：`sequence` 是 mirtop `Read` 导出的实际 isomiR RNA 序列，`seed_sequence` 是其第 2–8 nt，`sequence_source="mirtop Read"`；另有 `variant_type`（如 `iso_5p` / `iso_3p` / `iso_add3p` / `iso_snp` 或组合）、`iso_5p` / `iso_3p` / `iso_add3p` / `iso_snp`（各变异类型计数）和 `mirna_id`（成熟体名）。
+- **需要成熟体水平汇总时**才显式传 `granularity="miRNA"`：`var_names` 是成熟体名（如 `hsa-let-7a-5p`），同一 miRNA 的变异求和；此时传 `mature_fa="ref/mature_hsa.fa"`，以便 `sequence` / `seed_sequence` 写入 canonical mature sequence；`variant_type` 为空、`iso_*` 按成熟体求和。
 - `adata.uns["mirtop_result"]["stats_log"]` 含 mirtop stats 的变异类型分布（iso_5p / iso_3p / iso_add3p / iso_snp …），用于判断测序质量与加尾修饰偏好。
 
 ## Troubleshooting

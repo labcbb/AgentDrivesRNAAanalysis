@@ -17,6 +17,7 @@ import pandas as pd
 from anndata import AnnData
 
 from ..._registry import register_function
+from .candidates import TARGET_CANDIDATES_UNS_KEY, resolve_target_features
 
 
 STARBASE_MIRNA_TARGET_URL = "https://rnasysu.com/encori/api/miRNATarget/"
@@ -152,13 +153,18 @@ def _query_signature(params: Mapping[str, Any]) -> str:
         "Retrieve miRNA-mRNA target sites from the starBase/ENCORI miRNATarget HTTPS API. "
         "Targets are fetched sequentially to avoid burdening the remote service, saved as local TSV files, "
         "and cached with request parameters in adata.uns['starbase_mirna_targets']. With no explicit mirnas, "
-        "selects significant miRNAs from adata.uns['de_results']."
+        "consumes the deterministic target_candidate_selection result."
     ),
     examples=[
         "adata = sa.target.starbase_mirna_targets(adata, mirnas='hsa-miR-21-5p')",
-        "adata = sa.target.starbase_mirna_targets(adata, adj_p_max=0.05, abs_logfc_min=1)",
+        "adata = sa.target.select_target_candidates(adata); adata = sa.target.starbase_mirna_targets(adata)",
     ],
-    related=["diff.de_analysis", "reference.download_mirtarbase"],
+    related=[
+        "diff.de_analysis",
+        "target.miranda",
+        "target.seed_utr_matches",
+        "reference.download_mirtarbase",
+    ],
     produces={"uns": [STARBASE_UNS_KEY]},
 )
 def starbase_mirna_targets(
@@ -183,12 +189,14 @@ def starbase_mirna_targets(
     timeout: int = 60,
     request_interval: float = 0.5,
     force: bool = False,
+    selection_key: str = TARGET_CANDIDATES_UNS_KEY,
+    allow_all_features: bool = False,
 ) -> AnnData:
     """Fetch and cache starBase miRNA target predictions for selected miRNAs.
 
-    Explicit ``mirnas`` take priority. Otherwise, ``feature_filters`` selects
-    miRNAs from ``adata.var``; otherwise significant miRNAs are selected from
-    ``adata.uns[de_key]``. API requests are intentionally serial.
+    Explicit ``mirnas`` take priority. Otherwise this function consumes the
+    persisted deterministic target-candidate selection. API requests are
+    intentionally serial.
     """
     if not isinstance(adata, AnnData):
         raise TypeError("adata must be an AnnData object")
@@ -202,16 +210,30 @@ def starbase_mirna_targets(
         selection_source = "explicit"
     elif feature_filters:
         selected = _select_var_mirnas(adata, feature_filters)
-        selection_source = "feature_filters"
+        selection_source = "explicit_feature_filters"
     else:
-        selected = _select_de_mirnas(
+        feature_ids = resolve_target_features(
             adata,
-            de_key=de_key,
-            adj_p_max=adj_p_max,
-            abs_logfc_min=abs_logfc_min,
-            top_n=top_n,
+            selection_key=selection_key,
+            allow_all_features=allow_all_features,
         )
-        selection_source = "significant_de"
+        if "rna_type" in adata.var.columns:
+            isomirs = [
+                feature for feature in feature_ids
+                if str(adata.var.loc[feature, "rna_type"] or "").casefold() == "isomir"
+            ]
+            if isomirs:
+                raise ValueError(
+                    "starBase cannot represent observed isomiR sequences. Use target.miranda and "
+                    "target.seed_utr_matches for: " + ", ".join(isomirs[:5])
+                )
+        selected = (
+            adata.var.loc[feature_ids, "mirna_id"].fillna("").astype(str).tolist()
+            if "mirna_id" in adata.var.columns else feature_ids
+        )
+        selected = [mirna for mirna in selected if mirna and mirna.lower() != "nan"]
+        selected = list(dict.fromkeys(selected))
+        selection_source = selection_key
     if not selected:
         raise ValueError("No miRNAs matched the requested target-selection criteria")
 
@@ -266,7 +288,7 @@ def starbase_mirna_targets(
             "selection_source": selection_source,
             "selected_miRNAs": selected,
             "feature_filters": dict(feature_filters or {}),
-            "de_key": de_key if selection_source == "significant_de" else "",
+            "de_key": de_key if selection_source == selection_key else "",
             "adj_p_max": float(adj_p_max),
             "abs_logfc_min": float(abs_logfc_min),
             "records": run_records,

@@ -119,7 +119,8 @@ def test_rank_skill_matches_recognizes_chinese_workflow_aliases():
     registry.load()
 
     assert rank_skill_matches(registry, "我想先去接头再做质控")[0][0].slug == "fastq-qc"
-    assert rank_skill_matches(registry, "查询 miRNA 靶基因")[0][0].slug == "starbase-mirna-targets"
+    assert rank_skill_matches(registry, "查询 miRNA 靶基因")[0][0].slug == "mirna-target-prediction"
+    assert rank_skill_matches(registry, "用 miRanda 做 isomiR 靶标预测")[0][0].slug == "mirna-target-prediction"
 
 
 def test_rank_skill_matches_prefers_explicit_method_over_biological_default():
@@ -282,6 +283,36 @@ def test_execute_code_policy_allows_unpaired_de_code():
     }
     result = _audit_execute_code_policy(messages, arguments)
     assert result == ""
+
+
+def test_execute_code_policy_blocks_stale_web_container_paths():
+    result = _audit_execute_code_policy(
+        [],
+        {
+            "description": "查看工作区",
+            "code": "from pathlib import Path\nPath('/prodapp-output/webapp-tasks/demo').iterdir()",
+        },
+    )
+
+    assert "POLICY_VIOLATION" in result
+    assert "Path.cwd" in result
+
+
+def test_execute_code_policy_blocks_pid_liveness_loop():
+    result = _audit_execute_code_policy(
+        [],
+        {
+            "description": "等待 Bowtie 建索引完成",
+            "code": (
+                "while True:\n"
+                "    os.kill(genome_pid, 0)\n"
+                "    time.sleep(5)\n"
+            ),
+        },
+    )
+
+    assert "POLICY_VIOLATION" in result
+    assert "zombie" in result
 
 
 def test_execute_code_policy_blocks_report_step_without_html_output():

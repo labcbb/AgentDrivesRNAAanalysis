@@ -31,6 +31,11 @@ MATURE_URLS = (
     "https://ins-dvc.s3.amazonaws.com/insdvc/files/md5/c0/fbc0ae2aa8241afeae4b89fea9ed0f",
     f"{MIRBASE_BASE}/mature.fa",
 )
+GFF3_URLS = (
+    "https://mirbase.org/ftp/22.1/genomes/{code}.gff3",
+    "https://www.mirbase.org/ftp/22.1/genomes/{code}.gff3",
+    f"{MIRBASE_BASE}/{{code}}.gff3",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +125,229 @@ def _download_from_sources(
     raise RuntimeError(
         f"Failed to download miRBase data from {len(urls)} sources"
     ) from last_error
+
+
+def _read_fasta_sequences(path: Path) -> Dict[str, str]:
+    """Read FASTA records as DNA strings keyed by the first header token."""
+    records: Dict[str, str] = {}
+    identifier = ""
+    chunks: List[str] = []
+    with open(path, encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if identifier:
+                    records[identifier] = "".join(chunks).upper().replace("U", "T")
+                identifier = line[1:].split()[0]
+                chunks = []
+            else:
+                chunks.append(line)
+    if identifier:
+        records[identifier] = "".join(chunks).upper().replace("U", "T")
+    return {name: sequence for name, sequence in records.items() if sequence}
+
+
+def _parse_gff_attributes(text: str) -> Dict[str, str]:
+    return {
+        key: value
+        for item in text.split(";")
+        if "=" in item
+        for key, value in [item.split("=", 1)]
+    }
+
+
+def _mirtop_gff_issues(gff_path: Path, hairpin_ids: set[str]) -> List[str]:
+    """Return semantic problems that make a GFF3 unusable by mirtop."""
+    primary_ids: set[str] = set()
+    mature_rows: List[tuple[str, Dict[str, str]]] = []
+    malformed = 0
+
+    with open(gff_path, encoding="utf-8") as handle:
+        for raw_line in handle:
+            if raw_line.startswith("#") or not raw_line.strip():
+                continue
+            fields = raw_line.rstrip("\n").split("\t")
+            if len(fields) != 9:
+                malformed += 1
+                continue
+            attrs = _parse_gff_attributes(fields[8])
+            if fields[2] == "miRNA_primary_transcript":
+                identifier = attrs.get("ID")
+                if identifier:
+                    primary_ids.add(identifier)
+            elif fields[2] == "miRNA":
+                mature_rows.append((fields[0], attrs))
+
+    issues: List[str] = []
+    if malformed:
+        issues.append(f"{malformed} malformed GFF3 rows")
+    if primary_ids != hairpin_ids:
+        issues.append(
+            "precursor IDs do not exactly match the hairpin FASTA headers "
+            f"({len(primary_ids)} vs {len(hairpin_ids)})"
+        )
+    if not mature_rows:
+        issues.append("no mature miRNA feature rows")
+    else:
+        broken = [
+            attrs.get("Derives_from", "")
+            for _seqid, attrs in mature_rows
+            if not attrs.get("Name")
+            or attrs.get("Derives_from") not in primary_ids
+            or _seqid != attrs.get("Derives_from")
+        ]
+        if broken:
+            issues.append(
+                f"{len(broken)} mature miRNA rows have a missing or invalid Derives_from precursor"
+            )
+    return issues
+
+
+def _write_mirtop_gff3(
+    output_path: Path,
+    hairpins: Dict[str, str],
+    mature: Dict[str, str],
+) -> Dict[str, int]:
+    """Build a hairpin-coordinate GFF3 with valid mature-to-precursor links."""
+    primary_lines: List[str] = ["##gff-version 3", "##source sRNAgent miRBase mirtop reference"]
+    mature_lines: List[str] = []
+    unmapped = 0
+    ambiguous = 0
+    mapping_index = 0
+
+    for hairpin_id, sequence in hairpins.items():
+        primary_lines.append(f"##sequence-region {hairpin_id} 1 {len(sequence)}")
+        primary_lines.append(
+            f"{hairpin_id}\tsRNAgent\tmiRNA_primary_transcript\t1\t{len(sequence)}\t.\t+\t."
+            f"\tID={hairpin_id};Name={hairpin_id}"
+        )
+
+    for mature_id, mature_sequence in mature.items():
+        mapped_here = 0
+        for hairpin_id, hairpin_sequence in hairpins.items():
+            positions: List[int] = []
+            start = 0
+            while True:
+                position = hairpin_sequence.find(mature_sequence, start)
+                if position < 0:
+                    break
+                positions.append(position)
+                start = position + 1
+            if not positions:
+                continue
+            if len(positions) > 1:
+                ambiguous += 1
+            # mirtop stores one coordinate per (precursor, mature name). The
+            # earliest exact occurrence is deterministic and avoids overwriting
+            # that key in mirtop's parser.
+            position = positions[0]
+            mapping_index += 1
+            mapped_here += 1
+            start_1based = position + 1
+            end_1based = position + len(mature_sequence)
+            mature_lines.append(
+                f"{hairpin_id}\tsRNAgent\tmiRNA\t{start_1based}\t{end_1based}\t.\t+\t."
+                f"\tID={mature_id}.on.{hairpin_id}.{mapping_index};Name={mature_id};"
+                f"Derives_from={hairpin_id}"
+            )
+        if not mapped_here:
+            unmapped += 1
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join([*primary_lines, *mature_lines, ""]), encoding="utf-8")
+    return {
+        "hairpins": len(hairpins),
+        "mature_mirnas": len(mature),
+        "mature_mappings": mapping_index,
+        "unmapped_mature_mirnas": unmapped,
+        "ambiguous_mature_hairpin_hits": ambiguous,
+    }
+
+
+@register_function(
+    aliases=["prepare_mirtop_reference", "mirtop_reference", "prepare_isomir_reference"],
+    category="reference",
+    description=(
+        "Validate a miRBase precursor GFF3 against its hairpin FASTA and, when "
+        "needed, build a mirtop-compatible GFF3 with mature miRNA coordinates "
+        "and valid Derives_from precursor links."
+    ),
+    examples=[
+        'sa.reference.prepare_mirtop_reference("ref/hsa.gff3", "ref/hairpin_hsa.fa", "ref/mature_hsa.fa")',
+    ],
+    related=["reference.download_mirbase", "quant.mirtop"],
+)
+def prepare_mirtop_reference(
+    gff3: str,
+    hairpin_fasta: str,
+    mature_fasta: str,
+    output_path: Optional[str] = None,
+    *,
+    overwrite: bool = False,
+) -> Dict[str, object]:
+    """Return a mirtop-compatible GFF3 for a miRBase hairpin reference.
+
+    miRBase's genome GFF3 often contains precursor records only.  mirtop also
+    requires mature-miRNA coordinates in hairpin space and a ``Derives_from``
+    value that is the exact precursor FASTA identifier.  This function derives
+    those coordinates from release-matched hairpin and mature FASTA files.
+    """
+    source = Path(gff3).expanduser().resolve()
+    hairpin_path = Path(hairpin_fasta).expanduser().resolve()
+    mature_path = Path(mature_fasta).expanduser().resolve()
+    for label, path in (("GFF3", source), ("hairpin FASTA", hairpin_path), ("mature FASTA", mature_path)):
+        if not path.is_file():
+            raise FileNotFoundError(f"{label} not found: {path}")
+
+    hairpins = _read_fasta_sequences(hairpin_path)
+    mature = _read_fasta_sequences(mature_path)
+    if not hairpins:
+        raise ValueError(f"No sequences found in hairpin FASTA: {hairpin_path}")
+    if not mature:
+        raise ValueError(f"No sequences found in mature FASTA: {mature_path}")
+
+    issues_before = _mirtop_gff_issues(source, set(hairpins))
+    target = (
+        Path(output_path).expanduser().resolve()
+        if output_path
+        else source.with_name(f"{source.stem}.mirtop.gff3")
+    )
+    if not issues_before and not output_path:
+        return {
+            "gff3": str(source),
+            "source_gff3": str(source),
+            "rebuilt": False,
+            "issues_before": [],
+            "issues_after": [],
+        }
+
+    if target.is_file() and not overwrite:
+        issues_after = _mirtop_gff_issues(target, set(hairpins))
+        if not issues_after:
+            return {
+                "gff3": str(target),
+                "source_gff3": str(source),
+                "rebuilt": False,
+                "issues_before": issues_before,
+                "issues_after": [],
+            }
+
+    summary = _write_mirtop_gff3(target, hairpins, mature)
+    issues_after = _mirtop_gff_issues(target, set(hairpins))
+    if issues_after:
+        raise RuntimeError(
+            "Generated mirtop GFF3 did not pass validation: " + "; ".join(issues_after)
+        )
+    return {
+        "gff3": str(target),
+        "source_gff3": str(source),
+        "rebuilt": True,
+        "issues_before": issues_before,
+        "issues_after": [],
+        **summary,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -280,9 +508,13 @@ def download_mirbase(
 
         # ── Download species GFF3 ──
         if download_gff3 and not extract_only:
-            gff3_url = f"{MIRBASE_BASE}/{code}.gff3"
             gff3_local = out_dir / f"{code}.gff3"
-            resumable_download(gff3_url, gff3_local, jobs=jobs, force=force)
+            _download_from_sources(
+                tuple(url.format(code=code) for url in GFF3_URLS),
+                gff3_local,
+                jobs=jobs,
+                force=force,
+            )
             result["gff3"] = str(gff3_local)
 
     return result

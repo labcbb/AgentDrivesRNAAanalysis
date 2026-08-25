@@ -14,6 +14,7 @@ dependencies:
   - mirdeep2
   - subread
   - pysam
+  - miranda
   - scanpy
   - scikit-learn
   - statsmodels
@@ -23,6 +24,7 @@ dependencies:
   - networkx
   - jinja2
   - bowtie2>=2.5
+  - biopython
   - infernal>=1.1.4
   - mirtop
   - seqcluster

@@ -96,6 +96,12 @@ _REPORT_STEP_RE = re.compile(r"html\s*报告|html report|report\.html|生成.*ht
 _HTML_OUTPUT_RE = re.compile(r"\.html\b|write_html\(|<html", re.I)
 _FRAGOMICS_CODE_RE = re.compile(r"sa\.fragment\.fragomics\(", re.I)
 _FRAG_RESULT_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*.*sa\.fragment\.fragomics\(", re.M)
+_FOREIGN_WORKSPACE_RE = re.compile(r"/(?:prodapp-output|webapp-tasks)(?:/|\b)", re.I)
+_WRITE_OPEN_RE = re.compile(r"\bopen\(\s*[\"'][^\"']+[\"']\s*,\s*[\"'][wax+]+", re.I)
+_PID_LIVENESS_LOOP_RE = re.compile(
+    r"while\s+(?:True|1)\s*:.*?os\.kill\s*\([^\n]+,\s*0\)",
+    re.I | re.S,
+)
 
 
 class AgentCancelledError(Exception):
@@ -207,6 +213,23 @@ def _audit_execute_code_policy(
     code = str(arguments.get("code") or "")
     description = str(arguments.get("description") or "")
     combined = f"{description}\n{code}"
+    if _FOREIGN_WORKSPACE_RE.search(code):
+        return (
+            "POLICY_VIOLATION: 代码引用了不属于当前执行环境的 /prodapp-output 或 /webapp-tasks 路径。"
+            "请使用当前工作区中的相对路径，或先用 Path.cwd() 解析实际工作目录；不得猜测前端容器路径。"
+        )
+    if _WRITE_OPEN_RE.search(code) and ".parent.mkdir(" not in code and "os.makedirs(" not in code:
+        return (
+            "POLICY_VIOLATION: 写文件前必须先创建目标父目录。请用 "
+            "Path(output_path).parent.mkdir(parents=True, exist_ok=True)，再打开文件写入。"
+        )
+    if _PID_LIVENESS_LOOP_RE.search(code):
+        return (
+            "POLICY_VIOLATION: 禁止用 `while ... os.kill(pid, 0)` 监控后台进程。"
+            "子进程退出后可能保持 zombie 状态，导致该循环无限等待。请使用注册的 sa 工具"
+            "（它会等待并流式输出）；若必须保留同一 Popen 对象，使用 `proc.wait()` 或 `proc.poll()`，"
+            "并在完成后验证所需输出文件。"
+        )
     is_de_code = bool(_DE_CODE_RE.search(combined))
     report_requested = bool(deliverables.get("html_report_requested"))
     if requirements.get("html_report_requested") is not None:
@@ -1084,7 +1107,18 @@ def _build_system_prompt(skill_overview: str, extra_system: str = "") -> str:
         "Treat completed work as reusable state; do not rerun QC, alignment, quantification, "
         "or other expensive steps unless the user explicitly asks to rerun or the required "
         "result is genuinely missing.\n"
-        "9. Call `finish` with a concise summary when done.\n\n"
+        "9. Questions about why or whether a named tool uses an online service, local files, or a cache "
+        "are factual Q&A, not an analysis request or a request to approve a plan. Inspect the registered "
+        "tool or skill source when needed, then answer directly. Clearly distinguish a local Python wrapper, "
+        "a local result cache, and the actual data-service backend. Do not ask the user to choose a backend "
+        "unless they ask to change it.\n"
+        "10. For filesystem code, use workspace-relative paths or resolve from `Path.cwd()`; never guess paths "
+        "from another web/container runtime. Before any file write, create the parent directory with "
+        "`Path(path).parent.mkdir(parents=True, exist_ok=True)`. Inspect the type of an AnnData `.uns` value "
+        "before indexing it. For long external commands, prefer the registered `sa` tool that owns the command "
+        "and waits for it. Do not detach a `subprocess.Popen` process and never monitor a PID with "
+        "`os.kill(pid, 0)`: exited children can remain zombies and make the task wait forever.\n"
+        "11. Call `finish` with a concise summary when done.\n\n"
         "## Registered skills\n"
         f"{skills_block}\n"
     )
@@ -1435,7 +1469,7 @@ class SRNAgent:
             # marker in the stream indefinitely.
             if parsed.get("progressStage"):
                 parsed["stage"] = parsed["progressStage"]
-            elif not _SAMPLE_PROGRESS_RE.search(raw_stream):
+            elif observed.get("hasEvidence") and not _SAMPLE_PROGRESS_RE.search(raw_stream):
                 parsed["stage"] = observed["stage"]
                 parsed["detail"] = observed["detail"]
                 parsed["highlights"] = observed["highlights"]
@@ -1906,10 +1940,12 @@ class SRNAgent:
         history: List[Dict[str, str]],
         *,
         extra_context: str = "",
+        available_artifacts: Optional[List[str]] = None,
         chat_id: str = "",
         save_plan: Optional[Any] = None,
         load_plan: Optional[Any] = None,
         resume: bool = False,
+        route_intent: str = "",
         on_progress: Optional[ProgressCallback] = None,
         cancel_event: Optional[Any] = None,
         code_approval_callback: Optional[CodeApprovalCallback] = None,
@@ -1926,7 +1962,9 @@ class SRNAgent:
             orchestrator.run(
                 history,
                 extra_context=extra_context,
+                available_artifacts=available_artifacts,
                 resume=resume,
+                route_intent=route_intent,
                 on_progress=on_progress,
                 cancel_event=cancel_event,
                 code_approval_callback=code_approval_callback,

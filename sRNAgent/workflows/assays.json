@@ -1,0 +1,368 @@
+{
+  "schema": "srnagent.assay-workflows/v1",
+  "version": 1,
+  "description": "Assay-owned workflow selection. The planner may declare an assay and requested analysis stages, but it must not select a non-default quantifier unless the user explicitly requests that method.",
+  "selection_policy": {
+    "default_rule": "Use the assay default_quantifier when the user has not explicitly selected a supported alternative.",
+    "explicit_method_rule": "A non-default quantifier is selectable only when its requires_explicit_user_request flag is true and the user affirmatively requests one of its request_aliases.",
+    "validation_rule": "Every generated plan step must be in the selected quantifier's allowed_skills. A step in forbidden_skills invalidates the plan before contracts are applied."
+  },
+  "shared_stages": {
+    "differential_expression": {
+      "skill": "differential-analysis",
+      "inputs": ["raw_counts", "group_design_confirmed"],
+      "outputs": ["differential_results"],
+      "requires_user_confirmation": ["group_design_confirmed"]
+    }
+  },
+  "assays": {
+    "mirna": {
+      "display_name": "known miRNA",
+      "modality": "srna",
+      "default_quantifier": "mirdeep2-mirna",
+      "target_prediction": {
+        "skill": "mirna-target-prediction",
+        "workflow_contract": "skills/mirna-target-prediction/plan_contract.json",
+        "default_method": "starbase",
+        "seed_validation": {
+          "tool": "target.seed_utr_matches",
+          "requires": ["three_prime_utr_fasta", "mirna_sequence_metadata"],
+          "role": "optional sequence-level validation of a canonical miRNA target set"
+        },
+        "methods": {
+          "starbase": {
+            "default": true,
+            "requires_explicit_user_request": false,
+            "tool": "target.starbase_mirna_targets",
+            "allowed_features": ["mature_mirna_id"],
+            "forbidden_features": ["isomir_variant"],
+            "requires": ["canonical_mirna_identifier"],
+            "outputs": ["starbase_mirna_targets"]
+          },
+          "miranda": {
+            "default": false,
+            "requires_explicit_user_request": true,
+            "request_aliases": ["miRanda", "本地序列靶标预测", "miRNA 序列靶标预测"],
+            "tool": "target.miranda",
+            "allowed_features": ["mature_mirna_sequence"],
+            "requires": ["mirna_fasta", "three_prime_utr_fasta"],
+            "outputs": ["miranda_targets"]
+          }
+        }
+      },
+      "quantifiers": {
+        "mirdeep2-mirna": {
+          "default": true,
+          "requires_explicit_user_request": false,
+          "request_aliases": ["mirdeep2", "quantify_mirna", "已知 miRNA 定量"],
+          "purpose": "Known mature miRNA quantification. Novel miRNA prediction is not part of this workflow unless separately requested.",
+          "allowed_skills": ["fastq-qc", "reference-download", "mirdeep2-mirna", "differential-analysis"],
+          "forbidden_skills": ["feature-count", "isomir-quantification", "samtools_idxstats", "trax_quantification", "fragment-analysis"],
+          "stages": [
+            {
+              "id": "trim",
+              "skill": "fastq-qc",
+              "when_missing": ["trimmed_fastq"],
+              "inputs": ["raw_fastq", "trim_config_confirmed"],
+              "outputs": ["trimmed_fastq"]
+            },
+            {
+              "id": "references",
+              "skill": "reference-download",
+              "when_missing": ["genome_fasta", "genome_bowtie_index", "mirbase_mature_fasta", "mirbase_hairpin_fasta"],
+              "outputs": ["genome_fasta", "genome_bowtie_index", "mirbase_mature_fasta", "mirbase_hairpin_fasta"]
+            },
+            {
+              "id": "quantify",
+              "skill": "mirdeep2-mirna",
+              "inputs": ["trimmed_fastq", "genome_bowtie_index", "mirbase_mature_fasta", "mirbase_hairpin_fasta"],
+              "outputs": ["mirna_counts", "raw_counts", "mirna_logcpm", "mirna_sequence_metadata"],
+              "ann_data": "srna"
+            }
+          ]
+        },
+        "feature-count": {
+          "default": false,
+          "requires_explicit_user_request": true,
+          "request_aliases": ["使用 featureCounts", "用 featureCounts", "运行 featureCounts", "featureCounts 定量"],
+          "purpose": "Annotation-based miRNA counting from whole-genome-aligned BAM files. This is a supported alternative, not a fallback for missing counts.",
+          "allowed_skills": ["fastq-qc", "reference-download", "alignment-srna", "feature-count", "differential-analysis"],
+          "forbidden_skills": ["mirdeep2-mirna", "isomir-quantification", "samtools_idxstats", "trax_quantification", "fragment-analysis"],
+          "stages": [
+            {
+              "id": "trim",
+              "skill": "fastq-qc",
+              "when_missing": ["trimmed_fastq"],
+              "inputs": ["raw_fastq", "trim_config_confirmed"],
+              "outputs": ["trimmed_fastq"]
+            },
+            {
+              "id": "genomic_references",
+              "skill": "reference-download",
+              "when_missing": ["genome_fasta", "genome_bowtie_index", "genomic_annotation"],
+              "outputs": ["genome_fasta", "genome_bowtie_index", "genomic_annotation"]
+            },
+            {
+              "id": "genome_alignment",
+              "skill": "alignment-srna",
+              "inputs": ["trimmed_fastq", "genome_bowtie_index"],
+              "outputs": ["whole_genome_bam"]
+            },
+            {
+              "id": "quantify",
+              "skill": "feature-count",
+              "inputs": ["whole_genome_bam", "genomic_annotation", "strandedness_confirmed"],
+              "outputs": ["mirna_counts", "raw_counts", "mirna_logcpm"],
+              "ann_data": "srna"
+            }
+          ]
+        }
+      }
+    },
+    "isomir": {
+      "display_name": "isomiR",
+      "modality": "isomir",
+      "default_quantifier": "isomir-quantification",
+      "target_prediction": {
+        "skill": "mirna-target-prediction",
+        "workflow_contract": "skills/mirna-target-prediction/plan_contract.json",
+        "default_method": "miranda",
+        "seed_validation": {
+          "tool": "target.seed_utr_matches",
+          "requires": ["three_prime_utr_fasta", "isomir_sequence"],
+          "forbidden_inputs": ["sample_mirtop_gff", "hairpin_bam"],
+          "role": "required exact-sequence support before target-derived enrichment; only the selected AnnData sequences and UTR FASTA are inputs"
+        },
+        "parent_comparison": {
+          "tool": "target.compare_isomir_parent_targets",
+          "requires": ["isomir_sequence", "parent_mirna_id", "mirbase_mature_fasta", "three_prime_utr_fasta"],
+          "outputs": ["isomir_parent_target_comparison", "isomir_miranda_targets", "parent_mirna_miranda_targets", "isomir_seed_utr_matches", "parent_mirna_seed_utr_matches"],
+          "role": "optional same-method comparison of conserved, isomiR-gained, and parent-lost target genes"
+        },
+        "methods": {
+          "miranda": {
+            "default": true,
+            "requires_explicit_user_request": false,
+            "tool": "target.miranda",
+            "allowed_features": ["isomir_sequence"],
+            "forbidden_features": ["parent_mirna_only"],
+            "requires": ["isomir_fasta", "three_prime_utr_fasta"],
+            "outputs": ["miranda_targets"]
+          },
+          "starbase": {
+            "default": false,
+            "tool": "target.starbase_mirna_targets",
+            "allowed_features": [],
+            "forbidden_features": ["isomir_variant"],
+            "forbidden_reason": "starBase accepts canonical mature miRNA identifiers and cannot represent observed isomiR sequence changes."
+          }
+        }
+      },
+      "quantifiers": {
+        "isomir-quantification": {
+          "default": true,
+          "requires_explicit_user_request": false,
+          "request_aliases": ["mirtop", "isomir", "isoMiR"],
+          "purpose": "Variant-level isomiR quantification from a hairpin-aligned BAM using mirtop.",
+          "allowed_skills": ["fastq-qc", "reference-download", "alignment-srna", "isomir-quantification", "differential-analysis"],
+          "forbidden_skills": ["feature-count", "mirdeep2-mirna", "samtools_idxstats", "trax_quantification", "fragment-analysis"],
+          "stages": [
+            {
+              "id": "trim",
+              "skill": "fastq-qc",
+              "when_missing": ["trimmed_fastq"],
+              "inputs": ["raw_fastq", "trim_config_confirmed"],
+              "outputs": ["trimmed_fastq"]
+            },
+            {
+              "id": "mirbase_references",
+              "skill": "reference-download",
+              "when_missing": ["mirbase_hairpin_fasta", "mirbase_mature_fasta", "mirbase_gff3"],
+              "outputs": ["mirbase_hairpin_fasta", "mirbase_mature_fasta", "mirbase_gff3", "mirtop_reference"]
+            },
+            {
+              "id": "collapse",
+              "skill": "isomir-quantification",
+              "inputs": ["trimmed_fastq"],
+              "outputs": ["collapsed_fastq"]
+            },
+            {
+              "id": "hairpin_alignment",
+              "skill": "alignment-srna",
+              "inputs": ["collapsed_fastq", "mirbase_hairpin_fasta"],
+              "outputs": ["hairpin_bam"]
+            },
+            {
+              "id": "quantify",
+              "skill": "isomir-quantification",
+              "inputs": ["hairpin_bam", "mirtop_reference"],
+              "outputs": ["isomir_counts", "raw_counts", "isomir_variant_metadata", "isomir_stats"],
+              "ann_data": "isomir",
+              "must_use_dedicated_anndata": true
+            }
+          ]
+        }
+      }
+    },
+    "pirna": {
+      "display_name": "piRNA",
+      "modality": "srna",
+      "default_quantifier": "samtools_idxstats",
+      "quantifiers": {
+        "samtools_idxstats": {
+          "default": true,
+          "requires_explicit_user_request": false,
+          "request_aliases": ["samtools idxstats", "idxstats", "piRNA 定量"],
+          "purpose": "Count reads per piRNA FASTA reference sequence after small-RNA-reference alignment.",
+          "allowed_skills": ["fastq-qc", "reference-download", "alignment-srna", "samtools_idxstats", "differential-analysis"],
+          "forbidden_skills": ["feature-count", "mirdeep2-mirna", "isomir-quantification", "trax_quantification", "fragment-analysis"],
+          "stages": [
+            {
+              "id": "trim",
+              "skill": "fastq-qc",
+              "when_missing": ["trimmed_fastq"],
+              "inputs": ["raw_fastq", "trim_config_confirmed"],
+              "outputs": ["trimmed_fastq"]
+            },
+            {
+              "id": "pirna_reference",
+              "skill": "reference-download",
+              "when_missing": ["pirna_fasta", "pirna_bowtie_index"],
+              "outputs": ["pirna_fasta", "pirna_bowtie_index"]
+            },
+            {
+              "id": "reference_alignment",
+              "skill": "alignment-srna",
+              "inputs": ["trimmed_fastq", "pirna_bowtie_index"],
+              "outputs": ["pirna_reference_bam"]
+            },
+            {
+              "id": "quantify",
+              "skill": "samtools_idxstats",
+              "inputs": ["pirna_reference_bam"],
+              "outputs": ["pirna_counts", "raw_counts"],
+              "ann_data": "srna"
+            }
+          ]
+        },
+        "feature-count": {
+          "default": false,
+          "requires_explicit_user_request": true,
+          "request_aliases": ["使用 featureCounts", "用 featureCounts", "运行 featureCounts", "featureCounts 定量"],
+          "purpose": "Annotation-based piRNA counting from a whole-genome BAM when explicitly requested.",
+          "allowed_skills": ["fastq-qc", "reference-download", "alignment-srna", "feature-count", "differential-analysis"],
+          "forbidden_skills": ["mirdeep2-mirna", "isomir-quantification", "samtools_idxstats", "trax_quantification", "fragment-analysis"],
+          "stages": [
+            {
+              "id": "trim",
+              "skill": "fastq-qc",
+              "when_missing": ["trimmed_fastq"],
+              "inputs": ["raw_fastq", "trim_config_confirmed"],
+              "outputs": ["trimmed_fastq"]
+            },
+            {
+              "id": "genomic_references",
+              "skill": "reference-download",
+              "when_missing": ["genome_fasta", "genome_bowtie_index", "genomic_annotation"],
+              "outputs": ["genome_fasta", "genome_bowtie_index", "genomic_annotation"]
+            },
+            {
+              "id": "genome_alignment",
+              "skill": "alignment-srna",
+              "inputs": ["trimmed_fastq", "genome_bowtie_index"],
+              "outputs": ["whole_genome_bam"]
+            },
+            {
+              "id": "quantify",
+              "skill": "feature-count",
+              "inputs": ["whole_genome_bam", "genomic_annotation", "strandedness_confirmed"],
+              "outputs": ["pirna_counts", "raw_counts"],
+              "ann_data": "srna"
+            }
+          ]
+        }
+      }
+    },
+    "trna": {
+      "display_name": "tRNA/tRF",
+      "modality": "srna",
+      "default_quantifier": "trax_quantification",
+      "quantifiers": {
+        "trax_quantification": {
+          "default": true,
+          "requires_explicit_user_request": false,
+          "request_aliases": ["tRAX", "tRNA 定量", "tRF 定量", "tDR 定量"],
+          "purpose": "tRNA-derived-fragment quantification with the tRAX workflow.",
+          "allowed_skills": ["fastq-qc", "reference-download", "trax_quantification", "differential-analysis"],
+          "forbidden_skills": ["feature-count", "mirdeep2-mirna", "isomir-quantification", "samtools_idxstats", "fragment-analysis"],
+          "stages": [
+            {
+              "id": "trim",
+              "skill": "fastq-qc",
+              "when_missing": ["trimmed_fastq"],
+              "inputs": ["raw_fastq", "trim_config_confirmed"],
+              "outputs": ["trimmed_fastq"]
+            },
+            {
+              "id": "trax_reference",
+              "skill": "reference-download",
+              "when_missing": ["trnadb"],
+              "outputs": ["trnadb"]
+            },
+            {
+              "id": "quantify",
+              "skill": "trax_quantification",
+              "inputs": ["trimmed_fastq", "trnadb"],
+              "outputs": ["trna_fragment_counts", "raw_counts"],
+              "ann_data": "srna"
+            }
+          ]
+        }
+      }
+    },
+    "fragmentomics": {
+      "display_name": "fragmentomics",
+      "modality": "fragmentomics",
+      "default_quantifier": "fragment-analysis",
+      "quantifiers": {
+        "fragment-analysis": {
+          "default": true,
+          "requires_explicit_user_request": false,
+          "request_aliases": ["fragmentomics", "片段组学", "fragment-analysis"],
+          "purpose": "Genome-aligned small-RNA fragment feature extraction in an independent fragmentomics AnnData.",
+          "allowed_skills": ["fastq-qc", "reference-download", "alignment-srna", "fragment-analysis", "differential-analysis"],
+          "forbidden_skills": ["feature-count", "mirdeep2-mirna", "isomir-quantification", "samtools_idxstats", "trax_quantification"],
+          "stages": [
+            {
+              "id": "trim",
+              "skill": "fastq-qc",
+              "when_missing": ["trimmed_fastq"],
+              "inputs": ["raw_fastq", "trim_config_confirmed"],
+              "outputs": ["trimmed_fastq"]
+            },
+            {
+              "id": "genomic_references",
+              "skill": "reference-download",
+              "when_missing": ["genome_fasta", "genome_bowtie_index"],
+              "outputs": ["genome_fasta", "genome_bowtie_index"]
+            },
+            {
+              "id": "genome_alignment",
+              "skill": "alignment-srna",
+              "inputs": ["trimmed_fastq", "genome_bowtie_index"],
+              "outputs": ["whole_genome_bam"]
+            },
+            {
+              "id": "quantify",
+              "skill": "fragment-analysis",
+              "inputs": ["whole_genome_bam", "genome_fasta"],
+              "outputs": ["fragmentomics_counts", "raw_counts"],
+              "ann_data": "fragmentomics",
+              "must_use_dedicated_anndata": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}

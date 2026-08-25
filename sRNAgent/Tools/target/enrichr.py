@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import pandas as pd
@@ -14,7 +15,8 @@ from ..._registry import register_function
 
 
 ENRICHR_UNS_KEY = "enrichr"
-DEFAULT_GENE_SET = "KEGG_2016"
+DEFAULT_GENE_SET = None
+DEFAULT_GMT_DIR = Path("references/msigdb")
 _ORGANISM_ALIASES = {
     "human": "human",
     "homo sapiens": "human",
@@ -47,6 +49,13 @@ def _normalise_organism(organism: str) -> str:
     if not value:
         raise ValueError("organism must be provided")
     return _ORGANISM_ALIASES.get(value, value)
+
+
+def _result_key(value: str) -> str:
+    key = str(value or "").strip()
+    if not key:
+        raise ValueError("result_key must be a non-empty AnnData uns key")
+    return key
 
 
 def _serialise_gene_sets(gene_sets: str | Sequence[str] | Mapping[str, Any]) -> Any:
@@ -89,6 +98,38 @@ def _load_gseapy():
     return gp
 
 
+def _resolve_local_gene_sets(gene_sets: Any) -> tuple[Any, List[str]]:
+    """Resolve local GMT/dict inputs without allowing an Enrichr API library."""
+    if gene_sets is None:
+        files = sorted(DEFAULT_GMT_DIR.expanduser().glob("*.symbols.gmt"))
+        if not files:
+            files = sorted(DEFAULT_GMT_DIR.expanduser().glob("*.gmt"))
+        preferred = [path for path in files if "kegg" in path.name.lower()]
+        preferred += [path for path in files if "go.bp" in path.name.lower() and path not in preferred]
+        files = preferred or files
+        if not files:
+            raise FileNotFoundError(
+                f"No local MSigDB GMT found under {DEFAULT_GMT_DIR}. "
+                "Run sa.download.download_msigdb(...) first or pass gene_sets='/path/to/file.gmt'."
+            )
+        gene_sets = str(files[0])
+
+    if isinstance(gene_sets, Mapping):
+        return gene_sets, ["<mapping>"]
+    values = [gene_sets] if isinstance(gene_sets, (str, Path)) else list(gene_sets)
+    paths = [Path(value).expanduser() for value in values]
+    if not paths or any(path.suffix.lower() != ".gmt" for path in paths):
+        raise ValueError(
+            "Local enrichment requires a .gmt file path or a gene-set mapping; "
+            "Enrichr library names such as 'KEGG_2016' are not accepted."
+        )
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Local GMT file not found: {', '.join(missing)}")
+    resolved = [str(path.resolve()) for path in paths]
+    return resolved, resolved
+
+
 @register_function(
     aliases=[
         "enrichr", "enrichr_enrichment", "gene_set_enrichment", "pathway_enrichment",
@@ -96,57 +137,68 @@ def _load_gseapy():
     ],
     category="target",
     description=(
-        "Run GSEApy Enrichr over a supplied gene list and store the result table and full query metadata in "
-        "adata.uns['enrichr']. The default is human KEGG_2016. Human/Mouse capitalization and common aliases "
-        "are normalized for current GSEApy compatibility. Reuses the stored result for an unchanged query unless "
+        "Run GSEApy's local GMT Enrichr-compatible enrichment over a supplied gene list and store the result table "
+        "and full query metadata in adata.uns['enrichr']. A downloaded GMT under references/msigdb is used by "
+        "default. Human/Mouse capitalization and common aliases are retained as metadata. Reuses the stored result "
+        "for an unchanged query unless "
         "force=True."
     ),
     examples=[
-        "adata = sa.target.enrichr(adata, ['TP53', 'BRCA1', 'EGFR'])",
-        "adata = sa.target.enrichr(adata, genes, gene_sets='KEGG_2021_Human', organism='Human')",
+        "adata = sa.target.enrichr(adata, ['TP53', 'BRCA1', 'EGFR'], gene_sets='references/msigdb/c2.cp.kegg_legacy.symbols.gmt')",
+        "adata = sa.target.enrichr(adata, genes, gene_sets='references/msigdb/custom.symbols.gmt', organism='Human')",
     ],
-    related=["target.starbase_mirna_targets", "download.download_msigdb"],
+    related=[
+        "target.starbase_mirna_targets",
+        "target.miranda",
+        "target.seed_utr_matches",
+        "download.download_msigdb",
+    ],
     produces={"uns": [ENRICHR_UNS_KEY]},
 )
 def enrichr(
     adata: AnnData,
     genes: str | Sequence[str],
     *,
-    gene_sets: str | Sequence[str] | Mapping[str, Any] = DEFAULT_GENE_SET,
+    gene_sets: Optional[str | Sequence[str] | Mapping[str, Any]] = DEFAULT_GENE_SET,
     organism: str = "human",
     background: Optional[str | int | Sequence[str]] = None,
     cutoff: float = 0.05,
     force: bool = False,
+    result_key: str = ENRICHR_UNS_KEY,
 ) -> AnnData:
-    """Run Enrichr enrichment and store the result in ``adata.uns``.
+    """Run GSEApy's offline Enrichr-compatible enrichment and store the result in ``adata.uns``.
 
-    ``genes`` accepts one symbol or a sequence. The default query is human
-    ``KEGG_2016``; pass any Enrichr library name for a different collection.
-    Common human and mouse aliases are normalized before the GSEApy call.
+    ``genes`` accepts one symbol or a sequence. ``gene_sets`` must be a local
+    ``.gmt`` path or a gene-set mapping. If omitted, a downloaded GMT under
+    ``references/msigdb`` is selected. Enrichr library names are deliberately
+    rejected so this function cannot access the online Enrichr service. Set
+    ``result_key`` to preserve multiple enrichment contrasts in one AnnData.
     """
     if not isinstance(adata, AnnData):
         raise TypeError("adata must be an AnnData object")
     if float(cutoff) < 0 or float(cutoff) > 1:
         raise ValueError("cutoff must be between 0 and 1")
+    state_key = _result_key(result_key)
 
     selected_genes = _normalise_genes(genes)
     normalized_organism = _normalise_organism(organism)
-    signature = _run_signature(selected_genes, gene_sets, normalized_organism, background, float(cutoff))
-    existing = adata.uns.get(ENRICHR_UNS_KEY)
+    local_gene_sets, gene_set_metadata = _resolve_local_gene_sets(gene_sets)
+    signature = _run_signature(selected_genes, gene_set_metadata, normalized_organism, background, float(cutoff))
+    existing = adata.uns.get(state_key)
     if isinstance(existing, Mapping) and not force and existing.get("signature") == signature and "results" in existing:
         state = dict(existing)
         last_run = dict(state.get("last_run") or {})
         last_run["reused"] = True
         last_run["completed_at"] = _utc_now()
         state["last_run"] = last_run
-        adata.uns[ENRICHR_UNS_KEY] = state
+        adata.uns[state_key] = state
         return adata
 
     gp = _load_gseapy()
     try:
         run = gp.enrichr(
             gene_list=selected_genes,
-            gene_sets=gene_sets,
+            gene_sets=local_gene_sets,
             organism=normalized_organism,
             outdir=None,
             background=background,
@@ -154,21 +206,22 @@ def enrichr(
             no_plot=True,
             verbose=False,
         )
-    except Exception as exc:  # noqa: BLE001 - retain remote Enrichr failure context
-        raise RuntimeError(f"Enrichr query failed: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001 - retain local GSEApy failure context
+        raise RuntimeError(f"Local GMT enrichment failed: {exc}") from exc
     results = getattr(run, "results", None)
     if not isinstance(results, pd.DataFrame):
         raise RuntimeError("GSEApy Enrichr completed without returning a results DataFrame")
 
     result_table = results.copy()
     parameters: Dict[str, Any] = {
-        "gene_sets": _serialise_gene_sets(gene_sets),
+        "gene_sets": gene_set_metadata,
         "organism": normalized_organism,
         "background": background if isinstance(background, (str, int)) or background is None else list(background),
         "cutoff": float(cutoff),
+        "result_key": state_key,
     }
-    adata.uns[ENRICHR_UNS_KEY] = {
-        "tool": "gseapy.enrichr",
+    adata.uns[state_key] = {
+        "tool": "gseapy.enrichr.local_gmt",
         "gseapy_version": str(getattr(gp, "__version__", "unknown")),
         "signature": signature,
         "input_genes": selected_genes,

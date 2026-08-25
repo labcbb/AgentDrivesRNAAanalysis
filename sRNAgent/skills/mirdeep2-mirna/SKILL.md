@@ -89,17 +89,15 @@ sa.alignment.bowtie_build("ref/GRCh38.primary_assembly.genome.fa", "ref/grch38",
 >
 > miRDeep2 的 `mapper.pl` 内置了 adapter 剪切功能（`adapter=` 参数）。如果 adapter 序列给错，reads 无法正确比对到基因组，miRNA 定量和 novel miRNA 预测都会失败。
 >
-> **Agent 行动要求：不要默认使用 TruSeq 的 adapter！必须先问用户：**
-> 1. 询问用户使用的建库试剂盒名称
-> 2. 让用户确认是否使用下面的默认序列，还是自己指定
-> 3. 如果用户不确定，让对方查一下实验方法的 "Library preparation" 部分
+> **Agent 行动要求：不要默认使用任何 adapter。必须先取得建库元数据、既有 cutadapt 配置、FastQC 证据或用户明确指定的序列。**
+> 当元数据明确为 NEBNext Small RNA 时，应主动建议完整 read 1 adapter `AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC`；`AGATCGGAAGAGCACACGTCTGAACTC` 是其前缀，不是通用更优值。
 >
 > **建议在 cutadapt 中完成 adapter 剪切**（见 `fastq-qc` skill），`mapper.pl` 中不再重复做，分工更清晰。若需要 mapper.pl 做 adapter 剪切，务必先让用户确认正确的 adapter 序列：
 >
 > | 建库试剂盒 | 3' adapter 序列 |
 > |-----------|----------------|
 > | TruSeq Small RNA (Illumina) | `TGGAATTCTCGGGTGCCAAGG` |
-> | NEBNext Small RNA | `AGATCGGAAGAGCACACGTCTGAAC` |
+> | NEBNext Small RNA | `AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC` |
 > | QIAseq miRNA | `AACTGTAGGCACCATCAAT` |
 > | SMARTer smRNA-Seq | `GTTCAGAGTTCTACAGTCCGACGATC` |
 
@@ -184,6 +182,7 @@ adata = sa.quant.quantify_mirna(adata, genome_index="ref/grch38",
 # adata.X 是 count 矩阵，adata.var_names 是 miRNA 名称
 print(f"Count matrix shape: {adata.X.shape}")
 print(f"miRNA IDs: {adata.var['mirna_id'].tolist()[:5]}")
+print(adata.var[["sequence", "seed_sequence"]].head())
 
 # 查看 log2(CPM+1) 标准化表达量
 print(f"Normalized counts (log2 CPM): shape = {adata.layers['logcpm'].shape}")
@@ -409,6 +408,8 @@ print(f"Novel miRNA report: {adata.obs['prediction_html'].iloc[0]}")
 # adata.layers["counts"] : 原始 count 矩阵
 # adata.layers["logcpm"] : log2(CPM+1) 标准化表达量 (CPM = counts per million)
 # adata.var["mirna_id"] : miRNA 名称, 如 hsa-let-7a-5p
+# adata.var["sequence"] : miRBase mature RNA sequence
+# adata.var["seed_sequence"] : sequence 的第 2-8 nt，可直接用于靶标预测
 # adata.var["rna_type"] : miRNA
 
 # adata.uns["genome_index"] : "ref/grch38"

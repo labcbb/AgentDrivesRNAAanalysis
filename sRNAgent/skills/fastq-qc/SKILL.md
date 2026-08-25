@@ -24,7 +24,7 @@ The typical sRNA-seq workflow:
 Raw FASTQ (.fastq.gz)
     │
     ▼
-cutadapt ─── 3' adapter removal  (TGGAATTCTCGGGTGCCAAGG)
+cutadapt ─── 3' adapter removal  (evidence-backed sequence only)
            ─── quality trimming   (-q 20)
            ─── length filter      (-m 18 -M 36)
     │
@@ -69,11 +69,11 @@ Each sample in `adata.obs.index` becomes a row that the pipeline populates with 
 > sRNA-seq 文库构建时，3' adapter 被连接在 insert 两端，测序后 adapter 直接跟在 insert 后面。
 > **如果 adapter 序列给错，cutadapt 无法正确切除接头，大部分 reads 无法比对到基因组，整个分析失败。**
 >
-> **Agent 行动要求：把 TruSeq 默认值作为待确认提案，而不是当作已知事实。必须在运行前向用户展示：**
-> 1. 当前检测到的建库试剂盒名称；没有记录时明确说明默认提案是 TruSeq Small RNA
-> 2. 3' adapter、最小/最大长度、质量阈值、匹配参数及输出/JSON 留痕设置，让用户确认或逐项修改
-> 3. 如果用户不确定，让对方查一下实验方法的 "Library preparation" 部分
-> 4. 如果完全无法确定，可以建议先跑 FastQC 查看 Overrepresented Sequences
+> **Agent 行动要求：绝不按默认值选择 adapter。必须在运行前展示：**
+> 1. 建库试剂盒、已有 cutadapt 配置或 FastQC overrepresented-sequences 中的可追溯证据
+> 2. 3' adapter、其证据来源、最小/最大长度、质量阈值、匹配参数及输出/JSON 留痕设置
+> 3. 若证据不足，明确将 adapter 保持为“未记录”，请用户提供实验方法的 "Library preparation" 信息或序列；不得执行 cutadapt
+> 4. 当元数据明确为 NEBNext Small RNA 时，应主动说明并建议完整的 read 1 adapter `AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC`；`AGATCGGAAGAGCACACGTCTGAACTC` 是其前缀，不是通用更优值
 >
 > 常见 3' adapter 序列参考（供用户选择）：
 >
@@ -81,7 +81,7 @@ Each sample in `adata.obs.index` becomes a row that the pipeline populates with 
 > |-----------|----------------|
 > | TruSeq Small RNA (Illumina) | `TGGAATTCTCGGGTGCCAAGG` |
 > | NEXTflex Small RNA | `TGGAATTCTCGGGTGCCAAGG` (通常相同) |
-> | NEBNext Small RNA | `AGATCGGAAGAGCACACGTCTGAAC` |
+> | NEBNext Small RNA | `AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC` |
 > | QIAseq miRNA | `AACTGTAGGCACCATCAAT` |
 > | SMARTer smRNA-Seq | `GTTCAGAGTTCTACAGTCCGACGATC` |
 
@@ -92,7 +92,7 @@ sRNA-seq libraries use a specific 3' adapter that must be removed:
 ```python
 adata = sa.fastq.cutadapt(
     adata,
-    adapter_3="TGGAATTCTCGGGTGCCAAGG",  # TruSeq Small RNA 3' adapter
+    adapter_3="<confirmed 3' adapter>",
     min_length=18,     # miRNA minimal length
     max_length=36,     # small RNA maximal length
     quality_cutoff="20",

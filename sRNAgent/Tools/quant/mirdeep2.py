@@ -217,6 +217,39 @@ def _aggregate_mirna_counts(csv_path: Path) -> Dict[str, int]:
     return dict(counts)
 
 
+def _normalise_rna_sequence(sequence: str) -> str:
+    """Store mature/small-RNA sequences in canonical RNA alphabet."""
+    return "".join(str(sequence or "").split()).upper().replace("T", "U")
+
+
+def _load_mature_sequences(mature_fa: str) -> Dict[str, str]:
+    """Read miRBase mature FASTA into ``{miRNA ID: RNA sequence}`` mapping."""
+    path = Path(mature_fa).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"mature miRNA FASTA not found: {path}")
+    opener = gzip.open if path.suffix.lower() == ".gz" else open
+    sequences: Dict[str, str] = {}
+    identifier = ""
+    chunks: List[str] = []
+    with opener(path, "rt", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if identifier:
+                    sequences.setdefault(identifier, _normalise_rna_sequence("".join(chunks)))
+                identifier = line[1:].split()[0]
+                chunks = []
+            else:
+                chunks.append(line)
+    if identifier:
+        sequences.setdefault(identifier, _normalise_rna_sequence("".join(chunks)))
+    if not sequences:
+        raise ValueError(f"No mature miRNA sequences found in {path}")
+    return sequences
+
+
 def _relocate_all_samples_csv(out_dir: Path, sample_dir: Path) -> None:
     """Move ``miRNAs_expressed_all_samples_*.csv`` into ``sample_dir``.
 
@@ -429,7 +462,7 @@ def _build_sample_list(adata: AnnData) -> List[Tuple[str, str]]:
         "known miRNAs against miRBase. Writes results into the AnnData "
         "object: ``adata.obs`` (collapsed_path, arf_path, counts_csv), "
         "``adata.X`` and ``adata.layers['counts']`` (count matrix, samples x "
-        "miRNA features), ``adata.var['mirna_id']``, and ``adata.uns`` "
+        "miRNA features), ``adata.var['mirna_id']`` / ``['sequence']`` / ``['seed_sequence']``, and ``adata.uns`` "
         "(reference paths)."
     ),
     examples=[
@@ -442,7 +475,7 @@ def _build_sample_list(adata: AnnData) -> List[Tuple[str, str]]:
     ],
     produces={
         "obs": ["collapsed_path", "arf_path", "counts_csv"],
-        "var": ["mirna_id"],
+        "var": ["mirna_id", "sequence", "seed_sequence", "sequence_source"],
         "uns": ["genome_index", "mature_fa", "hairpin_fa", "species"],
         "layers": ["counts", "logcpm"],
     },
@@ -515,6 +548,7 @@ def quantify_mirna(
         ``.layers["logcpm"]`` (log2(CPM+1)), ``.var``, and ``.uns``.
     """
     sample_list = _build_sample_list(adata)
+    mature_sequences = _load_mature_sequences(mature_fa)
 
     def _process(item: Tuple[str, str]) -> Dict:
         name, fq = item
@@ -571,6 +605,15 @@ def quantify_mirna(
     # miRNA features; different RNA types are appended in the shared counts layer.
     mirna_var = pd.DataFrame(index=all_mirnas)
     mirna_var["mirna_id"] = all_mirnas
+    mirna_var["sequence"] = [mature_sequences.get(mirna, pd.NA) for mirna in all_mirnas]
+    mirna_var["seed_sequence"] = [
+        sequence[1:8] if isinstance(sequence, str) and len(sequence) >= 8 else pd.NA
+        for sequence in mirna_var["sequence"]
+    ]
+    mirna_var["sequence_source"] = [
+        "miRBase mature FASTA" if isinstance(sequence, str) else pd.NA
+        for sequence in mirna_var["sequence"]
+    ]
     adata = store_count_matrix(
         adata,
         np.asarray(count_matrix, dtype=np.float64),

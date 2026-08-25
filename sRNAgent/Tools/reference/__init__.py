@@ -9,7 +9,7 @@ from importlib import import_module
 
 from .genome import download_genome, download_gtf, download_ncrna, list_species
 from .mir_target import download_mirtarbase, list_mirtarbase_species
-from .mirbase import download_mirbase, list_mirbase_codes
+from .mirbase import download_mirbase, list_mirbase_codes, prepare_mirtop_reference
 from .piRBase import download_pirna, list_pirna_species
 from .tRNAdb import (
     build_trnadb,
@@ -28,6 +28,7 @@ __all__ = [
     "extract_three_prime_utr",
     "list_mirbase_codes",
     "download_mirbase",
+    "prepare_mirtop_reference",
     "list_pirna_species",
     "download_pirna",
     "list_mirtarbase_species",

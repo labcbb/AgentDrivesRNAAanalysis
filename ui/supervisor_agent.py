@@ -215,14 +215,35 @@ def _parse_json_object(text: str) -> Optional[Dict[str, Any]]:
             return payload
     except json.JSONDecodeError:
         pass
-    match = re.search(r"\{[\s\S]*\}", raw)
-    if not match:
-        return None
-    try:
-        payload = json.loads(match.group(0))
-        return payload if isinstance(payload, dict) else None
-    except json.JSONDecodeError:
-        return None
+    depth = 0
+    start: Optional[int] = None
+    escaped = False
+    in_string = False
+    for index, char in enumerate(raw):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                try:
+                    payload = json.loads(raw[start:index + 1])
+                    if isinstance(payload, dict):
+                        return payload
+                except json.JSONDecodeError:
+                    start = None
+    return None
 
 
 def _build_client(body: Dict[str, Any]):
@@ -266,7 +287,20 @@ def assess_code_risk(
     }
 
 
-def build_supervisor_context(chat_id: str) -> str:
+def _errors_for_run(errors: Dict[str, Any], run_id: str = "") -> List[Dict[str, Any]]:
+    """Return only errors that belong to a report's run, never old task noise."""
+    events = errors.get("events") if isinstance(errors.get("events"), list) else []
+    target = str(run_id or "").strip()
+    if not target:
+        return [item for item in events if isinstance(item, dict)]
+    return [
+        item for item in events
+        if isinstance(item, dict)
+        and str((item.get("context") or {}).get("runId") or "").strip() == target
+    ]
+
+
+def build_supervisor_context(chat_id: str, *, run_id: str = "") -> str:
     chat_id = sanitize_chat_id(chat_id)
     plan = load_plan(chat_id)
     memory = load_session_memory(chat_id)
@@ -308,8 +342,8 @@ def build_supervisor_context(chat_id: str) -> str:
     arts = memory.get("artifacts") or []
     if arts:
         parts.append("会话登记产物：\n- " + "\n- ".join(str(a) for a in arts[:40]))
-    err_events = errors.get("events") if isinstance(errors, dict) else None
-    if isinstance(err_events, list) and err_events:
+    err_events = _errors_for_run(errors, run_id)
+    if err_events:
         parts.append("错误记录：")
         for item in err_events[-12:]:
             parts.append(f"- {item.get('kind')}: {item.get('summary')}")
@@ -531,7 +565,7 @@ def stream_supervisor_chat(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         yield {"type": "error", "message": str(exc)}
 
 
-def _heuristic_report(chat_id: str) -> Dict[str, Any]:
+def _heuristic_report(chat_id: str, *, run_id: str = "") -> Dict[str, Any]:
     plan = load_plan(chat_id)
     memory = load_session_memory(chat_id)
     errors = load_session_errors(chat_id)
@@ -559,7 +593,7 @@ def _heuristic_report(chat_id: str) -> Dict[str, Any]:
                     }
                 )
     err_out = []
-    for item in (errors.get("events") or [])[-20:]:
+    for item in _errors_for_run(errors, run_id)[-20:]:
         err_out.append(
             {
                 "summary": item.get("summary") or item.get("kind"),
@@ -598,7 +632,7 @@ def generate_run_report(
 ) -> Dict[str, Any]:
     chat_id = sanitize_chat_id(chat_id)
     task_id = str(run_id or "").strip()
-    evidence = build_supervisor_context(chat_id)
+    evidence = build_supervisor_context(chat_id, run_id=task_id)
     if final_text:
         evidence += f"\n\n最终回复摘要：\n{final_text[:2000]}"
     if task_id:
@@ -618,21 +652,34 @@ def generate_run_report(
         }
 
     if not llm_body:
-        return append_task_report(chat_id, _as_task(_heuristic_report(chat_id)))
+        return append_task_report(chat_id, _as_task(_heuristic_report(chat_id, run_id=task_id)))
 
     try:
         client = _build_client(llm_body)
-        completion = client.complete(
-            [
-                {"role": "system", "content": _SYSTEM_REPORT},
-                {"role": "user", "content": evidence[:14000]},
-            ],
-            tools=None,
-            enable_thinking=False,
-        )
+        report_messages = [
+            {"role": "system", "content": _SYSTEM_REPORT},
+            {"role": "user", "content": evidence[:14000]},
+        ]
+        completion = client.complete(report_messages, tools=None, enable_thinking=False)
         parsed = _parse_json_object(completion.content)
         if not parsed:
-            report = _heuristic_report(chat_id)
+            repaired = client.complete(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Return only one valid JSON object matching the requested report schema. "
+                            "Repair the supplied invalid JSON without adding Markdown or commentary."
+                        ),
+                    },
+                    {"role": "user", "content": str(completion.content or "")[:12000]},
+                ],
+                tools=None,
+                enable_thinking=False,
+            )
+            parsed = _parse_json_object(repaired.content)
+        if not parsed:
+            report = _heuristic_report(chat_id, run_id=task_id)
             report["notes"] = list(report.get("notes") or []) + ["监管者 JSON 解析失败，已回退启发式报告"]
             return append_task_report(chat_id, _as_task(report))
         report = {
@@ -647,7 +694,7 @@ def generate_run_report(
         return append_task_report(chat_id, _as_task(report))
     except Exception as exc:  # noqa: BLE001
         logger.warning("generate_run_report failed: %s", exc)
-        report = _heuristic_report(chat_id)
+        report = _heuristic_report(chat_id, run_id=task_id)
         report["notes"] = list(report.get("notes") or []) + [f"监管者报告失败：{exc}"]
         return append_task_report(chat_id, _as_task(report))
 

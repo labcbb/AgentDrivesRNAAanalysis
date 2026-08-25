@@ -23,17 +23,108 @@ from sRNAgent.agent.plan_orchestrator import (  # noqa: E402
     _build_planner_system_prompt,
     _context_has_counts_for_modality,
     _derive_requested_scope,
+    _enforce_workflow_contracts,
+    _ensure_group_metadata_preflight,
     _enforce_requested_scope,
     _expand_plan_prerequisites,
+    _user_explicitly_requests_feature_count,
     _load_planning_skill_guidance,
     _load_skill_plan_contracts,
     _order_de_workflow_steps,
+    _parse_plan_json,
     _resolve_analysis_policy,
     _resolve_deliverables_policy,
     _resolve_requirements_policy,
+    _is_conversational_query,
     _is_read_only_query,
     _strip_unrequested_html_report,
 )
+
+
+def test_plan_json_parser_reports_a_controlled_error_for_malformed_output():
+    from sRNAgent.agent.plan_orchestrator import PlanJsonParseError
+
+    try:
+        _parse_plan_json('{"goal": "broken", "steps": [{"title": "x"}]')
+    except PlanJsonParseError as exc:
+        assert "invalid JSON" in str(exc)
+        assert exc.raw.startswith('{"goal"')
+    else:
+        raise AssertionError("malformed planner output should not parse")
+
+
+def test_plan_progress_event_keeps_a_running_step_snapshot():
+    """Queued plan events must not be changed by later lifecycle transitions."""
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    received = []
+
+    class Agent:
+        def _emit_progress(self, callback, event_type, **payload):
+            callback({"type": event_type, **payload})
+
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = Agent()
+    plan = {"steps": [{"id": "1", "status": "running"}]}
+    orchestrator._emit(received.append, "plan_step_start", plan=plan)
+    plan["steps"][0]["status"] = "done"
+
+    assert received[0]["plan"]["steps"][0]["status"] == "running"
+
+
+def test_plan_lifecycle_persists_only_completed_artifact_outputs():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "trim", "status": "done", "outputs": ["trimmed_fastq"]},
+            {"id": "align", "status": "pending", "outputs": ["genome_bam"]},
+        ]
+    }
+
+    PlanOrchestrator._normalize_plan_lifecycle(plan)
+
+    assert plan["artifactState"] == {
+        "schema": "srnagent.artifacts/v1",
+        "available": ["trimmed_fastq"],
+        "provenance": {"trimmed_fastq": "trim"},
+    }
+
+
+def test_plan_json_completion_repairs_one_malformed_llm_response():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    class Completion:
+        def __init__(self, content):
+            self.content = content
+
+    class Agent:
+        skill_registry = None
+
+        def __init__(self):
+            self.responses = ['{"goal":"broken", "steps":[{"title":"x"}]', '{"goal":"ok","steps":[]}']
+
+        def _llm_complete_cancellable(self, *args, **kwargs):
+            return Completion(self.responses.pop(0))
+
+        def _emit_progress(self, *args, **kwargs):
+            return None
+
+    orchestrator = PlanOrchestrator(Agent())
+    parsed = orchestrator._complete_plan_json(
+        [{"role": "user", "content": "task"}],
+        on_progress=None,
+        cancel_event=None,
+    )
+
+    assert parsed["goal"] == "ok"
+
+
+def test_tool_backend_question_is_direct_conversation_not_a_plan_request():
+    assert _is_conversational_query("enrichr为什么需要在线API，我不是用的本地的吗")
+    assert _is_conversational_query("这个工具是否使用本地注释数据库？")
+    assert _is_conversational_query("这个isomir的序列，是真实的不同于miRNA的mature序列的吧")
+    assert not _is_conversational_query("下载参考基因组并运行 miRNA 定量")
 
 
 def test_requested_scope_drops_unsolicited_fragmentomics_and_pirna_steps():
@@ -214,6 +305,65 @@ def test_plain_approval_cannot_close_a_group_gate_with_unknown_configuration():
     assert restored["steps"][0]["approval"]["lastResponse"] == "可以"
 
 
+def test_unknown_group_approval_gets_read_only_metadata_preflight_first():
+    plan = {
+        "steps": [
+            {
+                "id": "1",
+                "title": "确认差异分析样本分组与统计设计",
+                "status": "awaiting_approval",
+                "approval": {
+                    "id": "confirm-group-from-metadata",
+                    "review": {"fields": [
+                        {"source": "group_column", "unknown": "未记录"},
+                        {"source": "group_counts", "unknown": "未记录"},
+                        {"source": "control_group", "unknown": "未记录"},
+                        {"source": "analysis_design", "value": "unpaired"},
+                    ]},
+                },
+            },
+            {"id": "2", "title": "差异分析", "status": "pending", "depends_on": ["1"]},
+        ]
+    }
+
+    assert _ensure_group_metadata_preflight(plan) is True
+
+    preflight, gate, de_step = plan["steps"]
+    assert preflight["id"] == "1-group-preflight"
+    assert preflight["status"] == "pending"
+    assert "fastq-dl" in preflight["goal"]
+    assert gate["status"] == "awaiting_approval"
+    assert gate["approval"]["id"] == "confirm-groups-before-de"
+    assert gate["depends_on"] == ["1-group-preflight"]
+    assert de_step["depends_on"] == ["1"]
+
+
+def test_legacy_group_gate_cannot_consume_bare_approval_before_preflight():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认差异分析样本分组与统计设计",
+            "status": "awaiting_approval",
+            "approval": {
+                "id": "confirm-group-from-metadata",
+                "review": {"fields": [
+                    {"source": "group_column", "unknown": "未记录"},
+                    {"source": "group_counts", "unknown": "未记录"},
+                    {"source": "control_group", "unknown": "未记录"},
+                    {"source": "analysis_design", "value": "unpaired"},
+                ]},
+            },
+        }]
+    }
+    _ensure_group_metadata_preflight(plan)
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以")
+
+    assert restored["steps"][1]["status"] == "awaiting_approval"
+    assert restored["steps"][1]["approval"]["lastResponse"] == "可以"
+
+
 def test_group_gate_hydrates_preflight_values_and_accepts_natural_confirmation():
     from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
 
@@ -290,6 +440,7 @@ def test_isomir_trimmed_fastq_rebuild_inserts_collapse_before_alignment():
         _load_skill_plan_contracts(registry, query, step_skills=["isomir-quantification"]),
         user_query=query,
         extra_context="ref/hairpin_hsa.fa",
+        available_artifacts=["trimmed_fastq"],
     )
     requirements = _resolve_requirements_policy(query, "")
     prompt = _build_executor_system_prompt(
@@ -305,6 +456,207 @@ def test_isomir_trimmed_fastq_rebuild_inserts_collapse_before_alignment():
     assert "seqcluster_collapse" in planned[0]["goal"]
     assert requirements["isomir_parallel_workers"] == 8
     assert "Do not call `sa.quant.mirtop` once over all BAMs" in prompt
+
+
+def test_isomir_raw_fastq_plan_forces_trim_then_collapse_then_analysis():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [{"id": "1", "title": "运行 mirtop", "goal": "完成 isomiR 定量", "skill": "isomir-quantification"}],
+        skill_registry=registry,
+        user_query="对原始 FASTQ 做 isomiR 分析",
+        extra_context="adata.obs['fastq_path'] = 'raw/S1.fastq.gz'",
+        available_artifacts=["raw/S1.fastq.gz"],
+    )
+
+    titles = [step["title"] for step in planned]
+    assert titles == [
+        "读取现有 FASTQ 修剪配置",
+        "确认 sRNA-seq 3' adapter",
+        "完成 isomiR 前的 FASTQ 质控与接头修剪",
+        "折叠 trimmed FASTQ 供 isomiR hairpin 比对",
+        "运行 mirtop",
+    ]
+    assert "approval" in planned[1]
+
+
+def test_isomir_target_prediction_does_not_add_quantification_or_adapter_gate():
+    """A biological isomiR keyword must not import an upstream FASTQ workflow."""
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [{
+            "id": "1",
+            "title": "预测 top 5 isomiR 靶标",
+            "goal": "运行 miRanda 与 3' UTR seed 验证",
+            "skill": "mirna-target-prediction",
+        }],
+        skill_registry=registry,
+        user_query="用 miRanda 预测 top 5 isomiR 靶标",
+        # Raw FASTQ is deliberately present: it must not affect a target-only
+        # plan that operates on an already quantified isomiR AnnData.
+        extra_context="adata.obs['fastq_path'] = 'raw/S1.fastq.gz'",
+    )
+
+    assert {step["title"] for step in planned} == {
+        "从差异结果确定靶标分析候选小 RNA",
+        "确认靶标预测候选集",
+        "预测 top 5 isomiR 靶标",
+    }
+    assert all(step["skill"] != "fastq-qc" for step in planned)
+    assert all(step["workflowContract"] != "trim-before-isomir-collapse" for step in planned if "workflowContract" in step)
+
+
+def test_target_contract_compiles_candidate_confirmation_then_prediction_without_duplicates():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [
+            {
+                "id": "select", "title": "Select isomiR target-prediction candidates",
+                "goal": "select candidates", "skill": "mirna-target-prediction",
+            },
+            {
+                "id": "predict", "title": "Predict isomiR targets with miRanda + seed-site validation",
+                "goal": "run miRanda", "skill": "mirna-target-prediction",
+            },
+            {
+                "id": "persist", "title": "Persist isomir_adata with target artifacts",
+                "goal": "write target results", "skill": "mirna-target-prediction",
+            },
+        ],
+        skill_registry=registry,
+        user_query="预测 isomiR 靶标",
+        extra_context="",
+    )
+
+    assert [step["title"] for step in planned] == [
+        "从差异结果确定靶标分析候选小 RNA",
+        "确认靶标预测候选集",
+        "Predict isomiR targets with miRanda + seed-site validation",
+    ]
+    prediction = planned[-1]
+    assert prediction["inputs"] == [
+        "target_candidates_confirmed", "three_prime_utr_fasta", "mirna_sequence_metadata",
+    ]
+    assert prediction["depends_on"] == ["workflow:confirm-target-candidates-before-prediction"]
+    assert prediction["executionContracts"][0]["id"] == "target-prediction-execution-contract"
+
+
+def test_target_contract_repairs_a_persisted_out_of_order_target_plan():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [
+            {
+                "id": "confirm", "title": "确认靶标预测候选集", "skill": "mirna-target-prediction",
+                "status": "pending", "workflowContract": "confirm-target-candidates-before-prediction",
+                "inputs": ["target_candidates"], "outputs": ["target_candidates_confirmed"],
+            },
+            {
+                "id": "predict", "title": "Predict isomiR targets with miRanda",
+                "skill": "mirna-target-prediction", "status": "done",
+            },
+            {
+                "id": "persist", "title": "Persist isomir_adata with target artifacts",
+                "skill": "mirna-target-prediction", "status": "pending",
+            },
+            {
+                "id": "select-contract", "title": "从差异结果确定靶标分析候选小 RNA",
+                "skill": "mirna-target-prediction", "status": "pending",
+                "workflowContract": "select-target-candidates-before-prediction",
+                "outputs": ["target_candidates"],
+            },
+            {
+                "id": "select-llm", "title": "Select isomiR target-prediction candidates",
+                "skill": "mirna-target-prediction", "status": "pending",
+            },
+        ],
+        skill_registry=registry,
+        user_query="预测 isomiR 靶标",
+        extra_context="",
+    )
+
+    assert [step["id"] for step in planned] == ["select-contract", "confirm", "predict"]
+    assert planned[-1]["status"] == "done"
+    assert planned[-1]["depends_on"] == ["confirm"]
+
+
+def test_target_contract_removes_duplicate_gate_and_wires_parent_comparison():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [
+            {"id": "gate", "title": "确认靶标预测候选集", "skill": "mirna-target-prediction"},
+            {"id": "iso", "title": "预测 isomiR 靶标（miRanda）", "skill": "mirna-target-prediction"},
+            {"id": "parent", "title": "预测父 miRNA 靶标", "skill": "mirna-target-prediction"},
+            {"id": "compare", "title": "比较 isomiR 与父 miRNA 靶标差异", "skill": "mirna-target-prediction"},
+        ],
+        skill_registry=registry,
+        user_query="比较 isomiR 和父 miRNA 的靶标差异",
+        extra_context="",
+    )
+
+    assert [step["id"] for step in planned] == [
+        "workflow:select-target-candidates-before-prediction",
+        "workflow:confirm-target-candidates-before-prediction",
+        "iso", "parent", "compare",
+    ]
+    by_id = {step["id"]: step for step in planned}
+    assert by_id["iso"]["depends_on"] == ["workflow:confirm-target-candidates-before-prediction"]
+    assert by_id["parent"]["depends_on"] == [
+        "workflow:confirm-target-candidates-before-prediction", "iso",
+    ]
+    assert by_id["compare"]["depends_on"] == ["iso", "parent"]
+    assert all(
+        dependency in by_id
+        for step in planned
+        for dependency in step.get("depends_on") or []
+    )
+
+
+def test_target_only_scope_drops_de_and_raw_count_planner_prerequisites():
+    scope = _derive_requested_scope("基于现有 isomiR 数据比较 isomiR 和 miRNA 靶标差异")
+    _goal, planned = _enforce_requested_scope(
+        "比较 isomiR 和 miRNA 靶标差异",
+        [
+            {"id": "counts", "title": "核查现有 raw counts 矩阵", "skill": ""},
+            {"id": "groups", "title": "确认差异分析样本分组", "skill": "differential-analysis"},
+            {"id": "de", "title": "运行 sRNA 差异分析", "skill": "differential-analysis"},
+            {"id": "target", "title": "预测 isomiR 靶标", "skill": "mirna-target-prediction"},
+        ],
+        scope=scope,
+        fallback_goal="基于现有 isomiR 数据比较 isomiR 和 miRNA 靶标差异",
+    )
+
+    assert [step["id"] for step in planned] == ["target"]
+
+
+def test_target_only_scope_removes_hallucinated_isomir_upstream_workflow():
+    scope = _derive_requested_scope("用 miRanda 预测 top 5 isomiR 靶标")
+    _goal, planned = _enforce_requested_scope(
+        "预测 isomiR 靶标",
+        [
+            {"id": "1", "title": "确认 3' adapter", "skill": "fastq-qc"},
+            {"id": "2", "title": "运行 mirtop 定量", "skill": "isomir-quantification"},
+            {"id": "3", "title": "miRanda 靶标预测", "skill": "mirna-target-prediction"},
+        ],
+        scope=scope,
+        fallback_goal="用 miRanda 预测 top 5 isomiR 靶标",
+    )
+
+    assert scope["target_prediction_only"] is True
+    assert [step["skill"] for step in planned] == ["mirna-target-prediction"]
 
 
 def test_isomir_collapse_is_moved_before_hairpin_bowtie_when_planner_orders_it_late():
@@ -328,6 +680,7 @@ def test_isomir_collapse_is_moved_before_hairpin_bowtie_when_planner_orders_it_l
         _load_skill_plan_contracts(registry, query, step_skills=["isomir-quantification"]),
         user_query=query,
         extra_context="ref/hairpin_hsa.fa",
+        available_artifacts=["trimmed_fastq"],
     )
     titles = [step["title"] for step in planned]
 
@@ -337,6 +690,10 @@ def test_isomir_collapse_is_moved_before_hairpin_bowtie_when_planner_orders_it_l
         "hairpin Bowtie 比对重建",
         "运行 mirtop",
     ]
+    by_title = {step["title"]: step for step in planned}
+    assert by_title["hairpin Bowtie 比对重建"]["inputs"] == ["collapsed_fastq"]
+    assert by_title["运行 mirtop"]["inputs"] == ["hairpin_bam", "mirtop_reference"]
+    assert by_title["运行 mirtop"]["depends_on"] == ["2"]
 
 
 def test_isomir_skill_contract_places_collapse_before_hairpin_bowtie():
@@ -354,6 +711,7 @@ def test_isomir_skill_contract_places_collapse_before_hairpin_bowtie():
         contracts,
         user_query=query,
         extra_context="",
+        available_artifacts=["trimmed_fastq"],
     )
 
     assert contracts
@@ -417,12 +775,92 @@ def test_trax_skill_contract_adds_trimming_for_raw_fastq_only():
         contracts,
         user_query=query,
         extra_context="adata.obs['fastq_path'] = 'raw/S1.fastq.gz'",
+        available_artifacts=["raw/S1.fastq.gz"],
     )
 
     assert [step["title"] for step in planned] == [
         "完成 tRAX 前的 FASTQ 质控与修剪",
         "运行 tRAX 定量",
     ]
+
+
+def test_raw_trax_workflow_keeps_trim_after_adapter_approval_is_inserted():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [{"id": "1", "title": "运行 tRAX 定量", "goal": "计数 tRF", "skill": "trax_quantification"}],
+        skill_registry=registry,
+        user_query="用原始 FASTQ 做 tRAX tRNA 定量",
+        extra_context="adata.obs['fastq_path'] = 'raw/S1.fastq.gz'",
+        available_artifacts=["raw/S1.fastq.gz"],
+    )
+
+    assert [step["title"] for step in planned] == [
+        "读取现有 FASTQ 修剪配置",
+        "确认 sRNA-seq 3' adapter",
+        "完成 tRAX 前的 FASTQ 质控与修剪",
+        "运行 tRAX 定量",
+    ]
+
+
+def test_de_group_preflight_precedes_its_approval_gate():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [{"id": "1", "title": "差异分析", "goal": "DE", "skill": "differential-analysis"}],
+        skill_registry=registry,
+        user_query="做差异分析",
+        extra_context='adata.layers["counts"]',
+    )
+
+    assert [step["title"] for step in planned] == [
+        "读取差异分析分组与设计",
+        "确认差异分析样本分组",
+        "差异分析",
+    ]
+
+
+def test_de_contract_replaces_planner_group_steps_and_lifecycle_keeps_one_gate():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [
+            {
+                "id": "1",
+                "title": "读取差异分析分组与设计（preflight 证据收集）",
+                "goal": "检查 condition",
+                "skill": "differential-analysis",
+            },
+            {
+                "id": "2",
+                "title": "确认差异分析样本分组（阻塞门）",
+                "goal": "等待确认",
+                "skill": "differential-analysis",
+            },
+            {"id": "3", "title": "miRNA 差异分析", "goal": "DE", "skill": "differential-analysis"},
+        ],
+        skill_registry=registry,
+        user_query="做 miRNA 差异分析",
+        extra_context='adata.layers["counts"]',
+    )
+    plan = {"steps": planned}
+    PlanOrchestrator._normalize_plan_lifecycle(plan)
+
+    assert [step["title"] for step in plan["steps"]] == [
+        "读取差异分析分组与设计",
+        "确认差异分析样本分组",
+        "miRNA 差异分析",
+    ]
+    gate = plan["steps"][1]
+    assert gate["workflowContract"] == "confirm-groups-before-de"
+    assert gate["depends_on"] == ["workflow:confirm-groups-before-de:preflight"]
 
 
 def test_approval_contract_inserts_persisted_gate_before_feature_count():
@@ -484,6 +922,31 @@ def test_approval_response_unblocks_only_the_waiting_plan_step():
     assert restored["steps"][0]["status"] == "done"
     assert restored["steps"][0]["approval"]["response"] == "adapter=TGGA"
     assert restored["steps"][1]["status"] == "pending"
+
+
+def test_restore_repairs_impossible_completed_dependent_behind_approval_gate():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "1", "title": "读取靶标", "status": "done"},
+            {
+                "id": "2", "title": "确认 starBase 参数", "status": "awaiting_approval",
+                "approval": {"id": "starbase_params"}, "depends_on": ["1"],
+            },
+            {
+                "id": "3", "title": "下载 starBase 靶标", "status": "done",
+                "depends_on": ["2"],
+            },
+        ]
+    }
+
+    restored = PlanOrchestrator._prepare_restored_plan(plan)
+
+    gate = restored["steps"][1]
+    assert gate["status"] == "done"
+    assert gate["approval"]["response"] == "recovered_from_completed_dependent"
+    assert "系统恢复" in gate["result"]
 
 
 def test_plain_chinese_affirmation_confirms_an_explicitly_presented_configuration():
@@ -686,7 +1149,7 @@ def test_adapter_approval_renders_actual_input_adapter_and_length_values():
         "id": "1",
         "title": "读取现有 FASTQ 修剪配置",
         "status": "done",
-        "result": "INPUT_FASTQ: adata.obs['fastq_path']\nSAMPLE_COUNT: 30\nADAPTER_3: TGGAATTCTCGGGTGCCAAGG\nMIN_LENGTH: 18\nMAX_LENGTH: 40",
+        "result": "INPUT_FASTQ: adata.obs['fastq_path']\nSAMPLE_COUNT: 30\nADAPTER_3: TGGAATTCTCGGGTGCCAAGG\nADAPTER_EVIDENCE: 既有 cutadapt 配置\nMIN_LENGTH: 18\nMAX_LENGTH: 40",
     }
     gate = {
         "id": "2",
@@ -709,10 +1172,10 @@ def test_adapter_approval_renders_actual_input_adapter_and_length_values():
 
     message = _build_approval_request(plan, gate, history=[], extra_context="")
 
-    assert "摘要：将对 `adata.obs['fastq_path']` 中的 30 个样本使用 3' adapter `TGGAATTCTCGGGTGCCAAGG`，长度过滤为 `18`-40 nt。" in message
+    assert "摘要：对 `adata.obs['fastq_path']` 中的 30 个样本，基于 `既有 cutadapt 配置` 建议使用 3' adapter `TGGAATTCTCGGGTGCCAAGG`，长度过滤为 `18`-40 nt。" in message
 
 
-def test_adapter_approval_shows_complete_defaults_when_no_prior_trim_is_recorded():
+def test_adapter_approval_requires_evidence_when_no_prior_trim_is_recorded():
     preflight = {
         "id": "1",
         "title": "读取现有 FASTQ 修剪配置",
@@ -727,7 +1190,8 @@ def test_adapter_approval_shows_complete_defaults_when_no_prior_trim_is_recorded
             "id": "confirm-adapter-before-trimming",
             "review": {
                 "fields": [
-                    {"label": "adapter（TruSeq 默认提案）", "source": "adapter_3", "value": "TGGAATTCTCGGGTGCCAAGG", "unknown": "未记录"},
+                    {"label": "adapter（须有证据）", "source": "adapter_3", "unknown": "未记录，不能据此执行"},
+                    {"label": "adapter 依据", "source": "adapter_evidence", "unknown": "未记录，不能据此执行"},
                     {"label": "最小长度", "source": "min_length", "value": "18", "unknown": "未记录"},
                     {"label": "最大长度", "source": "max_length", "value": "36", "unknown": "未记录"},
                     {"label": "质量阈值", "source": "quality_cutoff", "value": "20", "unknown": "未记录"},
@@ -742,7 +1206,9 @@ def test_adapter_approval_shows_complete_defaults_when_no_prior_trim_is_recorded
 
     message = _build_approval_request({"steps": [preflight, gate]}, gate, history=[], extra_context="")
 
-    assert "adapter（TruSeq 默认提案）: TGGAATTCTCGGGTGCCAAGG" in message
+    assert "adapter（须有证据）: 未记录，不能据此执行" in message
+    assert "adapter 依据: 未记录，不能据此执行" in message
+    assert "TGGAATTCTCGGGTGCCAAGG" not in message
     assert "最小长度: 18" in message
     assert "最大长度: 36" in message
     assert "质量阈值: 20" in message
@@ -754,6 +1220,100 @@ def test_adapter_approval_shows_complete_defaults_when_no_prior_trim_is_recorded
 
 def test_adapter_approval_accepts_extended_trim_parameter_overrides():
     assert approval_response_is_actionable("quality_cutoff=25, error_rate=0.05, trim_n=true") is True
+
+
+def test_unknown_adapter_gate_rejects_bare_approval_but_accepts_explicit_sequence():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认 sRNA-seq 3' adapter",
+            "status": "awaiting_approval",
+            "approval": {
+                "id": "confirm-adapter-before-trimming",
+                "review": {"fields": [
+                    {"source": "adapter_3", "unknown": "未记录"},
+                    {"source": "adapter_evidence", "unknown": "未记录"},
+                ]},
+            },
+        }]
+    }
+
+    waiting = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以")
+    assert waiting["steps"][0]["status"] == "awaiting_approval"
+
+    approved = PlanOrchestrator._prepare_restored_plan(
+        plan,
+        approval_response="adapter_3=AGATCGGAAGAGCACACGTCTGAACTC",
+    )
+    assert approved["steps"][0]["status"] == "done"
+    assert approved["steps"][0]["approval"]["reviewed"] == {
+        "adapter_3": "AGATCGGAAGAGCACACGTCTGAACTC",
+        "adapter_evidence": "用户指定",
+    }
+
+
+def test_nebnext_metadata_produces_a_persisted_adapter_recommendation():
+    preflight = {
+        "id": "1",
+        "title": "读取现有 FASTQ 修剪配置",
+        "status": "done",
+        "result": "INPUT_FASTQ: raw/S1.fastq.gz\nSAMPLE_COUNT: 1\nLIBRARY_KIT: NEBNext Small RNA",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 sRNA-seq 3' adapter",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-adapter-before-trimming",
+            "review": {"fields": [
+                {"label": "试剂盒", "source": "library_kit", "unknown": "未记录"},
+                {"label": "adapter", "source": "adapter_3", "unknown": "未记录"},
+                {"label": "依据", "source": "adapter_evidence", "unknown": "未记录"},
+            ]},
+        },
+    }
+
+    message = _build_approval_request({"steps": [preflight, gate]}, gate, history=[], extra_context="")
+
+    assert "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC" in message
+    assert "建库元数据匹配 NEBNext Small RNA" in message
+    assert gate["approval"]["reviewed"]["adapter_3"] == "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
+    assert gate["approval"]["reviewed"]["adapter_evidence"] == "建库元数据匹配 NEBNext Small RNA"
+
+
+def test_feature_count_gate_recommends_strandedness_from_library_metadata():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    preflight = {
+        "id": "1",
+        "title": "读取 featureCounts 已知配置",
+        "status": "done",
+        "result": "SAMPLE_COUNT: 8\nLIBRARY_KIT: NEBNext Small RNA",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 featureCounts 链特异性",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-strandedness-before-feature-count",
+            "review": {"fields": [
+                {"label": "试剂盒", "source": "library_kit", "unknown": "未记录"},
+                {"label": "链特异性", "source": "strandedness", "unknown": "未记录"},
+                {"label": "依据", "source": "strandedness_evidence", "unknown": "未记录"},
+            ]},
+        },
+    }
+    plan = {"steps": [preflight, gate]}
+
+    message = _build_approval_request(plan, gate, history=[], extra_context="")
+
+    assert "链特异性: reverse" in message
+    assert "建库元数据匹配 NEBNext Small RNA" in message
+    approved = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以")
+    assert approved["steps"][1]["status"] == "done"
+    assert approved["steps"][1]["approval"]["reviewed"]["strandedness"] == "reverse"
 
 
 def test_adapter_approval_does_not_echo_session_memory_into_config_fields():
@@ -1024,11 +1584,7 @@ def test_replan_matches_completed_steps_by_identity_not_shifted_id():
     assert by_title["isomiR 定量"]["status"] == "pending"
 
 
-def test_successful_step_evidence_replans_away_redundant_pending_work():
-    class Completion:
-        def __init__(self, content):
-            self.content = content
-
+def test_successful_steps_advance_the_persisted_plan_without_replanning():
     class FakeAgent:
         system_prompt = "system"
         skill_registry = None
@@ -1036,15 +1592,6 @@ def test_successful_step_evidence_replans_away_redundant_pending_work():
         def __init__(self):
             self.events = []
             self.executed = []
-            self.requests = []
-            self.responses = [
-                Completion(
-                    '{"goal":"reuse reference","steps":[{"id":"1","title":"核对现有参考","goal":"inspect reference","skill":""}]}'
-                ),
-                Completion(
-                    '{"goal":"reuse reference","steps":[{"id":"1","title":"核对现有参考","goal":"inspect reference","skill":""}]}'
-                ),
-            ]
 
         def _emit_progress(self, callback, event_type, **payload):
             self.events.append(event_type)
@@ -1057,10 +1604,6 @@ def test_successful_step_evidence_replans_away_redundant_pending_work():
 
         def _check_cancelled(self, cancel_event):
             return None
-
-        def _llm_complete_cancellable(self, messages, **kwargs):
-            self.requests.append(messages)
-            return self.responses.pop(0)
 
     from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
 
@@ -1076,23 +1619,36 @@ def test_successful_step_evidence_replans_away_redundant_pending_work():
         "goal": "检查并完成 miRNA 定量",
         "steps": [
             {"id": "1", "title": "核对现有参考", "goal": "inspect reference", "status": "pending"},
-            {"id": "2", "title": "构建 Bowtie index", "goal": "build a genome index", "status": "pending"},
+            {"id": "2", "title": "miRNA 定量", "goal": "quantify miRNA", "status": "pending"},
         ],
     }
-    orchestrator._execute_step = lambda step, **kwargs: (
-        "已找到完整且兼容的 GRCh38 Bowtie index：ref/grch38.{1,2,3,4,rev.1,rev.2}.ebwt"
-        if step["id"] == "1"
-        else (_ for _ in ()).throw(AssertionError("redundant index build must not execute"))
+    orchestrator._execute_step = lambda step, **kwargs: agent.executed.append(step["id"]) or f"步骤 {step['id']} 完成"
+    orchestrator._replan = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("successful steps must not replan")
     )
     orchestrator._ensure_user_facing_reply = lambda user_query, text, **kwargs: text
 
     result = orchestrator.run([{"role": "user", "content": "检查并完成 miRNA 定量"}])
 
-    assert "完整且兼容的 GRCh38 Bowtie index" in result
-    assert "plan_revised" in agent.events
-    replanner_request = agent.requests[0][1]["content"]
-    assert "New evidence from the just-completed step" in replanner_request
-    assert "完整且兼容的 GRCh38 Bowtie index" in replanner_request
+    assert "步骤 2 完成" in result
+    assert agent.executed == ["1", "2"]
+    assert "plan_revised" not in agent.events
+    assert "plan_revising" not in agent.events
+
+
+def test_lifecycle_normalization_keeps_report_after_differential_analysis():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "report", "title": "生成 HTML 报告", "goal": "report.html", "status": "pending"},
+            {"id": "de", "title": "miRNA 差异分析", "goal": "limma-voom", "skill": "differential-analysis", "status": "pending"},
+        ]
+    }
+
+    PlanOrchestrator._normalize_plan_lifecycle(plan)
+
+    assert [step["id"] for step in plan["steps"]] == ["de", "report"]
 
 
 def test_existing_result_summary_is_read_only_and_skips_new_pipeline():
@@ -1431,12 +1987,50 @@ def test_differential_analysis_plan_expands_counts_and_group_confirmation():
 
     expanded = _expand_plan_prerequisites(steps, extra_context=context)
 
+    # The typed differential workflow owns its evidence preflight and approval
+    # gate, so prerequisite expansion must not add an untyped duplicate.
+    assert [step["skill"] for step in expanded] == ["", "differential-analysis"]
+    assert expanded[0]["title"] == "核查现有 raw counts 矩阵"
+
+
+def test_mirna_de_uses_mirdeep2_provider_instead_of_feature_count():
+    steps = [{
+        "id": "1",
+        "title": "miRNA 差异分析",
+        "goal": "对 miRNA 运行 limma-voom",
+        "skill": "differential-analysis",
+    }]
+
+    expanded = _expand_plan_prerequisites(steps, extra_context="")
+
     assert [step["skill"] for step in expanded] == [
-        "feature-count",
-        "",
+        "mirdeep2-mirna",
         "differential-analysis",
     ]
-    assert expanded[1]["title"] == "确认样本分组信息"
+    assert not any(step["skill"] == "feature-count" for step in expanded)
+
+
+def test_feature_count_selection_requires_affirmative_method_request():
+    assert _user_explicitly_requests_feature_count("使用 featureCounts 做基因计数") is True
+    assert _user_explicitly_requests_feature_count("miRNA 和 isomiR 默认不用 featureCounts") is False
+    assert _user_explicitly_requests_feature_count("featureCounts 不适用于 miRNA") is False
+
+
+def test_isomir_scope_removes_hallucinated_feature_count_steps():
+    steps = [
+        {"id": "1", "title": "isomiR 定量", "goal": "mirtop counts", "skill": "isomir-quantification"},
+        {"id": "2", "title": "生成小 RNA 定量矩阵", "goal": "featureCounts", "skill": "feature-count", "autoInserted": True},
+        {"id": "3", "title": "isomiR 差异分析", "goal": "limma-voom", "skill": "differential-analysis"},
+    ]
+
+    _goal, bounded = _enforce_requested_scope(
+        "isomiR 分析",
+        steps,
+        scope={"requested_assays": ["isomir"], "requested_modalities": ["isomir"], "restricted": True},
+        fallback_goal="基于现有文件完成 isomiR 定量及差异分析",
+    )
+
+    assert not any(step["skill"] == "feature-count" for step in bounded)
 
 
 def test_differential_analysis_defaults_to_unpaired_when_user_unspecified():

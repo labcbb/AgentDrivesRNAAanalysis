@@ -21,6 +21,8 @@ from sRNAgent.agent.bootstrap import initialize_registries  # noqa: E402
 from sRNAgent.agent.context import estimate_tokens, truncate_text  # noqa: E402
 from sRNAgent.agent.checkpoint import load_checkpoint  # noqa: E402
 from sRNAgent.agent.llm_client import LLMConfig  # noqa: E402
+from sRNAgent.agent.intent_router import IntentRouter, RouteDecision, RouteIntent  # noqa: E402
+from sRNAgent.agent.plan_lifecycle import PlanLifecycle  # noqa: E402
 from sRNAgent.agent.srn_agent import AgentCancelledError, SRNAgent  # noqa: E402
 
 from chat_kernel_manager import (  # noqa: E402
@@ -46,7 +48,7 @@ from session_store import (  # noqa: E402
     session_artifacts,
     session_dir,
 )
-from session_memory import append_work_log, build_session_memory_context, record_stream_event, remember_user_query  # noqa: E402
+from session_memory import append_work_log, build_session_memory_context, load_session_memory, record_stream_event, remember_user_query  # noqa: E402
 from session_errors import (
     clear_run_context,
     record_session_error,
@@ -678,6 +680,20 @@ def _chat_code_panel_running(chat_id: str) -> bool:
     )
 
 
+def _reset_interrupted_plan(chat_id: str) -> bool:
+    """Return a cancelled or stale plan to a resumable state exactly once."""
+    plan = load_plan(chat_id)
+    if not isinstance(plan, dict):
+        return False
+    before = [str(step.get("status") or "") for step in plan.get("steps") or [] if isinstance(step, dict)]
+    PlanLifecycle(plan).prepare_for_resume()
+    after = [str(step.get("status") or "") for step in plan.get("steps") or [] if isinstance(step, dict)]
+    if before == after:
+        return False
+    save_plan(chat_id, plan)
+    return True
+
+
 def agent_run_status(chat_id: str) -> Dict[str, Any]:
     """Lightweight run snapshot for UI polling when SSE is silent or disconnected."""
     try:
@@ -709,6 +725,14 @@ def agent_run_status(chat_id: str) -> Dict[str, Any]:
     task_active = has_active_run or busy
     stale_plan_step = plan_step_running and not task_active
     stale_code_panel = code_panel_running and not task_active
+    repaired_stale_plan = False
+    if stale_plan_step:
+        # A persisted `running` status is only valid while its agent loop or
+        # notebook kernel is alive. Repair it after a restart as well.
+        repaired_stale_plan = _reset_interrupted_plan(chat_id)
+        if repaired_stale_plan:
+            plan = load_plan(chat_id)
+            plan_summary = plan_progress_summary(plan) if plan else ""
 
     return {
         "ok": True,
@@ -739,6 +763,7 @@ def agent_run_status(chat_id: str) -> Dict[str, Any]:
         "codePanelRunning": code_panel_running,
         "stalePlanStep": stale_plan_step,
         "staleCodePanel": stale_code_panel,
+        "repairedStalePlan": repaired_stale_plan,
         "taskActive": task_active,
         "backgroundActive": busy and not has_active_run,
         "liveAvailable": has_live_bus(chat_id),
@@ -785,24 +810,30 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
     try:
         chat_id = _resolve_chat_id(body)
         user_query = _latest_user_message(messages)
-        remember_user_query(chat_id, user_query)
         use_plan_mode = _plan_mode_enabled(agent_cfg)
-        resume = bool(body.get("resume") or body.get("continueRun") or False)
-        if _FRESH_WORKFLOW_KEYWORDS.search(user_query):
-            resume = False
-        if not resume and _plan_awaits_approval(chat_id):
-            resume = True
-        if not resume:
+        route_decision = _route_request(body, chat_id, user_query)
+        resume, answer_without_resuming_plan = _resolve_plan_routing(
+            body, chat_id, user_query,
+        )
+        remember_user_query(
+            chat_id,
+            user_query,
+            reset_request_scope=not resume and not answer_without_resuming_plan,
+        )
+        if not resume and not answer_without_resuming_plan:
             clear_plan(chat_id)
         run_context = _build_run_context(chat_id, user_query=user_query)
-        if use_plan_mode:
+        available_artifacts = load_session_memory(chat_id).get("artifacts") if chat_id else []
+        if use_plan_mode and not answer_without_resuming_plan:
             text = agent.run_planned(
                 messages,
                 extra_context=run_context,
+                available_artifacts=available_artifacts,
                 chat_id=chat_id,
                 save_plan=save_plan,
                 load_plan=load_plan,
                 resume=resume,
+                route_intent=route_decision.intent.value,
             )
         else:
             text = agent.run_with_history(
@@ -864,17 +895,6 @@ def _normalize_approval_mode(body: Dict[str, Any]) -> str:
     return "manual"
 
 
-_RESUME_KEYWORDS = (
-    "继续", "继续刚才", "继续任务", "继续对话", "接着", "接着做",
-    "从断的地方", "从上次", "go on", "continue", "resume",
-)
-_FRESH_WORKFLOW_KEYWORDS = re.compile(
-    r"(?:清空|清除|删除|重建|重新生成|重跑).{0,48}(?:mirtop|iso[- ]?mir|isomiR)|"
-    r"(?:从|自).{0,16}(?:hairpin )?(?:比对|alignment|bowtie).{0,32}(?:开始|重建|重新|生成)",
-    re.I,
-)
-
-
 def _normalize_message_list(messages):
     if not isinstance(messages, list):
         return []
@@ -891,7 +911,12 @@ def _latest_user_message(source):
     if isinstance(source, list):
         history = source
     elif isinstance(source, dict):
-        history = source.get("history") if isinstance(source.get("history"), list) else []
+        # The streaming endpoint receives the current turn in ``messages``.
+        # Prefer it over legacy ``history``/``query`` fields; otherwise a
+        # concise approval such as "可以" is silently dropped before planning.
+        history = source.get("messages") if isinstance(source.get("messages"), list) else []
+        if not history:
+            history = source.get("history") if isinstance(source.get("history"), list) else []
     for item in reversed(history):
         if not isinstance(item, dict):
             continue
@@ -902,83 +927,32 @@ def _latest_user_message(source):
     return ""
 
 
+def _should_answer_without_resuming_plan(chat_id: str, message: str) -> bool:
+    """Compatibility wrapper for callers that only need the answer branch."""
+    return _route_request({}, chat_id, message).intent == RouteIntent.ANSWER
 
 
-def _auto_detect_resume(body: Dict[str, Any], chat_id: str) -> bool:
-    """True if the new user message looks like 'continue the interrupted task'.
 
-    Resume only when persisted state actually contains unfinished work. A
-    completed run also has a checkpoint (written before ``finish``), so a
-    keyword-only check would incorrectly route a new follow-up into the old
-    plan.
-    """
-    if not chat_id:
-        return False
-    msg = _latest_user_message(body).lower()
-    # A destructive/rebuild request establishes a new execution scope even
-    # when it contains words such as "continue". Reusing a checkpoint here
-    # can resurrect an interrupted subprocess with incompatible outputs.
-    if _FRESH_WORKFLOW_KEYWORDS.search(msg):
-        return False
-    if not msg or len(msg) > 60:
-        return False
-    if not any(kw.lower() in msg for kw in _RESUME_KEYWORDS):
-        return False
 
+def _route_request(body: Dict[str, Any], chat_id: str, message: str) -> RouteDecision:
+    """The sole UI routing boundary; never infer intent from punctuation."""
     try:
-        plan = load_plan(chat_id)
+        plan = load_plan(chat_id) if chat_id else None
     except Exception:
         plan = None
-    if isinstance(plan, dict):
-        steps = plan.get("steps") if isinstance(plan.get("steps"), list) else []
-        if any(
-            isinstance(step, dict)
-            and str(step.get("status") or "pending").strip().lower()
-            in {"pending", "running", "failed"}
-            for step in steps
-        ):
-            return True
-        # An all-done plan is historical context, not a resumable run.
-        return False
-
-    # Non-plan mode: inspect the checkpoint transcript. Tool results or a
-    # non-terminal assistant tool call mean another LLM turn is required.
-    try:
-        checkpoint = load_checkpoint(session_dir(chat_id) / "checkpoints", chat_id)
-    except Exception:
-        checkpoint = None
-    messages = checkpoint.get("messages") if isinstance(checkpoint, dict) else None
-    if not isinstance(messages, list) or not messages:
-        return False
-    for item in reversed(messages):
-        if not isinstance(item, dict) or item.get("role") == "system":
-            continue
-        role = str(item.get("role") or "")
-        if role == "tool":
-            return True
-        if role == "assistant":
-            calls = item.get("tool_calls") if isinstance(item.get("tool_calls"), list) else []
-            return any(
-                str((call.get("function") or {}).get("name") or call.get("name") or "") != "finish"
-                for call in calls
-                if isinstance(call, dict)
-            )
-        return False
-    return False
+    return IntentRouter.route(
+        message,
+        active_plan=plan,
+        explicit_resume=bool(body.get("resume") or body.get("continueRun")),
+    )
 
 
-def _plan_awaits_approval(chat_id: str) -> bool:
-    """A user reply after a plan approval gate resumes that exact plan."""
-    if not chat_id:
-        return False
-    try:
-        plan = load_plan(chat_id)
-    except Exception:
-        return False
-    steps = plan.get("steps") if isinstance(plan, dict) and isinstance(plan.get("steps"), list) else []
-    return any(
-        isinstance(step, dict) and str(step.get("status") or "").strip().lower() == "awaiting_approval"
-        for step in steps
+def _resolve_plan_routing(body: Dict[str, Any], chat_id: str, message: str) -> tuple[bool, bool]:
+    """Compatibility projection of the central route decision for callers."""
+    decision = _route_request(body, chat_id, message)
+    return (
+        decision.intent in {RouteIntent.CONTINUE, RouteIntent.AMEND_PLAN},
+        decision.intent == RouteIntent.ANSWER,
     )
 
 
@@ -1044,13 +1018,11 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     chat_id = _resolve_chat_id(body)
     device_id = str(body.get("deviceId") or "").strip()
     approval_mode = _normalize_approval_mode(body)
-    resume = bool(body.get("resume") or body.get("continueRun") or False)
-    if _FRESH_WORKFLOW_KEYWORDS.search(_latest_user_message(body)):
-        resume = False
-    # 自动检测"继续中断任务"：用户消息含这些关键词 + 该 chat 有 checkpoint
-    # → 当作 resume=true，让 agent 从上次中断的 tool_loop 消息恢复
-    if not resume:
-        resume = _plan_awaits_approval(chat_id) or _auto_detect_resume(body, chat_id)
+    initial_user_query = _latest_user_message(messages) or _latest_user_message(body)
+    route_decision = _route_request(body, chat_id, initial_user_query)
+    resume, answer_without_resuming_plan = _resolve_plan_routing(
+        body, chat_id, initial_user_query,
+    )
 
     # Exclusive operator lease: another device mid-run cannot steal this chat.
     existing_lease = get_operator_lease(chat_id)
@@ -1082,7 +1054,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
     # Remove the previous plan only after this request has acquired the chat;
     # a rejected observer must not erase the active operator's plan.
-    if not resume:
+    if not resume and not answer_without_resuming_plan:
         clear_plan(chat_id)
 
     # Stop any in-flight agent loop for this chat; interrupt kernel only if it is busy.
@@ -1119,7 +1091,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             full = event.get("fullContent")
             if full:
                 persist_event["content"] = full
-            record_stream_event_error(chat_id, persist_event)
+            record_stream_event_error(chat_id, persist_event, run_id=run_id)
             append_ledger_event(chat_id, event, run_id=run_id)
             _append_work_log_event(chat_id, event, run_id)
         except Exception:
@@ -1211,27 +1183,30 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
             on_progress({"type": "status", "message": "Agent 就绪，正在请求 LLM…"})
             use_plan_mode = _plan_mode_enabled(agent_cfg)
-            user_query = _latest_user_message(messages)
+            user_query = initial_user_query
             remember_user_query(
                 chat_id,
                 user_query,
-                reset_request_scope=not resume,
+                reset_request_scope=not resume and not answer_without_resuming_plan,
             )
             # A new user request starts a new planning context. Clear the
             # previous unfinished plan before building session memory; doing
             # it afterward leaked the old pending steps into the planner and
             # could make an unrelated follow-up inherit the prior workflow.
-            if not resume:
+            if not resume and not answer_without_resuming_plan:
                 clear_plan(chat_id)
             run_context = _build_run_context(chat_id, user_query=user_query)
-            if use_plan_mode:
+            available_artifacts = load_session_memory(chat_id).get("artifacts") if chat_id else []
+            if use_plan_mode and not answer_without_resuming_plan:
                 text = agent.run_planned(
                     messages,
                     extra_context=run_context,
+                    available_artifacts=available_artifacts,
                     chat_id=chat_id,
                     save_plan=save_plan,
                     load_plan=load_plan,
                     resume=resume,
+                    route_intent=route_decision.intent.value,
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                     code_approval_callback=request_code_approval,
@@ -1265,6 +1240,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                 }
             )
         except AgentCancelledError:
+            _reset_interrupted_plan(chat_id)
             on_progress({"type": "cancelled", "message": "已停止生成"})
         except Exception as exc:  # noqa: BLE001
             import traceback as _tb

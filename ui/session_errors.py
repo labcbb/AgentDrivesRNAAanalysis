@@ -215,7 +215,7 @@ def record_session_error(
         save_session_errors(chat_id, store)
 
 
-def record_stream_event_error(chat_id: str, event: Dict[str, Any]) -> None:
+def record_stream_event_error(chat_id: str, event: Dict[str, Any], *, run_id: str = "") -> None:
     """Record error-like SSE events into session_errors.json."""
     if not chat_id or not event:
         return
@@ -226,6 +226,7 @@ def record_stream_event_error(chat_id: str, event: Dict[str, Any]) -> None:
             chat_id,
             kind="stream_error",
             summary=str(event.get("message") or "Agent 流式执行失败"),
+            run_id=run_id,
             source="sse",
         )
         return
@@ -236,6 +237,7 @@ def record_stream_event_error(chat_id: str, event: Dict[str, Any]) -> None:
             kind="plan_step_failed",
             summary=str(event.get("message") or "计划步骤失败"),
             detail=str(event.get("result") or ""),
+            run_id=run_id,
             source="plan_orchestrator",
         )
         return
@@ -249,6 +251,7 @@ def record_stream_event_error(chat_id: str, event: Dict[str, Any]) -> None:
                 kind="code_error",
                 summary=str(event.get("summary") or "代码执行失败"),
                 detail=content,
+                run_id=run_id,
                 source="execute_code",
             )
 

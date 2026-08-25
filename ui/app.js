@@ -91,7 +91,7 @@ const STREAM_STATUS_POLL_MS = 4000;
 const EXECUTION_ELAPSED_TICK_MS = 1000;
 /** @type {Map<string, { abortController: AbortController, runId: string, codeExecutionId: string|null, lastSeq: number }>} */
 const liveFollows = new Map();
-/** @type {Map<string, string[]>} 主任务运行期间用户发的新消息先排队，当前任务结束后自动发送 */
+/** @type {Map<string, Array<{id: string, text: string, notice: Element|null}>>} 主任务运行期间用户发的新消息先排队，当前任务结束后自动发送 */
 const pendingSends = new Map();
 const BACKGROUND_WATCH_POLL_MS = 3000;
 const BACKGROUND_EXECUTION_ID = "background-kernel-run";
@@ -1538,24 +1538,9 @@ function syncRunStatusToUI(chatId, status, options = {}) {
   const message = buildRunStatusMessage(status);
   const { pending = null, assistantEntry = null, persist = true } = options;
 
-  // Status banners are for the loading line only — never clobber a final reply.
-  if (assistantEntry && message && canOverwriteAssistantContent(assistantEntry, message)) {
-    assistantEntry.content = message;
-  }
-
   if (chatId === activeChatId) {
     const target = resolvePendingGroup(pending) || getLastAssistantGroup();
-    if (
-      target
-      && message
-      && (!assistantEntry || canOverwriteAssistantContent(assistantEntry, message))
-    ) {
-      const textEl = target.querySelector(".chat-text");
-      if (textEl) {
-        textEl.classList.add("chat-text--loading");
-        textEl.textContent = message;
-      }
-    }
+    if (target && message) setLiveStatus(target, message);
     if (status.plan?.steps?.length && target) {
       const planTitle = resolvePlanSnapshotTitle(status.plan.goal);
       appendThinkingStep(
@@ -1582,10 +1567,6 @@ function syncRunStatusToUI(chatId, status, options = {}) {
     scrollThreadToBottom();
   }
 
-  if (persist && assistantEntry && chatId && canOverwriteAssistantContent(assistantEntry, message)) {
-    const messages = options.messages || chatHistory;
-    persistChatMessages(chatId, messages);
-  }
   return true;
 }
 
@@ -1845,15 +1826,8 @@ function applyLiveFollowEvent(chatId, event) {
     persistChatMessages(chatId, messages);
   }
 
-  if (event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "stream_end") {
-    const stream = chatStreams.get(chatId);
-    if (stream?.isFollower) {
-      chatStreams.delete(chatId);
-    }
-    if (chatId === activeChatId) {
-      window.KernelPanel?.refresh?.({ force: true });
-      syncComposerForActiveChat();
-    }
+  if (event.type === "final" || event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "stream_end") {
+    releaseComposerAfterStream(chatId);
   }
 }
 
@@ -2123,6 +2097,7 @@ function renderChatThread() {
   threadInner.innerHTML = "";
   if (chatHistory.length === 0) {
     threadInner.innerHTML = welcomeCardHtml();
+    renderQueuedSendNotices(activeChatId);
     renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: isActiveChatSending() });
     scrollThreadToBottom();
     return;
@@ -2140,6 +2115,7 @@ function renderChatThread() {
       if (thinkingEl) thinkingEl.open = false;
     }
   });
+  renderQueuedSendNotices(activeChatId);
   renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: isActiveChatSending() });
 }
 
@@ -2545,13 +2521,33 @@ function appendMessage(role, text, options = {}) {
   const textEl = group.querySelector(".chat-text");
   if (options.loading) {
     textEl.classList.add("chat-text--loading");
-    textEl.textContent = "思考中…";
+    textEl.textContent = "";
+    setLiveStatus(group, "思考中…");
   } else {
     renderChatText(textEl, text, role);
   }
   threadInner.appendChild(group);
   scrollThreadToBottom();
   return group;
+}
+
+function setLiveStatus(group, message) {
+  const bubble = group?.querySelector(".chat-bubble");
+  const textEl = group?.querySelector(".chat-text");
+  const text = String(message || "").trim();
+  if (!bubble || !textEl || !text) return;
+  let statusEl = bubble.querySelector(".chat-live-status");
+  if (!statusEl) {
+    statusEl = document.createElement("div");
+    statusEl.className = "chat-live-status";
+    statusEl.setAttribute("role", "status");
+    bubble.insertBefore(statusEl, textEl);
+  }
+  statusEl.textContent = text;
+}
+
+function clearLiveStatus(group) {
+  group?.querySelector(".chat-live-status")?.remove();
 }
 
 function getLastAssistantGroup() {
@@ -4006,9 +4002,6 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
   if (!event?.type || !assistantEntry) return;
 
   if (event.type === "status" && event.message) {
-    if (canOverwriteAssistantContent(assistantEntry, event.message)) {
-      assistantEntry.content = event.message;
-    }
     return;
   }
   if (
@@ -4024,7 +4017,8 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
   ) {
     const msg = event.message || "";
     const isFinalPlanEvent = event.type === "plan_complete" || event.type === "plan_incomplete" || event.type === "plan_failed";
-    if (msg && (isFinalPlanEvent || canOverwriteAssistantContent(assistantEntry, msg))) {
+    const isApprovalEvent = event.type === "plan_approval_required";
+    if (msg && (isFinalPlanEvent || isApprovalEvent)) {
       if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
         freezeAssistantFinalText(assistantEntry, msg);
       } else {
@@ -4115,31 +4109,15 @@ function handleAgentStreamEvent(group, event) {
   if (!group || !event?.type) return;
 
   if (event.type === "status" && event.message) {
-    const entry = getLastAssistantEntry();
-    if (entry) entry.content = event.message;
-    const textEl = group.querySelector(".chat-text");
-    if (textEl) {
-      textEl.classList.add("chat-text--loading");
-      textEl.textContent = event.message;
-    }
+    setLiveStatus(group, event.message);
     scrollThreadToBottom();
     return;
   }
 
   if (event.type === "heartbeat") {
     const msg = event.message || "任务运行中…";
-    const entry = getLastAssistantEntry();
-    // Heartbeats keep the connection alive after "done"; never wipe the final reply.
-    if (entry && !canOverwriteAssistantContent(entry, msg)) {
-      scrollThreadToBottom();
-      return;
-    }
-    if (entry) entry.content = msg;
-    const textEl = group.querySelector(".chat-text");
-    if (textEl) {
-      textEl.classList.add("chat-text--loading");
-      textEl.textContent = msg;
-    }
+    // Heartbeats are transport telemetry, never assistant content.
+    setLiveStatus(group, msg);
     if (event.kernelBusy && !activeCodeExecutionId) {
       ensureBackgroundExecutionCard(
         {
@@ -4169,7 +4147,8 @@ function handleAgentStreamEvent(group, event) {
     const entry = getLastAssistantEntry();
     const msg = event.message || "";
     const isFinalPlanEvent = event.type === "plan_complete" || event.type === "plan_incomplete" || event.type === "plan_failed";
-    if (entry && msg && (isFinalPlanEvent || canOverwriteAssistantContent(entry, msg))) {
+    const isApprovalEvent = event.type === "plan_approval_required";
+    if (entry && msg && (isFinalPlanEvent || isApprovalEvent)) {
       if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
         freezeAssistantFinalText(entry, msg);
       } else {
@@ -4177,15 +4156,17 @@ function handleAgentStreamEvent(group, event) {
       }
     }
     const textEl = group.querySelector(".chat-text");
-    if (textEl && msg && (isFinalPlanEvent || !entry || canOverwriteAssistantContent(entry, msg))) {
+    if (textEl && msg && (isFinalPlanEvent || isApprovalEvent)) {
+      clearLiveStatus(group);
       if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
         textEl.classList.remove("chat-text--loading");
-        textEl.textContent = msg;
+        renderChatText(textEl, msg, "assistant");
       } else {
-        textEl.classList.add("chat-text--loading");
-        textEl.textContent = msg;
+        textEl.classList.remove("chat-text--loading");
+        renderChatText(textEl, msg, "assistant");
       }
     }
+    if (isApprovalEvent && msg) persistActiveChat();
     if (event.plan?.steps?.length) {
       const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
       const planData = buildThinkingPlanData(event.plan, event.type, msg);
@@ -4304,6 +4285,14 @@ function resetComposerControls() {
 }
 
 function releaseComposerAfterStream(chatId) {
+  // A terminal server event is authoritative. Do not leave a stale live
+  // follower/background watch keeping the composer in stop mode.
+  stopBackgroundRunWatch(chatId);
+  const follow = liveFollows.get(chatId);
+  if (follow) {
+    liveFollows.delete(chatId);
+    follow.abortController?.abort();
+  }
   finishChatStream(chatId);
 }
 
@@ -4325,14 +4314,14 @@ async function handleStop() {
   if (follow) {
     // 先取消后端任务，再断开旁观流
   }
+  // 立即清除队列，避免取消请求等待期间任务恰好结束而自动发送一条追加消息。
+  clearPendingSends(activeChatId);
   markRunningExecutionsStopped();
   stopBackgroundRunWatch(activeChatId);
   if (window.cancelAgentRun) {
     await window.cancelAgentRun(runId || null, activeChatId);
   }
   detachLiveEventStream(activeChatId);
-  // 用户手动停止 = 放弃当前任务与排队消息（排队语义是"等当前任务自然结束"）
-  pendingSends.delete(activeChatId);
   if (stream?.isFollower) {
     chatStreams.delete(activeChatId);
   }
@@ -4343,6 +4332,7 @@ function updateMessageGroup(group, text) {
   if (!group) return;
   const textEl = group.querySelector(".chat-text");
   if (!textEl) return;
+  clearLiveStatus(group);
   textEl.classList.remove("chat-text--loading");
   renderChatText(textEl, text, group.classList.contains("assistant") ? "assistant" : "user");
 
@@ -4361,6 +4351,76 @@ function resetComposer() {
   composer.style.height = "auto";
 }
 
+function queuedSendNoticeText(position, total) {
+  return `⏳ 当前任务运行中，消息已加入队列（第 ${position} 条，共 ${total} 条）。当前任务结束后自动发送。`;
+}
+
+function removeQueuedSendNotice(item) {
+  if (item?.notice?.isConnected) item.notice.remove();
+  if (item) item.notice = null;
+}
+
+function updateQueuedSendNotices(chatId) {
+  const queue = pendingSends.get(chatId) || [];
+  queue.forEach((item, index) => {
+    const label = item.notice?.querySelector(".queued-send-notice__text");
+    if (label) label.textContent = queuedSendNoticeText(index + 1, queue.length);
+  });
+  if (chatId === activeChatId) scrollThreadToBottom();
+}
+
+function appendQueuedSendNotice(chatId, item) {
+  const group = appendMessage("assistant", "");
+  if (!group) return;
+
+  group.classList.add("chat-group--queued-send");
+  group.dataset.queuedSendId = item.id;
+  const textEl = group.querySelector(".chat-text");
+  if (!textEl) return;
+
+  const row = document.createElement("div");
+  row.className = "queued-send-notice";
+  const label = document.createElement("span");
+  label.className = "queued-send-notice__text";
+  row.appendChild(label);
+
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "queued-send-notice__cancel";
+  cancel.textContent = "撤回";
+  cancel.title = "撤回这条已排队的消息";
+  cancel.setAttribute("aria-label", "撤回这条已排队的消息");
+  cancel.addEventListener("click", () => withdrawPendingSend(chatId, item.id));
+  row.appendChild(cancel);
+
+  textEl.replaceChildren(row);
+  item.notice = group;
+}
+
+function renderQueuedSendNotices(chatId) {
+  const queue = pendingSends.get(chatId) || [];
+  queue.forEach((item) => appendQueuedSendNotice(chatId, item));
+  updateQueuedSendNotices(chatId);
+}
+
+function withdrawPendingSend(chatId, itemId) {
+  const queue = pendingSends.get(chatId);
+  if (!queue) return;
+  const index = queue.findIndex((item) => item.id === itemId);
+  if (index < 0) return;
+
+  const [item] = queue.splice(index, 1);
+  removeQueuedSendNotice(item);
+  if (queue.length === 0) pendingSends.delete(chatId);
+  else updateQueuedSendNotices(chatId);
+}
+
+function clearPendingSends(chatId) {
+  const queue = pendingSends.get(chatId) || [];
+  queue.forEach(removeQueuedSendNotice);
+  pendingSends.delete(chatId);
+}
+
 async function handleSend() {
   if (!composer) return;
   if (isActiveChatSending()) {
@@ -4368,13 +4428,12 @@ async function handleSend() {
     const queued = composer.value.trim();
     if (!queued) return;
     const q = pendingSends.get(activeChatId) || [];
-    q.push(queued);
+    const item = { id: createId(), text: queued, notice: null };
+    q.push(item);
     pendingSends.set(activeChatId, q);
     resetComposer();
-    appendMessage(
-      "assistant",
-      `⏳ 当前任务运行中，消息已加入队列（待发送 ${q.length} 条）。当前任务结束后自动发送，无需重复操作。`,
-    );
+    appendQueuedSendNotice(activeChatId, item);
+    updateQueuedSendNotices(activeChatId);
     persistChatMessages(activeChatId, chatHistory);
     return;
   }
@@ -4560,13 +4619,7 @@ async function handleSend() {
         if (event.type === "run_start") {
           if (isVisible) {
             const target = resolvePendingGroup(pending);
-            const textEl = target?.querySelector(".chat-text");
-            if (textEl) {
-              textEl.classList.add("chat-text--loading");
-              textEl.textContent = "已连接，等待 Agent 响应…";
-            }
-          } else if (assistantEntry) {
-            assistantEntry.content = "已连接，等待 Agent 响应…";
+            setLiveStatus(target, "已连接，等待 Agent 响应…");
           }
           return;
         }
@@ -4574,12 +4627,6 @@ async function handleSend() {
           touchStreamActivity();
           if (isVisible) {
             handleAgentStreamEvent(resolvePendingGroup(pending), event);
-          } else if (
-            assistantEntry
-            && event.message
-            && canOverwriteAssistantContent(assistantEntry, event.message)
-          ) {
-            assistantEntry.content = event.message;
           }
           return;
         }
@@ -4649,6 +4696,15 @@ async function handleSend() {
               );
             }
             persistChatMessages(streamChatId, streamMessages);
+          }
+        }
+        if (event.type === "final" || event.type === "done") {
+          // The reply is complete even if the SSE transport has not closed
+          // yet. Release the stop button immediately; the generation guard in
+          // `finally` prevents this retiring stream from touching a new turn.
+          if (!streamComposerReleased) {
+            streamComposerReleased = true;
+            releaseComposerAfterStream(streamChatId);
           }
         }
         if (event.type === "cancelled" || event.type === "error") {
@@ -4764,6 +4820,10 @@ async function handleSend() {
     if (assistantEntry) assistantEntry.content = message;
     persistChatMessages(streamChatId, streamMessages);
   } finally {
+    // A terminal event may already have released this composer, and the user
+    // may have started the next turn. Never let a retiring stream clear that
+    // newer turn's state.
+    if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
     clearStreamIdleTimer();
     clearStreamStatusPoll();
     // Clear synthetic background CODE card BEFORE run-status stale detection,
@@ -4849,7 +4909,9 @@ async function drainPendingSends(chatId) {
     pendingSends.set(chatId, q);
     return;
   }
-  if (composer) composer.value = next;
+  removeQueuedSendNotice(next);
+  if (q.length > 0) updateQueuedSendNotices(chatId);
+  if (composer) composer.value = next.text;
   await handleSend();
 }
 

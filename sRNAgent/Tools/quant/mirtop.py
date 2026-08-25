@@ -7,20 +7,18 @@ matrix at a configurable granularity (variant, miRNA, or hairpin).
 
 The wrapper runs three mirtop subcommands:
 
-1. ``mirtop gff --sps <species> --gtf <precursor.gff3>
-   --hairpin <hairpin.fa> --out <dir> <bam1> <bam2> ...`` -- one
-   invocation over all BAMs writes a merged ``mirtop.gff`` plus one
-   per-sample ``<bamstem>.gff``.
+1. Reuse existing per-sample ``<bamstem>.gff`` files when available and
+   merge them into ``mirtop.gff``. If they are absent, ``mirtop gff --sps
+   <species> --gtf <precursor.gff3> --hairpin <hairpin.fa> --out <dir>
+   <bam1> <bam2> ...`` creates both the merged and per-sample GFF files.
 2. ``mirtop counts --gff <merged.gff> --out <dir>`` -- writes
    ``<dir>/mirtop.tsv`` (the name derives from the GFF basename).
 3. ``mirtop stats -o <dir> <merged.gff>`` -- writes ``mirtop_stats.txt``
    and ``mirtop_stats.log`` with the per-sample variant-type distribution.
 
-Note: ``mirtop counts`` accepts a single ``--gff``, so the per-sample
-GFFs must first be combined into one merged GFF by a single ``mirtop
-gff`` invocation over all BAMs -- per-sample parallel invocations cannot
-feed ``mirtop counts``. The agent runtime supervises output artifacts and
-subprocess lifecycle generically, without mirtop-specific UI hooks.
+Note: ``mirtop counts`` accepts a single ``--gff``. Per-sample GFFs are
+therefore combined deterministically before counts are computed; this avoids
+needlessly reprocessing BAM files after parallel per-sample annotation.
 """
 
 from __future__ import annotations
@@ -38,6 +36,7 @@ from anndata import AnnData
 from ..._registry import register_function
 from ..._utils import run_cli_cmd
 from ..alignment.bowtie import normalize_rna_fasta_to_dna
+from ..reference.mirbase import prepare_mirtop_reference
 from .tRAX import store_count_matrix
 
 
@@ -132,6 +131,45 @@ _MIRTOP_META_COLS = [
 ]
 
 
+def _normalise_rna_sequence(sequence: object) -> str:
+    """Return a valid small-RNA sequence in RNA alphabet, or an empty string."""
+    value = "".join(str(sequence or "").split()).upper().replace("T", "U")
+    return value if value and set(value) <= {"A", "C", "G", "U", "N"} else ""
+
+
+def _load_mature_sequences(path: Path) -> Dict[str, str]:
+    """Read a species-specific miRBase mature FASTA without external dependencies."""
+    sequences: Dict[str, str] = {}
+    identifier = ""
+    chunks: List[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if identifier:
+                    sequences.setdefault(identifier, _normalise_rna_sequence("".join(chunks)))
+                identifier = line[1:].split()[0]
+                chunks = []
+            else:
+                chunks.append(line)
+    if identifier:
+        sequences.setdefault(identifier, _normalise_rna_sequence("".join(chunks)))
+    return {identifier: sequence for identifier, sequence in sequences.items() if sequence}
+
+
+def _resolve_mature_fasta(mature_fa: Optional[str], source_hairpin_path: Path) -> Optional[Path]:
+    """Use an explicit mature FASTA or the miRBase sibling convention when present."""
+    if mature_fa:
+        path = Path(mature_fa).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"mature miRNA FASTA not found: {path}")
+        return path
+    candidate = source_hairpin_path.with_name(source_hairpin_path.name.replace("hairpin", "mature", 1))
+    return candidate if candidate.is_file() else None
+
+
 def _resolve_counts_tsv(out_dir: Path) -> Path:
     """Find the counts TSV produced by ``mirtop counts`` in ``out_dir``.
 
@@ -221,22 +259,100 @@ def _merged_gff_covers_samples(gff: Path, sample_names: List[str]) -> bool:
     if not gff.is_file():
         return False
     try:
+        coldata: List[str] = []
         with open(gff, encoding="utf-8") as handle:
             for line in handle:
                 if line.startswith("## COLDATA:"):
-                    coldata = [
+                    coldata.extend(
                         item.strip()
-                        for item in line.split("COLDATA:")[1].strip().split(",")
-                    ]
-                    return all(
-                        any(sample in item or item in sample for item in coldata)
-                        for sample in sample_names
+                        for item in line.split("COLDATA:", 1)[1].strip().split(",")
+                        if item.strip()
                     )
                 if not line.startswith("#"):
                     break
+        return all(
+            any(sample in item or item in sample for item in coldata)
+            for sample in sample_names
+        )
     except OSError:
         return False
-    return False
+
+
+def _resolve_existing_sample_gffs(
+    adata: AnnData,
+    out_dir: Path,
+    bam_paths: Dict[str, str],
+    sample_names: List[str],
+) -> Optional[Dict[str, Path]]:
+    """Locate a complete set of precomputed per-sample mirtop GFFs.
+
+    The orchestrator can annotate BAMs in parallel and records those paths in
+    ``adata.obs['mirtop_gff']``. Older sessions store them below
+    ``per_sample/<sample>/``. Support both layouts so a follow-up
+    ``mirtop_quant`` only needs to concatenate GFF records before counts.
+    """
+    resolved: Dict[str, Path] = {}
+    for sample in sample_names:
+        candidates: List[Path] = []
+        if "mirtop_gff" in adata.obs.columns:
+            value = str(adata.obs.loc[sample, "mirtop_gff"]).strip()
+            if value and value.lower() not in {"nan", "none"}:
+                candidates.append(Path(value).expanduser())
+        bam_stem = Path(bam_paths[sample]).stem
+        candidates.extend(
+            [
+                out_dir / "per_sample" / sample / f"{bam_stem}.gff",
+                out_dir / f"{bam_stem}.gff",
+            ]
+        )
+        path = next(
+            (candidate.resolve() for candidate in candidates if candidate.is_file() and candidate.stat().st_size > 0),
+            None,
+        )
+        if path is None:
+            return None
+        resolved[sample] = path
+    return resolved
+
+
+def _merge_sample_gffs(sample_gffs: Dict[str, Path], merged_gff: Path) -> None:
+    """Merge per-sample mirGFF3 files without rerunning mirtop on BAMs."""
+    header_lines: List[str] = []
+    coldata_lines: List[str] = []
+    seen_headers = set()
+    seen_coldata = set()
+
+    for path in sample_gffs.values():
+        with path.open(encoding="utf-8") as handle:
+            for raw_line in handle:
+                if not raw_line.startswith("#"):
+                    break
+                line = raw_line.rstrip("\n")
+                if line.startswith("## COLDATA:"):
+                    if line not in seen_coldata:
+                        seen_coldata.add(line)
+                        coldata_lines.append(line)
+                elif line not in seen_headers:
+                    seen_headers.add(line)
+                    header_lines.append(line)
+
+    if not coldata_lines:
+        raise ValueError("Per-sample mirtop GFFs do not contain ## COLDATA headers")
+
+    temporary = merged_gff.with_name(f".{merged_gff.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as output:
+            for line in [*header_lines, *coldata_lines]:
+                output.write(f"{line}\n")
+            for path in sample_gffs.values():
+                with path.open(encoding="utf-8") as source:
+                    for line in source:
+                        if not line.startswith("#"):
+                            output.write(line)
+        os.replace(temporary, merged_gff)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _parse_mirtop_counts(
@@ -359,8 +475,8 @@ def _aggregate_by_granularity(
     category="quant",
     description=(
         "Quantify isoMiR (isomiR) variants from BAM files using mirtop. "
-        "Runs a single `mirtop gff` over all BAMs to build the merged "
-        "isomiR GFF, then "
+        "Reuses per-sample GFFs when available (otherwise runs `mirtop gff`) "
+        "to build the merged isomiR GFF, then "
         "`mirtop counts` to summarise reads at the requested granularity "
         "(variant, miRNA, or hairpin), and `mirtop stats` for the "
         "per-sample variant-type distribution. Counts merge into "
@@ -387,7 +503,7 @@ def _aggregate_by_granularity(
     produces={
         "obs": ["mirtop_gff", "mirtop_dir"],
         "var": [
-            "mirna_id", "rna_type", "variant_type", "reads",
+            "mirna_id", "rna_type", "variant_type", "sequence", "seed_sequence", "sequence_source",
             "iso_5p", "iso_3p", "iso_add3p", "iso_snp",
         ],
         "layers": ["counts", "logcpm"],
@@ -402,6 +518,7 @@ def mirtop_quant(
     *,
     bam_col: str = "bam_path",
     species: str = "hsa",
+    mature_fa: Optional[str] = None,
     granularity: str = "variant",
     normalize: bool = True,
     create_index: bool = True,
@@ -413,11 +530,12 @@ def mirtop_quant(
 
     The pipeline runs in three stages:
 
-    1. **Merged GFF** -- one ``mirtop gff --sps <species> --gtf <gff>
-       --hairpin <hairpin> --out <out> <bam1> <bam2> ...`` call over all
-       BAMs writes the merged ``mirtop.gff`` plus per-sample
-       ``<bamstem>.gff``. Idempotent: skipped when ``mirtop.gff`` already
-       covers every sample.
+    1. **Merged GFF** -- reuse a complete set of per-sample GFFs in
+       ``adata.obs['mirtop_gff']`` or ``<out>/per_sample/<sample>/`` and
+       concatenate them into ``mirtop.gff``. Only when those GFFs are absent
+       does it run ``mirtop gff --sps <species> --gtf <gff> --hairpin
+       <hairpin> --out <out> <bam1> <bam2> ...`` over BAMs. Idempotent:
+       skipped when ``mirtop.gff`` already covers every sample.
     2. **Combined counts** -- ``mirtop counts --gff <merged.gff> --out
        <out>`` writes ``<out>/mirtop.tsv``. Idempotent: skipped when the
        TSV already covers every sample.
@@ -444,6 +562,10 @@ def mirtop_quant(
     species
         Three-letter miRBase species code (``"hsa"``, ``"mmu"``, ...).
         Passed to ``mirtop gff --sps``.
+    mature_fa
+        Optional species-specific miRBase mature FASTA. It is used to add
+        canonical mature sequences at ``granularity="miRNA"``. At variant
+        granularity, mirtop's observed ``Read`` sequence is stored instead.
     granularity
         Aggregation level for counts. Default ``"variant"`` — **no
         aggregation**: every isomiR UID is its own feature. ``"miRNA"``
@@ -459,8 +581,9 @@ def mirtop_quant(
     extra_args
         Extra arguments appended to the ``mirtop gff`` command.
     overwrite
-        Re-run ``mirtop gff``/``mirtop counts`` even when outputs already
-        cover every sample.
+        Rebuild the merged GFF and re-run ``mirtop counts`` even when outputs
+        already cover every sample. When per-sample GFFs are available, this
+        still avoids re-running annotation on BAM files.
 
     Returns
     -------
@@ -472,11 +595,16 @@ def mirtop_quant(
         - ``adata.layers['logcpm']`` -- log2(CPM+1) (if ``normalize``)
         - ``adata.var['mirna_id']`` -- feature IDs
         - ``adata.var['rna_type']`` -- ``"isoMiR"``
+        - ``adata.var['sequence']`` -- observed isomiR RNA sequence at
+          variant granularity, or mature reference sequence after miRNA
+          aggregation when ``mature_fa`` is available
+        - ``adata.var['seed_sequence']`` -- positions 2-8 of ``sequence``
+          for target-prediction workflows
         - ``adata.var['variant_type']`` -- isomiR variant type per feature
           (``iso_5p`` / ``iso_3p`` / ``iso_add3p`` / ``iso_snp`` or a
           combination; empty at aggregated granularities)
-        - ``adata.var['reads']`` + ``iso_*`` columns -- per-feature total
-          reads and per-variant-type counts (variant granularity)
+        - ``adata.var['sequence_source']`` + ``iso_*`` columns -- sequence
+          provenance and per-variant-type counts (variant granularity)
         - ``adata.uns['mirtop_result']`` -- output paths and stats log
           (including source/normalized hairpin provenance)
     """
@@ -486,6 +614,25 @@ def mirtop_quant(
     binary = _find_mirtop_binary()
     gff_path, source_hairpin_path = _resolve_reference_files(gff, hairpin)
     hairpin_path, hairpin_normalized = normalize_rna_fasta_to_dna(source_hairpin_path)
+    mature_path = _resolve_mature_fasta(mature_fa, source_hairpin_path)
+    mature_sequences = _load_mature_sequences(mature_path) if mature_path is not None else {}
+    mirtop_reference: Dict[str, object] = {
+        "gff3": str(gff_path),
+        "source_gff3": str(gff_path),
+        "rebuilt": False,
+        "issues_before": [],
+        "issues_after": [],
+    }
+    if mature_path is not None:
+        # miRBase genome GFF3 files can be precursor-only, while locally
+        # augmented files may carry stale Derives_from IDs. Build a separate,
+        # validated GFF3 rather than mutating the downloaded reference.
+        mirtop_reference = prepare_mirtop_reference(
+            str(gff_path), str(hairpin_path), str(mature_path),
+        )
+        gff_path = Path(str(mirtop_reference["gff3"]))
+        if mirtop_reference["rebuilt"]:
+            print(f"[mirtop] Built validated reference GFF3: {gff_path}", flush=True)
     out_dir = Path(output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -499,14 +646,28 @@ def mirtop_quant(
 
     merged_gff = out_dir / "mirtop.gff"
 
-    # Step 1: merged `mirtop gff` over all BAMs (idempotent).
+    # Step 1: merge previously generated per-sample GFFs when possible.
+    existing_sample_gffs = _resolve_existing_sample_gffs(
+        adata, out_dir, bam_paths, sample_names
+    )
     if not overwrite and _merged_gff_covers_samples(merged_gff, sample_names):
         print(
-            f"[mirtop] Skipping `mirtop gff`: {merged_gff} already covers "
+            f"[mirtop] Skipping GFF preparation: {merged_gff} already covers "
             f"all {len(sample_names)} samples",
             flush=True,
         )
+    elif existing_sample_gffs is not None:
+        print(
+            f"[mirtop] Merging {len(existing_sample_gffs)} existing per-sample GFFs "
+            f"into {merged_gff}; BAMs will not be reprocessed",
+            flush=True,
+        )
+        _merge_sample_gffs(existing_sample_gffs, merged_gff)
     else:
+        print(
+            "[mirtop] No complete per-sample GFF set found; running `mirtop gff` on BAMs",
+            flush=True,
+        )
         cmd = [
             binary,
             "gff",
@@ -528,10 +689,15 @@ def mirtop_quant(
     if not merged_gff.exists():
         raise FileNotFoundError(f"`mirtop gff` did not produce {merged_gff}")
 
-    # Per-sample GFFs are written by the same invocation (one per BAM stem).
     sample_gffs = {
-        sample: str(out_dir / f"{Path(bam_paths[sample]).stem}.gff")
-        for sample in sample_names
+        sample: str(path)
+        for sample, path in (
+            existing_sample_gffs
+            or {
+                sample: out_dir / f"{Path(bam_paths[sample]).stem}.gff"
+                for sample in sample_names
+            }
+        ).items()
     }
 
     # Step 2: combined `mirtop counts` (idempotent).
@@ -605,8 +771,12 @@ def mirtop_quant(
             var["mirna_id"] = [str(idx) for idx in aggregated.index]
         if "Variant" in meta.columns:
             var["variant_type"] = meta["Variant"].astype(str)
-        if "Read" in meta.columns:
-            var["reads"] = pd.to_numeric(meta["Read"], errors="coerce").fillna(0)
+        read_sequences = meta["Read"].map(_normalise_rna_sequence) if "Read" in meta.columns else pd.Series("", index=meta.index)
+        var["sequence"] = read_sequences.replace("", pd.NA)
+        var["sequence_source"] = [
+            "mirtop Read" if isinstance(sequence, str) and sequence else pd.NA
+            for sequence in var["sequence"]
+        ]
         for col in ("iso_5p", "iso_3p", "iso_add3p", "iso_snp"):
             if col in meta.columns:
                 var[col] = pd.to_numeric(meta[col], errors="coerce").fillna(0)
@@ -626,6 +796,15 @@ def mirtop_quant(
                 ).sum(numeric_only=True)
                 for col in type_cols:
                     var[col] = summed[col].reindex(aggregated.index).fillna(0)
+        var["sequence"] = [mature_sequences.get(str(mirna), pd.NA) for mirna in var["mirna_id"]]
+        var["sequence_source"] = [
+            "miRBase mature FASTA" if isinstance(sequence, str) else pd.NA
+            for sequence in var["sequence"]
+        ]
+    var["seed_sequence"] = [
+        sequence[1:8] if isinstance(sequence, str) and len(sequence) >= 8 else pd.NA
+        for sequence in var["sequence"]
+    ]
     var["id_column"] = id_col
 
     adata = adata[sample_names].copy()
@@ -642,8 +821,11 @@ def mirtop_quant(
         "species": species,
         "granularity": granularity,
         "gff": str(gff_path),
+        "source_gff": str(mirtop_reference["source_gff3"]),
+        "gff_reference": mirtop_reference,
         "hairpin": str(hairpin_path),
         "source_hairpin": str(source_hairpin_path),
+        "mature_fa": str(mature_path) if mature_path is not None else "",
         "hairpin_rna_to_dna_normalized": hairpin_normalized,
         "rna_type": rna_type,
         "files": {

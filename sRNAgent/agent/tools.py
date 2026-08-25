@@ -35,7 +35,11 @@ _SKILL_ALIASES = {
     "reference-download": ("参考基因组", "参考下载", "gencode", "ensembl", "mirbase"),
     "reporting": ("报告", "html报告", "分析报告", "结果汇总"),
     "samtools_idxstats": ("pirna定量", "pirna计数", "idxstats", "samtools"),
-    "starbase-mirna-targets": ("靶基因", "靶标", "mirna靶标", "starbase", "encori"),
+    "mirna-target-prediction": (
+        "靶基因", "靶标", "mirna靶标", "starbase", "encori", "miranda",
+        "isomir靶标", "isomir target", "seed", "seed analysis", "种子序列",
+        "isomir靶标变化", "父mirna靶标", "parent mirna target", "3utr", "3'utr",
+    ),
     "trna-fragment-quantification-with-trax": ("trna定量", "trf", "tdr", "trna片段", "trax"),
 }
 
@@ -104,16 +108,21 @@ def _default_quantification_skills(query: str) -> set[str]:
 def _explicit_method_skills(query: str, skill_registry: SkillRegistry) -> set[str]:
     """Resolve a named method before applying broad biological defaults."""
     lowered = str(query or "").lower()
-    method_slugs = {
+    method_patterns = {
         "feature-count": r"feature[-_ ]?counts?",
         "samtools_idxstats": r"idxstats?|samtools",
         "mirdeep2-mirna": r"mirdeep(?:2)?",
         "isomir-quantification": r"mirtop",
         "trna-fragment-quantification-with-trax": r"trax",
+        # These terms identify an analysis method, not isomiR quantification.
+        # Keep them in the same deterministic priority layer as explicit
+        # quantifiers so a target-prediction request cannot be hijacked by the
+        # broad "isomiR" keyword on the quantification skill.
+        "mirna-target-prediction": r"starbase|encori|miranda|seed(?:[ _-]?analysis)?|种子(?:序列)?|靶标预测|靶基因|靶标变化|parent[ _-]?mirna",
     }
     available = {slug.lower() for slug in skill_registry.skill_metadata}
     return {
-        slug for slug, pattern in method_slugs.items()
+        slug for slug, pattern in method_patterns.items()
         if slug in available and re.search(pattern, lowered, re.IGNORECASE)
     }
 

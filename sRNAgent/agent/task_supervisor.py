@@ -264,6 +264,7 @@ class TaskProgressSupervisor:
                 "detail": stage,
                 "activeProcess": bool(active),
                 "recentArtifactChange": bool(changed),
+                "hasEvidence": True,
             }
         if sample_gffs:
             stage = f"已完成 {len(sample_gffs)} 个样本级 GFF，剩余任务仍在运行"
@@ -273,6 +274,7 @@ class TaskProgressSupervisor:
                 "detail": stage,
                 "activeProcess": bool(active),
                 "recentArtifactChange": bool(changed),
+                "hasEvidence": True,
             }
         if files:
             stage = f"已发现 {len(files)} 个产物，任务仍在运行"
@@ -282,6 +284,7 @@ class TaskProgressSupervisor:
                 "detail": stage,
                 "activeProcess": bool(active),
                 "recentArtifactChange": bool(changed),
+                "hasEvidence": True,
             }
         if active:
             stage = "外部进程正在运行，等待首个产物"
@@ -291,6 +294,7 @@ class TaskProgressSupervisor:
                 "detail": stage,
                 "activeProcess": True,
                 "recentArtifactChange": False,
+                "hasEvidence": True,
             }
         stage = "任务正在运行，等待首个可追踪产物"
         return {
@@ -299,4 +303,5 @@ class TaskProgressSupervisor:
             "detail": stage,
             "activeProcess": False,
             "recentArtifactChange": False,
+            "hasEvidence": False,
         }

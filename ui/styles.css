@@ -2102,6 +2102,71 @@ a {
   font-style: italic;
 }
 
+.chat-live-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 20px;
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.chat-live-status::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: chat-live-status-pulse 1.4s ease-in-out infinite;
+}
+
+.chat-group--queued-send .chat-bubble {
+  background: color-mix(in srgb, var(--card) 82%, var(--accent-subtle));
+}
+
+.queued-send-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.queued-send-notice__text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.queued-send-notice__cancel {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  cursor: pointer;
+}
+
+.queued-send-notice__cancel:hover,
+.queued-send-notice__cancel:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+  outline: none;
+}
+
+@keyframes chat-live-status-pulse {
+  0%, 100% { opacity: 0.38; transform: scale(0.82); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
 .chat-thinking {
   margin-bottom: 10px;
   border: 1px solid color-mix(in srgb, var(--border) 85%, var(--accent) 15%);
