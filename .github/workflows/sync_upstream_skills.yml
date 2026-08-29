@@ -1,0 +1,21 @@
+name: (DEPRECATED) Auto Sync Nature Figure Skill
+on:
+  workflow_dispatch:
+
+# This workflow is intentionally neutralized.
+# The nature-figure skill it synced has been removed from the repository;
+# running the upstream clone would resurrect files that the maintainers
+# are actively deleting. Delete this file in a future cleanup pass, or
+# repurpose it once a different upstream skill is registered.
+
+permissions:
+  contents: write
+
+jobs:
+  sync_skill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify maintainer
+        run: |
+          echo "sync_upstream_skills is deprecated: nature-figure has been removed."
+          echo "This job is a no-op. Please remove the workflow file or repurpose it."

@@ -1,0 +1,62 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "trim-before-isomir-collapse",
+      "kind": "stage",
+      "activation": {"requires": ["raw_fastq"], "missing": ["trimmed_fastq"]},
+      "placement": {"before_skills": ["isomir-quantification"]},
+      "step": {
+        "title": "完成 isomiR 前的 FASTQ 质控与接头修剪",
+        "goal": "对原始 small RNA FASTQ 先确认 adapter 并运行 cutadapt，产出每个样本非空 trimmed_path；接头残留会被误判为 isomiR 3' 加尾，未经 trimming 不得进入后续 hairpin Bowtie 或 mirtop。",
+        "skill": "fastq-qc",
+        "inputs": ["trim_config_confirmed"],
+        "outputs": ["trimmed_fastq"]
+      }
+    },
+    {
+      "id": "collapse-before-hairpin-alignment",
+      "kind": "stage",
+      "activation": {"requires": ["trimmed_fastq"], "missing": ["collapsed_fastq"]},
+      "placement": {"before_skills": ["alignment-srna"], "fallback_before_skills": ["isomir-quantification"]},
+      "replaces_titles": ["折叠 trimmed FASTQ"],
+      "step": {
+        "title": "折叠 trimmed FASTQ 供 isomiR hairpin 比对",
+        "goal": "对全部样本运行 sa.fastq.seqcluster_collapse；验证每个 collapsed_path 为非空 .fastq.gz，并将其作为 hairpin Bowtie 输入。不得用未折叠 FASTQ 生成的 BAM 做 mirtop。",
+        "skill": "isomir-quantification",
+        "inputs": ["trimmed_fastq"],
+        "outputs": ["collapsed_fastq"]
+      }
+    },
+    {
+      "id": "trim-before-isomir-collapse-order",
+      "kind": "order",
+      "activation": {},
+      "placement": {"before_skills": ["fastq-qc"], "after_skills": ["isomir-quantification"]}
+    },
+    {
+      "id": "hairpin-alignment-artifact-contract",
+      "kind": "bind_io",
+      "activation": {},
+      "selector": {"skills": ["alignment-srna"], "select": "last"},
+      "io": {
+        "inputs": ["collapsed_fastq"],
+        "outputs": ["hairpin_bam"]
+      }
+    },
+    {
+      "id": "isolated-parallel-mirtop-execution",
+      "kind": "execution",
+      "activation": {},
+      "selector": {"skills": ["isomir-quantification"], "select": "last"},
+      "execution": {
+        "instructions": "mirtop gff 没有 jobs/threads 参数。若直接调用 CLI，在任何 worker 启动前必须先调用 sa.reference.prepare_mirtop_reference(gff3, hairpin_fasta, mature_fasta)，并将返回的 result['gff3'] 作为所有 --gtf 输入；不得手工重命名 GFF3 或仅替换 Derives_from。sa.quant.mirtop 会自动完成同一预检。多样本并行时必须每样本一个独立 staging 输出目录，使用 run_threads 限制并发；每个 worker 返回时输出 progress 与 inflight；stdout/stderr 写入样本私有日志，禁止 capture_output=True；汇总前验证每个样本非空 GFF。"
+      },
+      "io": {
+        "inputs": ["hairpin_bam", "mirtop_reference"],
+        "outputs": ["sample_mirtop_gff", "merged_mirtop_gff", "isomir_counts", "isomir_stats"]
+      }
+    }
+  ]
+}

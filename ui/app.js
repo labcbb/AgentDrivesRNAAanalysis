@@ -1,0 +1,5647 @@
+const shell = document.querySelector(".shell");
+const navToggle = document.getElementById("nav-toggle");
+const navBackdrop = document.getElementById("nav-backdrop");
+const collapseToggle = null;
+const themeToggle = document.getElementById("theme-toggle");
+const composerForm = document.getElementById("composer-form");
+const composer = document.getElementById("composer");
+const sendBtn = document.getElementById("send-btn");
+const chatScroll = document.getElementById("chat-scroll");
+const threadInner = document.getElementById("chat-thread-inner");
+const agentLeftPanel = document.getElementById("agent-left-panel");
+const agentCodePanel = document.getElementById("agent-code-panel");
+const agentCodeInner = document.getElementById("agent-code-inner");
+const autoApproveToggle = document.getElementById("auto-approve-toggle");
+const supervisorOpenBtn = document.getElementById("supervisor-open-btn");
+const branchChatPanel = document.getElementById("branch-chat-panel");
+const supervisorThread = document.getElementById("supervisor-thread");
+const supervisorForm = document.getElementById("supervisor-form");
+const supervisorInput = document.getElementById("supervisor-input");
+const supervisorSendBtn = document.getElementById("supervisor-send-btn");
+const leftPanelModeSelect = document.getElementById("left-panel-mode");
+const reportPageBody = document.getElementById("report-page-body");
+const reportPageMeta = document.getElementById("report-page-meta");
+const reportPageSubtitle = document.getElementById("report-page-subtitle");
+const reportRefreshBtn = document.getElementById("report-refresh-btn");
+const reportClearBtn = document.getElementById("report-clear-btn");
+const breadcrumbCurrent = document.getElementById("breadcrumb-current");
+const agentSessions = document.getElementById("agent-sessions");
+const newChatBtn = document.getElementById("new-chat-btn");
+const chatRecentList = document.getElementById("chat-recent-list");
+const parameterHint = document.getElementById("parameter-hint");
+const parameterForm = document.getElementById("parameter-form");
+const analysisLog = document.getElementById("analysis-log");
+const runAnalysisBtn = document.getElementById("run-analysis-btn");
+
+/** HTTP + 非 localhost 时 crypto.randomUUID 不可用，需 fallback */
+function createId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    try {
+      return crypto.randomUUID();
+    } catch {
+      // insecure context (e.g. http://123.x.x.x)
+    }
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+function getOrCreateDeviceId() {
+  try {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (id && id.length >= 8) return id;
+    id = createId();
+    localStorage.setItem(DEVICE_ID_KEY, id);
+    return id;
+  } catch {
+    return createId();
+  }
+}
+
+function getDeviceActiveChatId() {
+  try {
+    return localStorage.getItem(DEVICE_ACTIVE_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+function setDeviceActiveChatId(chatId) {
+  try {
+    if (chatId) localStorage.setItem(DEVICE_ACTIVE_KEY, chatId);
+    else localStorage.removeItem(DEVICE_ACTIVE_KEY);
+  } catch {
+    // ignore quota / private mode
+  }
+}
+
+let isComposing = false;
+let pendingExecutionCode = "";
+let imeEnterStroke = false;
+let activeCodeExecutionId = null;
+let currentPage = "agent";
+/** @type {Map<string, { generation: number, runId: string, abortController: AbortController, messages: Array<any>, assistantEntry: any, pending: Element|null, idleTimer: number|null, lastStreamEventAt: number, codeExecutionId: string|null }>} */
+const chatStreams = new Map();
+let nextStreamGeneration = 0;
+const STREAM_IDLE_MS = 3600000;
+const STREAM_STATUS_POLL_MS = 4000;
+const EXECUTION_ELAPSED_TICK_MS = 1000;
+/** @type {Map<string, { abortController: AbortController, runId: string, codeExecutionId: string|null, lastSeq: number }>} */
+const liveFollows = new Map();
+/** @type {Map<string, Array<{id: string, text: string, notice: Element|null}>>} 主任务运行期间用户发的新消息先排队，当前任务结束后自动发送 */
+const pendingSends = new Map();
+const BACKGROUND_WATCH_POLL_MS = 3000;
+const BACKGROUND_EXECUTION_ID = "background-kernel-run";
+/** @type {Map<string, { timer: number, startedAt: number, pending: Element|null, assistantEntry: any|null }>} */
+const backgroundWatches = new Map();
+let executionElapsedTimer = null;
+
+function isChatStreaming(chatId) {
+  if (!chatId) return false;
+  const stream = chatStreams.get(chatId);
+  if (!stream) return false;
+  // 旁观伪 stream 不算「本机主发送流」
+  return !stream.isFollower;
+}
+
+function isLiveFollowing(chatId = activeChatId) {
+  return Boolean(chatId && liveFollows.has(chatId));
+}
+
+function isActiveChatSending() {
+  return (
+    isChatStreaming(activeChatId)
+    || isLiveFollowing(activeChatId)
+    // 刷新页面后 chatStreams 已清空，但 agent 可能仍在后端运行
+    // （resumeBackgroundRunIfNeeded 已建后台监视）—— 仍视为"运行中"，
+    // 这样刷新后发消息会排队而不是启动新 run 取消旧 run
+    || backgroundWatches.has(activeChatId)
+  );
+}
+
+function getChatStream(chatId) {
+  return chatStreams.get(chatId || activeChatId) || null;
+}
+
+function syncComposerForActiveChat() {
+  setComposerMode(isActiveChatSending() ? "stop" : "send");
+  renderRecentChats();
+}
+
+function getChatRecord(chatId) {
+  return chatStore.chats.find((chat) => chat.id === chatId) || null;
+}
+
+function ensureChatRecord(chatId) {
+  if (!chatId) return null;
+  let chat = getChatRecord(chatId);
+  if (!chat) {
+    chat = {
+      id: chatId,
+      title: "New Chat",
+      messages: [],
+      codePanel: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    chatStore.chats.unshift(chat);
+  }
+  if (!Array.isArray(chat.codePanel)) chat.codePanel = [];
+  return chat;
+}
+
+function persistChatMessages(chatId, messages) {
+  if (!chatId) return;
+  const hasMessages = messages.some(
+    (item) => item.role === "user" || (item.role === "assistant" && assistantHasPersistableContent(item)),
+  );
+  if (!hasMessages) {
+    removeEmptyChat(chatId);
+    saveChatStore();
+    renderRecentChats();
+    return;
+  }
+
+  const chat = ensureChatRecord(chatId);
+  chat.messages = messages
+    .map((item) => normalizeMessage(item))
+    .filter(
+      (item) =>
+        item.role === "user" ||
+        (item.role === "assistant" && assistantHasPersistableContent(item)),
+    );
+  chat.updatedAt = Date.now();
+  chat.title = deriveChatTitle(chat.messages);
+  if (chatStore.chats.length > MAX_STORED_CHATS) {
+    chatStore.chats.sort((a, b) => b.createdAt - a.createdAt);
+    chatStore.chats = chatStore.chats.slice(0, MAX_STORED_CHATS);
+  }
+  if (chatId === activeChatId) {
+    chatStore.activeChatId = activeChatId;
+  }
+  saveChatStore();
+  scheduleServerSessionSave(chatId);
+  renderRecentChats();
+}
+
+function cancelAllChatStreams() {
+  for (const [chatId, stream] of chatStreams.entries()) {
+    stream.generation = -1;
+    stream.abortController?.abort();
+    void window.cancelAgentRun?.(stream.runId, chatId);
+  }
+  chatStreams.clear();
+  renderRecentChats();
+}
+
+function finishChatStream(chatId, options = {}) {
+  const stream = chatStreams.get(chatId);
+  if (stream?.idleTimer) {
+    window.clearInterval(stream.idleTimer);
+    stream.idleTimer = null;
+  }
+  if (stream?.statusPollTimer) {
+    window.clearInterval(stream.statusPollTimer);
+    stream.statusPollTimer = null;
+  }
+  chatStreams.delete(chatId);
+  renderRecentChats();
+  if (chatId !== activeChatId) return;
+  syncComposerForActiveChat();
+  schedulePendingSendDrain(chatId);
+  if (!options.keepBackgroundWatch && window.llmIsLocalServer?.()) {
+    if (isActiveChatSending()) {
+      window.KernelPanel?.stopPolling?.();
+    } else {
+      window.KernelPanel?.refresh?.({ force: true });
+      window.KernelPanel?.startPolling?.(12000);
+    }
+  }
+}
+let chatHistory = [];
+let activeChatId = null;
+let currentAnalysisCategory = "";
+
+const CHAT_STORE_KEY = "srnagent-chat-sessions";
+const DEVICE_ID_KEY = "srnagent-device-id";
+const DEVICE_ACTIVE_KEY = "srnagent-device-active-chat";
+const AUTO_APPROVE_KEY = "srnagent-auto-approve-code";
+const APPROVAL_MODE_KEY = "srnagent-approval-mode";
+const LIVE_EVENT_CHECKPOINT_KEY_PREFIX = "srnagent-live-event-checkpoint:";
+const MAX_STORED_CHATS = 40;
+
+/** "server" = catalog + per-chat RW via serve.py; "local" = offline localStorage fallback */
+let chatPersistenceMode = "pending";
+/** Only flush chats this device actually touched (never blanket rewrite all). */
+const pendingServerSaveIds = new Set();
+
+let chatStore = { activeChatId: null, chats: [] };
+let approvalMode = loadApprovalModeSetting();
+let autoApproveCode = approvalMode === "auto";
+let serverSessionSaveTimer = null;
+/** @type {Array<{role:string, content:string}>} */
+let supervisorHistory = [];
+let supervisorBusy = false;
+/** @type {AbortController|null} */
+let supervisorAbortController = null;
+let supervisorImeEnterStroke = false;
+/** "code" | "branch" — left panel beside the chat. */
+let leftPanelMode = "code";
+
+function getLiveEventCheckpoint(chatId) {
+  if (!chatId) return null;
+  try {
+    const raw = sessionStorage.getItem(`${LIVE_EVENT_CHECKPOINT_KEY_PREFIX}${chatId}`);
+    const value = raw ? JSON.parse(raw) : null;
+    const runId = String(value?.runId || "").trim();
+    const seq = Number(value?.seq);
+    return runId && Number.isFinite(seq) && seq > 0 ? { runId, seq } : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberLiveEventCheckpoint(chatId, runId, seq) {
+  const normalizedRunId = String(runId || "").trim();
+  const normalizedSeq = Number(seq);
+  if (!chatId || !normalizedRunId || !Number.isFinite(normalizedSeq) || normalizedSeq <= 0) return;
+  try {
+    const current = getLiveEventCheckpoint(chatId);
+    const nextSeq = current?.runId === normalizedRunId
+      ? Math.max(current.seq, normalizedSeq)
+      : normalizedSeq;
+    sessionStorage.setItem(
+      `${LIVE_EVENT_CHECKPOINT_KEY_PREFIX}${chatId}`,
+      JSON.stringify({ runId: normalizedRunId, seq: nextSeq }),
+    );
+  } catch {
+    // Session storage can be unavailable in private/restricted browser contexts.
+  }
+}
+
+function recordLiveEventCheckpoint(chatId, assistantEntry, event) {
+  if (!assistantEntry) return;
+  const seq = Number(event?._seq);
+  const runId = String(event?.runId || "").trim();
+  if (!runId || !Number.isFinite(seq) || seq <= 0) return;
+  if (assistantEntry.liveEventRunId !== runId) {
+    assistantEntry.liveEventRunId = runId;
+    assistantEntry.liveEventSeq = 0;
+  }
+  assistantEntry.liveEventSeq = Math.max(Number(assistantEntry.liveEventSeq) || 0, seq);
+  rememberLiveEventCheckpoint(chatId, runId, assistantEntry.liveEventSeq);
+}
+
+const categoryLabels = {
+  normalization: "Normalization",
+  qc: "Quality Control",
+  feature: "Feature Selection",
+  dimreduction: "Dimensionality Reduction",
+  clustering: "Clustering",
+  deg: "Differential Expression",
+  dct: "Differential Cell Type",
+  annotation: "Cell Annotation",
+  trajectory: "Trajectory Analysis",
+  "env-install": "Python Package Install",
+  "env-info": "Python Env Info",
+};
+
+function setTheme(mode) {
+  document.documentElement.setAttribute("data-theme-mode", mode);
+  localStorage.setItem("ui-mock-theme", mode);
+}
+
+function initTheme() {
+  const saved = localStorage.getItem("ui-mock-theme");
+  setTheme(saved === "light" ? "light" : "dark");
+}
+
+// 用户向上滚动查看历史内容时，强制滚到底会让用户丢失滚动位置。
+// 用 stick-to-bottom 标志：用户主动向上滚后停止自动跟随，新内容到达时
+// 也不再拉回底部；用户重新滚到底部再恢复跟随。
+let chatStickToBottom = true;
+chatScroll?.addEventListener("scroll", () => {
+  if (!chatScroll) return;
+  const distance = chatScroll.scrollHeight - chatScroll.scrollTop - chatScroll.clientHeight;
+  chatStickToBottom = distance <= 50;
+});
+
+let codeStickToBottom = true;
+let suppressCodeAutoScroll = false;
+function _updateCodeStickToBottom() {
+  const inner = getCodePanelInner();
+  if (!inner) return;
+  const distance = inner.scrollHeight - inner.scrollTop - inner.clientHeight;
+  codeStickToBottom = distance <= 50;
+}
+agentCodeInner?.addEventListener("scroll", _updateCodeStickToBottom, { passive: true });
+
+function scrollThreadToBottom() {
+  if (!chatScroll || !chatStickToBottom) return;
+  requestAnimationFrame(() => {
+    if (!chatStickToBottom) return;
+    chatScroll.scrollTop = chatScroll.scrollHeight;
+  });
+}
+
+function scrollCodePanelToBottom() {
+  const inner = getCodePanelInner();
+  if (!inner || !codeStickToBottom || suppressCodeAutoScroll) return;
+  requestAnimationFrame(() => {
+    const cur = getCodePanelInner();
+    if (!cur || !codeStickToBottom || suppressCodeAutoScroll) return;
+    if (cur.scrollHeight <= cur.clientHeight + 1) {
+      cur.scrollTop = 0;
+      return;
+    }
+    cur.scrollTop = cur.scrollHeight;
+  });
+}
+
+function captureCodePanelScrollState() {
+  const inner = getCodePanelInner();
+  if (!inner) return null;
+  return {
+    stickToBottom: codeStickToBottom,
+    scrollTop: inner.scrollTop,
+    scrollHeight: inner.scrollHeight,
+    clientHeight: inner.clientHeight,
+  };
+}
+
+function restoreCodePanelScrollState(state) {
+  const inner = getCodePanelInner();
+  if (!inner || !state || state.stickToBottom) return;
+  const maxTop = Math.max(0, inner.scrollHeight - inner.clientHeight);
+  inner.scrollTop = Math.min(state.scrollTop, maxTop);
+  _updateCodeStickToBottom();
+}
+
+function isProgressNoiseLine(line) {
+  const text = String(line || "");
+  if (!text) return true;
+  if (text.includes("__SRNAGENT_DL__")) return true;
+  if (/\d+%\|[\s█▏▎▍▌▋▊▉]+\|/.test(text)) return true;
+  if (/overallPct/i.test(text) && /bytesTotal/i.test(text)) return true;
+  if (/\[\d{2}:\d{2}<\d{2}:\d{2},\s*\d+[kMG]?B\/s\]/.test(text)) return true;
+  return false;
+}
+
+function countInflightSamples(text) {
+  const value = String(text || "");
+  if (!value) return 0;
+  const tupleMatches = value.match(/\(\s*'[^']*'\s*,\s*'[^']*'\s*\)/g);
+  if (tupleMatches?.length) return tupleMatches.length;
+  const payload = value.split(/[:：]/).slice(1).join(":").trim();
+  if (!payload) return 0;
+  if (payload === "[]" || payload === "{}" || payload === "()") return 0;
+  const sampleIds = payload.match(/\b(?:SRR|ERR|DRR)\d+\b/gi);
+  if (sampleIds?.length) return new Set(sampleIds.map((item) => item.toUpperCase())).size;
+  const items = payload.split(",").map((item) => item.trim()).filter(Boolean);
+  return items.length || 1;
+}
+
+function extractExecutionConcurrency(artifact) {
+  const text = [
+    artifact?.description,
+    artifact?.stage,
+    artifact?.progressLabel,
+    artifact?.code,
+  ].filter(Boolean).join(" ");
+  const patterns = [
+    /\bjobs\s*=\s*(\d+)/i,
+    /\bmax_workers\s*=\s*(\d+)/i,
+    /\bN_PARALLEL\s*=\s*(\d+)/i,
+    /(\d+)\s*(?:个|路)?\s*(?:样本)?\s*(?:并行|并发|parallel|concurrent)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const workers = Number(match[1]);
+    if (Number.isFinite(workers) && workers > 0) return workers;
+  }
+  return null;
+}
+
+function inferBatchTotal(artifact) {
+  const text = [artifact?.description, artifact?.stage, artifact?.progressLabel, artifact?.code]
+    .filter(Boolean).join(" ");
+  const patterns = [
+    /[×x]\s*(\d+)\s*(?:个)?\s*(?:样本|samples?)/i,
+    /(?:总样本|total\s*(?:samples?)?)\s*[:：=]?\s*(\d+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+    const total = Number(match[1]);
+    if (Number.isFinite(total) && total > 0) return total;
+  }
+  return null;
+}
+
+function inferExecutionPhaseLabel(payload = {}) {
+  const texts = [
+    payload.description,
+    payload.stage,
+    payload.progressLabel,
+    ...(Array.isArray(payload.highlights) ? payload.highlights : []),
+  ]
+    .map((line) => String(line || "").trim())
+    .filter(Boolean);
+  if (!texts.length) return "";
+  const joined = texts.join("\n");
+  const lower = joined.toLowerCase();
+
+  if ((/pirna|piRNA/.test(joined) || /pirna/.test(lower)) && (/quant|count|定量|表达/.test(joined) || /quant|count/.test(lower))) {
+    return "当前任务：piRNA 定量";
+  }
+  if (/mirdeep2|mirdeep/.test(lower) || ((/mirna|miRNA/.test(joined) || /mirna/.test(lower)) && (/quant|count|定量|novel|表达/.test(joined) || /quant|count|novel/.test(lower)))) {
+    return "当前任务：miRNA 定量 / miRDeep2";
+  }
+  if ((/trax/.test(lower) || /trna|tRNA/.test(joined) || /trna/.test(lower)) && (/quant|count|定量|表达/.test(joined) || /quant|count/.test(lower))) {
+    return "当前任务：tRNA 定量";
+  }
+  if (/bowtie|align|alignment|比对/.test(joined) || /bowtie|align/.test(lower)) {
+    return "当前任务：序列比对";
+  }
+  // seqcluster descriptions mention trimmed FASTQ as an input; recognize the
+  // operation itself before falling back to the generic trim label.
+  if (/seqcluster|collapse|序列折叠|去重/.test(joined) || /seqcluster|collapse/.test(lower)) {
+    return "当前任务：序列折叠 / 去重";
+  }
+  if (/cutadapt|trim|修剪|去接头/.test(joined) || /cutadapt|trim/.test(lower)) {
+    return "当前任务：接头修剪";
+  }
+  if (/fastqc|multiqc|质控|\bqc\b/.test(joined) || /fastqc|multiqc|\bqc\b/.test(lower)) {
+    return "当前任务：质控";
+  }
+  if (
+    /fragmentomics|fragomics|fragment-analysis|片段组学/.test(joined)
+    || /fragmentomics|fragomics|fragment-analysis/.test(lower)
+    || /(?:\bFSD\b|\bFSC\b|\bRCD\b|\bEDM\b|\bBPM\b)/.test(joined)
+  ) {
+    return "当前任务：片段组学";
+  }
+  if (/download|下载/.test(joined) || /download/.test(lower)) {
+    return "当前任务：下载数据";
+  }
+  return "";
+}
+
+function resolveExecutionPhaseTitle(event, existing) {
+  const rawHighlights = Array.isArray(event?.highlights)
+    ? event.highlights.filter(Boolean)
+    : String(event?.snippet || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+  const hasProgressFields = Boolean(
+    event?.progressOverallPct != null
+    || event?.progressFilePct != null
+    || event?.progressRun
+    || event?.progressFileTotal
+    || event?.progressBytesTotal
+    || event?.progressLabel
+    || Number(event?.progressBytes) > 0
+    || event?.progressIndeterminate,
+  );
+  const isDownloadTask = Boolean(event?.isDownloadTask || existing?.isDownloadTask || hasProgressFields);
+  const highlights = filterExecutionHighlights(rawHighlights, { isDownloadTask });
+  const phaseDescription = inferExecutionPhaseLabel({
+    description: event?.description || event?.summary || existing?.description || "",
+    stage: event?.stage || existing?.stage || "",
+    progressLabel: event?.progressLabel || existing?.progressLabel || "",
+    highlights,
+  });
+  return {
+    isDownloadTask,
+    highlights,
+    phaseDescription,
+    title: phaseDescription || event?.summary || event?.description || "代码执行中",
+  };
+}
+
+function extractBatchExecutionSummary(artifact) {
+  const texts = [
+    artifact?.stage,
+    artifact?.progressLabel,
+    ...(Array.isArray(artifact?.highlights) ? artifact.highlights : []),
+  ]
+    .map((line) => String(line || "").trim())
+    .filter(Boolean);
+
+  let done = null;
+  let total = null;
+  let running = null;
+
+  texts.forEach((text) => {
+    const batchMatch = text.match(/已完成\s*(\d+)\s*\/\s*(\d+)\s*样本/);
+    if (batchMatch) {
+      done = Number(batchMatch[1]);
+      total = Number(batchMatch[2]);
+      return;
+    }
+    const artifactMatch = text.match(/(?:已完成|已发现)\s*(\d+)\s*个样本级\s*GFF/i);
+    if (artifactMatch) {
+      done = Number(artifactMatch[1]);
+      return;
+    }
+    const progressMatch = text.match(/^progress\s*:\s*(\d+)\s*\/\s*(\d+)/i);
+    if (progressMatch) {
+      done = Number(progressMatch[1]);
+      total = Number(progressMatch[2]);
+      return;
+    }
+    if (/^(进行中|inflight)\s*[:：]/i.test(text)) {
+      running = countInflightSamples(text);
+    }
+  });
+
+  if (!Number.isFinite(total) || total == null) total = inferBatchTotal(artifact);
+
+  if ((!Number.isFinite(running) || running == null) && !artifact?.done && !artifact?.stopped) {
+    const jobs = extractExecutionConcurrency(artifact);
+    if (jobs != null && Number.isFinite(done) && Number.isFinite(total)) {
+      running = Math.max(0, Math.min(jobs, total - done));
+    }
+  }
+
+  if (!Number.isFinite(done) || !Number.isFinite(total) || total <= 0) return null;
+  return {
+    done,
+    total,
+    running: Number.isFinite(running) ? Math.max(0, running) : null,
+  };
+}
+
+function filterExecutionHighlights(highlights, artifact) {
+  const items = Array.isArray(highlights) ? highlights.filter(Boolean) : [];
+  const filtered = items.filter((line) => {
+    const text = String(line || "").trim();
+    if (isProgressNoiseLine(text)) return false;
+    if (/^progress\s*:\s*\d+\s*\/\s*\d+/i.test(text)) return false;
+    if (/^(进行中|inflight)\s*[:：]/i.test(text)) return false;
+    return true;
+  });
+  if (artifact?.isDownloadTask) return [];
+  return filtered;
+}
+
+function isDownloadProgressArtifact(artifact) {
+  if (!artifact || !artifact.isDownloadTask) return false;
+  return Boolean(
+    artifact.progressRun
+    || artifact.progressFileTotal
+    || artifact.progressBytesTotal
+    || artifact.progressLabel
+    || Number(artifact.progressBytes) > 0
+    || artifact.progressIndeterminate,
+  );
+}
+
+function stripDownloadProgressFields(artifact) {
+  if (!artifact) return artifact;
+  const next = { ...artifact };
+  delete next.progressOverallPct;
+  delete next.progressFilePct;
+  delete next.progressRun;
+  delete next.progressFileIndex;
+  delete next.progressFileTotal;
+  delete next.progressBytes;
+  delete next.progressBytesTotal;
+  delete next.progressLabel;
+  delete next.progressIndeterminate;
+  next.isDownloadTask = false;
+  return next;
+}
+
+function normalizeExecutionArtifact(artifact) {
+  if (!artifact || artifact.type !== "execution") return artifact;
+  if (artifact.done || artifact.stopped) {
+    return stripDownloadProgressFields(artifact);
+  }
+  return artifact;
+}
+
+function formatElapsedLabel(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return `${total} 秒`;
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  if (mins < 60) return `${mins} 分 ${secs} 秒`;
+  const hours = Math.floor(mins / 60);
+  const remMins = mins % 60;
+  return `${hours} 小时 ${remMins} 分`;
+}
+
+function resolveExecutionStartedAt(artifact, fallbackNow = Date.now()) {
+  const startedAt = Number(artifact?.startedAt);
+  if (Number.isFinite(startedAt) && startedAt > 0) return startedAt;
+  const elapsedSec = Number(artifact?.elapsedSec);
+  if (Number.isFinite(elapsedSec) && elapsedSec >= 0) {
+    return Math.max(0, fallbackNow - elapsedSec * 1000);
+  }
+  return fallbackNow;
+}
+
+function hydrateExecutionElapsed(artifact, now = Date.now()) {
+  if (!artifact || artifact.type !== "execution" || artifact.done || artifact.stopped) return artifact;
+  const startedAt = resolveExecutionStartedAt(artifact, now);
+  const elapsedSec = Math.max(0, Math.floor((now - startedAt) / 1000));
+  return {
+    ...artifact,
+    startedAt,
+    elapsedSec,
+    elapsedLabel: formatElapsedLabel(elapsedSec),
+  };
+}
+
+function refreshRunningExecutionElapsed() {
+  const chat = getActiveChatRecord();
+  if (!chat?.codePanel || !Array.isArray(chat.codePanel)) return;
+  const now = Date.now();
+  let changed = false;
+  chat.codePanel = chat.codePanel.map((artifact) => {
+    if (artifact?.type !== "execution" || artifact.done || artifact.stopped) return artifact;
+    const next = hydrateExecutionElapsed(artifact, now);
+    if (
+      next.startedAt !== artifact.startedAt
+      || next.elapsedSec !== artifact.elapsedSec
+      || next.elapsedLabel !== artifact.elapsedLabel
+    ) {
+      changed = true;
+    }
+    return next;
+  });
+  if (!changed) return;
+  chat.codePanel.forEach((artifact) => {
+    if (artifact?.type !== "execution" || artifact.done || artifact.stopped) return;
+    const card = getExecutionCard(artifact.id);
+    if (card) applyExecutionCardState(card, normalizeExecutionArtifact(artifact), {
+      showStop: isActiveChatSending() && !artifact.done && !artifact.stopped,
+    });
+  });
+}
+
+function ensureExecutionElapsedTimer() {
+  if (executionElapsedTimer != null) return;
+  executionElapsedTimer = window.setInterval(() => {
+    refreshRunningExecutionElapsed();
+  }, EXECUTION_ELAPSED_TICK_MS);
+}
+
+function welcomeCardHtml() {
+  return `
+    <div class="welcome-card">
+      <h2>sRNA Agent</h2>
+      <p>Welcome! This is an agent for small RNA analysis</p>
+    </div>
+  `;
+}
+
+function loadApprovalModeSetting() {
+  try {
+    const mode = String(localStorage.getItem(APPROVAL_MODE_KEY) || "").trim().toLowerCase();
+    if (mode === "manual" || mode === "smart" || mode === "auto") return mode;
+    // Migrate legacy boolean toggle.
+    if (localStorage.getItem(AUTO_APPROVE_KEY) === "true") return "auto";
+  } catch (_error) {
+    // ignore
+  }
+  return "manual";
+}
+
+function setApprovalMode(mode) {
+  const next = mode === "smart" || mode === "auto" ? mode : "manual";
+  approvalMode = next;
+  autoApproveCode = next === "auto";
+  try {
+    localStorage.setItem(APPROVAL_MODE_KEY, approvalMode);
+    localStorage.setItem(AUTO_APPROVE_KEY, autoApproveCode ? "true" : "false");
+  } catch (_error) {
+    // ignore storage failures
+  }
+  updateAutoApproveUi();
+  if (autoApproveCode) {
+    approvePendingCodeCards({ auto: true });
+  }
+}
+
+function setAutoApproveCode(enabled) {
+  setApprovalMode(enabled ? "auto" : "manual");
+}
+
+function cycleApprovalMode() {
+  if (approvalMode === "manual") setApprovalMode("smart");
+  else if (approvalMode === "smart") setApprovalMode("auto");
+  else setApprovalMode("manual");
+}
+
+function updateAutoApproveUi() {
+  if (!autoApproveToggle) return;
+  const labels = {
+    manual: "审批：手动",
+    smart: "审批：智能",
+    auto: "审批：全自动",
+  };
+  autoApproveToggle.setAttribute("aria-pressed", approvalMode !== "manual" ? "true" : "false");
+  autoApproveToggle.textContent = labels[approvalMode] || labels.manual;
+  autoApproveToggle.classList.toggle("code__auto-approve-btn--active", approvalMode === "auto");
+  autoApproveToggle.classList.toggle("code__auto-approve-btn--smart", approvalMode === "smart");
+  autoApproveToggle.title =
+    "点击切换：手动批准 / 智能审批（监管者）/ 全部自动\n当前："
+    + (approvalMode === "smart"
+      ? "监管者评估，高风险仍需人工"
+      : approvalMode === "auto"
+        ? "全部自动放行"
+        : "每次代码执行都需人工批准");
+}
+
+function normalizeMessage(item) {
+  const role = item?.role === "user" ? "user" : "assistant";
+  const message = {
+    role,
+    content: role === "assistant"
+      ? stripExecutionMemoryBlock(item?.content)
+      : String(item?.content || ""),
+  };
+  if (role === "assistant" && Array.isArray(item?.thinkingSteps)) {
+    const normalizedSteps = item.thinkingSteps.map((step) => ({
+      id: step?.id ? String(step.id) : "",
+      kind: String(step?.kind || "tool"),
+      title: String(step?.title || ""),
+      body: step?.body ? String(step.body) : "",
+      data: step?.data && typeof step.data === "object" ? step.data : null,
+      roundId: String(step?.roundId || ""),
+    }));
+    const seenStepKeys = new Set();
+    const uniqueNonPlanSteps = normalizedSteps.filter((step) => {
+      if (step.kind === "plan") return false;
+      const key = thinkingStepFingerprint(step);
+      if (seenStepKeys.has(key)) return false;
+      seenStepKeys.add(key);
+      return true;
+    });
+    const lastPlanStep = normalizedSteps.filter((step) => step.kind === "plan").at(-1) || null;
+    message.thinkingSteps = lastPlanStep
+      ? [lastPlanStep, ...uniqueNonPlanSteps]
+      : uniqueNonPlanSteps;
+    // Recompute instead of trusting the persisted counter. Older sessions
+    // could contain replayed id-less steps whose counter grew on every reload.
+    message.thinkingRoundCount = countUniqueThinkingSteps(message.thinkingSteps);
+  }
+  if (role === "assistant") {
+    const storedLiveEventSeq = Number(item?.liveEventSeq);
+    if (Number.isFinite(storedLiveEventSeq) && storedLiveEventSeq > 0) {
+      message.liveEventSeq = storedLiveEventSeq;
+    }
+    const storedLiveEventRunId = String(item?.liveEventRunId || "").trim();
+    if (storedLiveEventRunId) message.liveEventRunId = storedLiveEventRunId;
+  }
+  if (role === "assistant" && Array.isArray(item?.executionLog)) {
+    message.executionLog = item.executionLog.map((entry) => ({
+      tool: String(entry?.tool || ""),
+      title: String(entry?.title || ""),
+      summary: String(entry?.summary || ""),
+    }));
+  }
+  if (role === "assistant" && item?.stopped === true) {
+    message.stopped = true;
+  }
+  return message;
+}
+
+function normalizeChat(chat) {
+  const normalized = {
+    id: chat.id,
+    title: chat.title || "New Chat",
+    messages: Array.isArray(chat.messages) ? chat.messages.map(normalizeMessage) : [],
+    codePanel: Array.isArray(chat.codePanel) ? chat.codePanel : [],
+    createdAt: chat.createdAt || Date.now(),
+    updatedAt: chat.updatedAt || Date.now(),
+  };
+  if (chat.revision != null) normalized.revision = Number(chat.revision) || 0;
+  if (chat.lastWriterDeviceId) normalized.lastWriterDeviceId = String(chat.lastWriterDeviceId);
+  if (chat.operatorLease && typeof chat.operatorLease === "object") {
+    normalized.operatorLease = {
+      deviceId: String(chat.operatorLease.deviceId || ""),
+      runId: String(chat.operatorLease.runId || ""),
+      expiresAt: Number(chat.operatorLease.expiresAt || 0) || 0,
+    };
+  }
+  if (chat._baseUpdatedAt != null) {
+    normalized._baseUpdatedAt = Number(chat._baseUpdatedAt) || undefined;
+  }
+  return normalized;
+}
+
+function loadChatStoreFromLocal() {
+  try {
+    const raw = localStorage.getItem(CHAT_STORE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && Array.isArray(parsed.chats)) {
+        return {
+          activeChatId: parsed.activeChatId || null,
+          chats: parsed.chats.map(normalizeChat),
+        };
+      }
+    }
+  } catch (_error) {
+    // ignore corrupt storage
+  }
+  return { activeChatId: null, chats: [] };
+}
+
+function saveChatStore() {
+  if (activeChatId) {
+    chatStore.activeChatId = activeChatId;
+    setDeviceActiveChatId(activeChatId);
+  }
+  if (chatPersistenceMode === "local") {
+    localStorage.setItem(CHAT_STORE_KEY, JSON.stringify(chatStore));
+  }
+  if (chatPersistenceMode === "server" && activeChatId) {
+    scheduleServerSessionSave(activeChatId);
+  }
+}
+
+function scheduleServerSessionSave(chatId) {
+  if (chatPersistenceMode !== "server" || !window.saveChatSession) return;
+  const targetId = chatId || activeChatId;
+  if (targetId) pendingServerSaveIds.add(targetId);
+  if (serverSessionSaveTimer) {
+    window.clearTimeout(serverSessionSaveTimer);
+  }
+  serverSessionSaveTimer = window.setTimeout(() => {
+    serverSessionSaveTimer = null;
+    void flushServerSessionSave();
+  }, 400);
+}
+
+async function flushServerSessionSave() {
+  if (chatPersistenceMode !== "server" || !window.saveChatSession) return;
+  const ids = [...pendingServerSaveIds];
+  pendingServerSaveIds.clear();
+  if (!ids.length && activeChatId) ids.push(activeChatId);
+  const deviceId = getOrCreateDeviceId();
+  for (const chatId of ids) {
+    const chat = chatStore.chats.find((item) => item.id === chatId);
+    if (!chat || !Array.isArray(chat.messages) || chat.messages.length === 0) continue;
+    // Skip wiping someone else's leased chat when we are only following.
+    if (chatStreams.get(chatId)?.isFollower) continue;
+    const expectedUpdatedAt =
+      chat._baseUpdatedAt != null ? Number(chat._baseUpdatedAt) : undefined;
+    try {
+      const result = await window.saveChatSession({
+        chatId: chat.id,
+        chat,
+        deviceId,
+        expectedUpdatedAt,
+        updateGlobalActive: false,
+      });
+      if (result?.conflict && result.chat) {
+        // Keep our operator view; merge catalog entry without jumping active chat.
+        const serverChat = normalizeChat(result.chat);
+        serverChat._baseUpdatedAt = Number(serverChat.updatedAt || 0) || undefined;
+        const idx = chatStore.chats.findIndex((item) => item.id === chatId);
+        if (idx >= 0 && chatId !== activeChatId) {
+          chatStore.chats[idx] = serverChat;
+        }
+        continue;
+      }
+      if (result?.ok && result.chat) {
+        chat.updatedAt = Number(result.chat.updatedAt || chat.updatedAt) || chat.updatedAt;
+        chat.revision = result.chat.revision;
+        chat._baseUpdatedAt = Number(result.chat.updatedAt || chat.updatedAt) || undefined;
+      }
+    } catch {
+      // best-effort server persistence
+    }
+  }
+}
+
+function getActiveChatRecord() {
+  return chatStore.chats.find((chat) => chat.id === activeChatId) || null;
+}
+
+function deriveChatTitle(messages) {
+  const firstUser = messages.find((item) => item.role === "user" && String(item.content || "").trim());
+  if (!firstUser) return "New Chat";
+  const text = String(firstUser.content).trim().replace(/\s+/g, " ");
+  return text.length > 42 ? `${text.slice(0, 42)}…` : text;
+}
+
+function ensureActiveChatRecord() {
+  if (!activeChatId) activeChatId = createId();
+  let chat = getActiveChatRecord();
+  if (!chat) {
+    chat = {
+      id: activeChatId,
+      title: "New Chat",
+      messages: [],
+      codePanel: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    chatStore.chats.unshift(chat);
+  }
+  if (!Array.isArray(chat.codePanel)) chat.codePanel = [];
+  chatStore.activeChatId = activeChatId;
+  return chat;
+}
+
+function thinkingStepFingerprint(step) {
+  if (String(step?.kind || "").trim() === "plan") return "kind:plan";
+  const id = String(step?.id || "").trim();
+  if (id) return `id:${id}`;
+  let data = "";
+  try {
+    data = step?.data && typeof step.data === "object" ? JSON.stringify(step.data) : "";
+  } catch {
+    data = "";
+  }
+  return [step?.kind || "tool", step?.title || "", step?.body || "", data].join("|");
+}
+
+function thinkingRoundId(step) {
+  const explicit = String(step?.roundId || "").trim();
+  if (explicit) return explicit;
+  const turn = Number(step?.turn);
+  return Number.isFinite(turn) && turn > 0 ? `turn:${turn}` : "";
+}
+
+function legacyThinkingRoundId(step) {
+  if (String(step?.kind || "") !== "tool" && String(step?.kind || "") !== "result") return "";
+  const id = String(step?.id || "");
+  const execution = id.match(/^execution:([^:]+):(call_[^:]+):/);
+  if (execution) return `legacy:${execution[1]}:${execution[2]}`;
+  const tool = id.match(/^stream:([^:]+):tool:(\d+)$/);
+  return tool ? `legacy:${tool[1]}:tool:${tool[2]}` : "";
+}
+
+function stableThinkingRoundId(step) {
+  const recorded = thinkingRoundId(step);
+  // Old clients stored a per-plan `turn` value, which restarts at one and is
+  // therefore not a durable count. Prefer the tool-call identity whenever it
+  // is available so live rendering and a later reload use the same value.
+  if (recorded && !recorded.startsWith("turn:")) return recorded;
+  return legacyThinkingRoundId(step) || recorded;
+}
+
+function thinkingRoundStats(steps) {
+  if (!Array.isArray(steps)) return { count: 0, exact: false };
+  const recorded = steps.map(thinkingRoundId).filter(Boolean);
+  const trusted = recorded.filter((id) => !id.startsWith("legacy:") && !id.startsWith("turn:"));
+  if (trusted.length) return { count: new Set(trusted).size, exact: true };
+  const legacy = steps.map(legacyThinkingRoundId).filter(Boolean);
+  if (legacy.length) return { count: new Set(legacy).size, exact: false };
+  return { count: new Set(recorded).size, exact: false };
+}
+
+function countUniqueThinkingSteps(steps) {
+  return thinkingRoundStats(steps).count;
+}
+
+function recordThinkingStep(step) {
+  const chat = ensureActiveChatRecord();
+  const entry = chatHistory[chatHistory.length - 1];
+  if (!entry || entry.role !== "assistant") return;
+  if (!Array.isArray(entry.thinkingSteps)) entry.thinkingSteps = [];
+  const nextStep = {
+    id: step.id || "",
+    kind: step.kind || "tool",
+    title: step.title || "",
+    body: step.body || "",
+    data: step.data && typeof step.data === "object" ? step.data : null,
+    roundId: stableThinkingRoundId(step),
+  };
+  const nextFingerprint = thinkingStepFingerprint(nextStep);
+  let index = nextStep.id
+    ? entry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id)
+    : -1;
+  if (index < 0 && nextStep.kind === "plan") {
+    index = entry.thinkingSteps.findIndex((item) => String(item?.kind || "") === "plan");
+  }
+  // Older persisted events did not have stream IDs. Match their content once
+  // so a replay upgrades the existing step instead of appending another one.
+  if (index < 0) {
+    index = entry.thinkingSteps.findIndex((item) => (
+      !String(item?.id || "").trim()
+      && thinkingStepFingerprint(item) === nextFingerprint
+    ));
+  }
+  if (index >= 0) {
+    entry.thinkingSteps[index] = nextStep;
+  } else {
+    entry.thinkingSteps.push(nextStep);
+  }
+  // The counter is derived from the deduplicated step list, so replay order
+  // cannot mutate it.
+  entry.thinkingRoundCount = countUniqueThinkingSteps(entry.thinkingSteps);
+  persistActiveChat();
+}
+
+function recordCodeArtifact(artifact) {
+  const chat = ensureActiveChatRecord();
+  if (!Array.isArray(chat.codePanel)) chat.codePanel = [];
+
+  if (artifact.type === "execution") {
+    const index = artifact.id != null
+      ? chat.codePanel.findIndex((item) => item.type === "execution" && item.id === artifact.id)
+      : chat.codePanel.findIndex((item) => item.type === "execution" && !item.done && !item.stopped);
+    if (index >= 0) {
+      const prev = chat.codePanel[index];
+      const merged = { ...prev, ...artifact };
+      if (prev.done && artifact.done === false) merged.done = true;
+      if (prev.stopped && artifact.stopped === false) merged.stopped = true;
+      if (merged.done || merged.stopped) {
+        Object.assign(merged, stripDownloadProgressFields(merged));
+      }
+      chat.codePanel[index] = merged;
+    } else {
+      chat.codePanel.push(artifact);
+    }
+  } else {
+    const existingIndex = chat.codePanel.findIndex(
+      (item) => item.type === "approval" && item.id === artifact.id,
+    );
+    if (existingIndex >= 0) {
+      chat.codePanel[existingIndex] = { ...chat.codePanel[existingIndex], ...artifact };
+    } else {
+      chat.codePanel.push(artifact);
+    }
+  }
+  persistActiveChat();
+}
+
+function isPlaceholderAssistantContent(content) {
+  const text = String(content || "").trim();
+  if (!text) return true;
+  return (
+    text === "思考中…"
+    || text.startsWith("正在")
+    || text.startsWith("Agent ")
+    || text.startsWith("已连接")
+    || text.startsWith("调用失败：")
+    || text === "（已停止生成）"
+    || text === "（流式连接已结束，未检测到后台任务）"
+    || text.startsWith("（流式连接已结束")
+    || text.startsWith("（后台运行中")
+    || text.includes("CODE 面板仍有任务执行中")
+    || text.includes("任务仍在进行")
+    || text.includes("任务已中断")
+    || text.includes("任务已结束")
+    || text.includes("长任务执行中")
+    || text.includes("可继续对话")
+    || text.includes("内核仍在执行")
+    || text.includes("请稍候")
+    || /^步骤\s*\d+\/\d+\s*[：:]/.test(text)
+    || /^步骤\s*\d+\/\d+\s*完成/.test(text)
+    || /^全部\s*\d+\s*个步骤已完成/.test(text)
+    || text === "任务运行中…"
+    || text === "Jupyter 内核正在执行代码"
+  );
+}
+
+function looksLikeStatusBanner(content) {
+  return isPlaceholderAssistantContent(content);
+}
+
+/** Prefer the best available assistant reply; never keep a status banner if a real answer exists. */
+function resolveFinalAssistantText({ current = "", reply = "", status = null } = {}) {
+  const candidates = [
+    stripExecutionMemoryBlock(reply),
+    extractPlanFinalResult(status),
+    stripExecutionMemoryBlock(current),
+  ].map((text) => String(text || "").trim()).filter(Boolean);
+
+  const real = candidates.find((text) => !looksLikeStatusBanner(text));
+  if (real) return real;
+
+  if (status?.planSummary) {
+    return `${status.planSummary}（任务已结束，可继续对话）`;
+  }
+  return candidates[0] || "";
+}
+
+function freezeAssistantFinalText(assistantEntry, text) {
+  if (!assistantEntry || !text) return;
+  assistantEntry.content = text;
+  assistantEntry._finalReplyLocked = true;
+}
+
+function canOverwriteAssistantContent(assistantEntry, nextText = "") {
+  if (!assistantEntry) return false;
+  if (assistantEntry._finalReplyLocked) return false;
+  const current = String(assistantEntry.content || "").trim();
+  if (!current || looksLikeStatusBanner(current)) return true;
+  // Never replace a real answer with a status / empty banner.
+  if (looksLikeStatusBanner(nextText) || !String(nextText || "").trim()) return false;
+  return true;
+}
+
+async function fetchRunStatus(chatId) {
+  if (!chatId || !window.fetchAgentRunStatus) return null;
+  try {
+    return await window.fetchAgentRunStatus(chatId);
+  } catch {
+    return null;
+  }
+}
+
+async function recoverPersistedFinalReply(chatId) {
+  if (!chatId || !window.fetchChatSessionDetail) return "";
+  try {
+    const detail = await window.fetchChatSessionDetail(chatId);
+    const messages = Array.isArray(detail?.chat?.messages) ? detail.chat.messages : [];
+    const lastAssistant = [...messages].reverse().find((item) => item?.role === "assistant");
+    const text = stripExecutionMemoryBlock(lastAssistant?.content || "");
+    return text && !isPlaceholderAssistantContent(text) ? text : "";
+  } catch {
+    return "";
+  }
+}
+
+function hasRunningCodePanelExecution(chatId = activeChatId) {
+  const chat = chatId === activeChatId ? getActiveChatRecord() : getChatRecord(chatId);
+  if (!chat?.codePanel) return false;
+  return chat.codePanel.some(
+    (item) => item.type === "execution" && !item.done && !item.stopped,
+  );
+}
+
+function isTaskLikelyActive(status, chatId = activeChatId) {
+  if (status?.ok) {
+    return Boolean(status.hasActiveRun || status.kernelBusy);
+  }
+  return false;
+}
+
+function isPlanSettled(status) {
+  const steps = status?.plan?.steps;
+  if (!Array.isArray(steps) || steps.length === 0) return false;
+  return steps.every((step) => {
+    const s = String(step?.status || "");
+    return s === "done" || s === "failed" || s === "skipped";
+  });
+}
+
+function planHasActiveSteps(planOrStatus) {
+  const steps = Array.isArray(planOrStatus?.steps)
+    ? planOrStatus.steps
+    : (Array.isArray(planOrStatus?.plan?.steps) ? planOrStatus.plan.steps : []);
+  return steps.some((step) => {
+    const s = String(step?.status || "");
+    return s === "running" || s === "pending" || s === "awaiting_approval";
+  });
+}
+
+function assistantEntryHasPlan(assistantEntry) {
+  return (assistantEntry?.thinkingSteps || []).some(
+    (step) => String(step?.kind || "") === "plan"
+      && Array.isArray(step?.data?.steps)
+      && step.data.steps.length > 0,
+  );
+}
+
+function clearLivePlan() {
+  window.__srnagentLivePlan = null;
+  renderTodosBoard(null);
+}
+
+function extractPlanFinalResult(status) {
+  const steps = Array.isArray(status?.plan?.steps) ? status.plan.steps : [];
+  for (let i = steps.length - 1; i >= 0; i -= 1) {
+    const step = steps[i];
+    if (String(step?.status || "") === "done" && String(step?.result || "").trim()) {
+      return String(step.result).trim();
+    }
+  }
+  return "";
+}
+
+function isStaleTaskState(status) {
+  if (!status?.ok) return false;
+  // Plan finished normally — dangling CODE flags are cleanup, not an interruption.
+  if (isPlanSettled(status) && !status.hasActiveRun && !status.kernelBusy) {
+    return false;
+  }
+  return Boolean(
+    status.stalePlanStep
+    || status.staleCodePanel
+    || ((status.planStepRunning || status.codePanelRunning) && !status.hasActiveRun && !status.kernelBusy),
+  );
+}
+
+function buildInterruptedStatusMessage(status) {
+  const parts = [];
+  if (status?.planSummary) parts.push(status.planSummary);
+  parts.push("（任务已中断，可继续对话或重新发送指令）");
+  return parts.join(" · ");
+}
+
+function interruptedPlanSnapshot(plan) {
+  if (!plan || !Array.isArray(plan.steps)) return null;
+  return {
+    ...plan,
+    steps: plan.steps.map((step) => (
+      String(step?.status || "") === "running"
+        ? { ...step, status: "interrupted" }
+        : step
+    )),
+  };
+}
+
+function planSnapshotFromThinking(assistantEntry) {
+  const planStep = (assistantEntry?.thinkingSteps || []).find(
+    (step) => String(step?.kind || "") === "plan" && Array.isArray(step?.data?.steps),
+  );
+  if (!planStep) return null;
+  return {
+    goal: String(planStep.title || "").replace(/（已(?:更新|完成)）$/, ""),
+    steps: planStep.data.steps,
+  };
+}
+
+function renderInterruptedPlan(target, assistantEntry, plan) {
+  const interrupted = interruptedPlanSnapshot(plan);
+  if (!interrupted?.steps?.length) return;
+  const step = {
+    id: "current-plan",
+    kind: "plan",
+    title: resolvePlanSnapshotTitle(interrupted.goal, "plan_interrupted"),
+    data: buildThinkingPlanData(interrupted, "plan_interrupted"),
+    body: interrupted.steps.map((item) => {
+      const mark = item.status === "done" ? "✓" : item.status === "interrupted" ? "!" : item.status === "failed" ? "✗" : "○";
+      return `${mark} ${item.title || item.goal || item.id}`;
+    }).join("\n"),
+  };
+  if (assistantEntry) appendThinkingStepToEntry(assistantEntry, step);
+  if (target) appendThinkingStep(target, step, { persist: false });
+}
+
+function renderPlanSnapshot(target, assistantEntry, plan) {
+  if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) return;
+  const step = {
+    id: "current-plan",
+    kind: "plan",
+    title: resolvePlanSnapshotTitle(plan.goal, "plan_complete"),
+    data: buildThinkingPlanData(plan, "plan_complete"),
+    body: plan.steps.map((item) => {
+      const mark = item.status === "done" ? "✓" : item.status === "running" ? "▶" : item.status === "failed" ? "✗" : "○";
+      return `${mark} ${item.title || item.goal || item.id}`;
+    }).join("\n"),
+  };
+  if (assistantEntry) appendThinkingStepToEntry(assistantEntry, step);
+  if (target) appendThinkingStep(target, step, { persist: false });
+}
+
+function syncPersistedPlanSnapshot(chatId, status) {
+  if (!status?.plan?.steps?.length) return;
+  const messages = chatId === activeChatId
+    ? chatHistory
+    : (getChatRecord(chatId)?.messages || []);
+  const assistantEntry = [...messages].reverse().find((item) => item?.role === "assistant");
+  if (!assistantEntry) return;
+
+  if (chatId === activeChatId) {
+    renderPlanSnapshot(getLastAssistantGroup(), assistantEntry, status.plan);
+    persistChatMessages(chatId, messages);
+    return;
+  }
+
+  appendThinkingStepToEntry(assistantEntry, {
+    id: "current-plan",
+    kind: "plan",
+    title: resolvePlanSnapshotTitle(status.plan.goal, "plan_revised"),
+    data: buildThinkingPlanData(status.plan, "plan_revised"),
+    body: status.plan.steps
+      .map((step) => `${summarizePlanStepStatus(step.status).mark} ${step.title || step.goal || step.id}`)
+      .join("\n"),
+  });
+  persistChatMessages(chatId, messages);
+}
+
+/** Clear stuck CODE/plan UI without rewriting a good assistant reply. */
+function cleanupDanglingTaskUi(chatId) {
+  markRunningExecutionsStopped();
+  removeBackgroundExecutionCard();
+  stopBackgroundRunWatch(chatId);
+  if (chatId === activeChatId) {
+    renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: false });
+  }
+}
+
+function buildRunStatusMessage(status) {
+  if (!status?.ok) return "";
+  const parts = [];
+  // Settled plan.json from a previous turn must not hijack the live status
+  // banner of a new tool-loop / answer turn.
+  if (status.planSummary && planHasActiveSteps(status)) parts.push(status.planSummary);
+  else if (status.kernelBusy) parts.push("Jupyter 内核正在执行代码");
+  else if (status.hasActiveRun) parts.push("Agent 正在运行");
+
+  if (isStaleTaskState(status)) {
+    parts.push("（任务已中断，计划/CODE 状态未同步）");
+  } else if (status.backgroundActive && !isChatStreaming(status.chatId || activeChatId)) {
+    parts.push("（流式连接已断开，内核仍在执行）");
+  } else if ((status.hasActiveRun || status.kernelBusy) && isChatStreaming(status.chatId || activeChatId)) {
+    parts.push("（长任务执行中，请稍候）");
+  }
+  return parts.join(" · ") || "任务运行中…";
+}
+
+function reconcileStaleTaskUi(chatId, status, options = {}) {
+  const { pending = null, assistantEntry = null, persist = true, forceMessage = false } = options;
+
+  // Soft cleanup path: plan already settled or caller only wants to clear CODE flags.
+  if (!isStaleTaskState(status)) {
+    if (isPlanSettled(status) || status?.staleCodePanel || status?.codePanelRunning) {
+      const planResult = isPlanSettled(status) ? extractPlanFinalResult(status) : "";
+      if (planResult && assistantEntry && canOverwriteAssistantContent(assistantEntry, planResult)) {
+        freezeAssistantFinalText(assistantEntry, planResult);
+        if (chatId === activeChatId) {
+          const target = resolvePendingGroup(pending) || getLastAssistantGroup();
+          updateMessageGroup(target, planResult);
+        }
+      }
+      if (chatId === activeChatId && status?.plan?.steps?.length && assistantEntryHasPlan(assistantEntry)) {
+        const target = resolvePendingGroup(pending) || getLastAssistantGroup();
+        renderPlanSnapshot(target, assistantEntry, status.plan);
+      }
+      cleanupDanglingTaskUi(chatId);
+      if (persist && chatId) persistChatMessages(chatId, chatHistory);
+      schedulePendingSendDrain(chatId);
+      return false;
+    }
+    return false;
+  }
+
+  cleanupDanglingTaskUi(chatId);
+
+  // Never clobber a real final answer with a false "interrupted" banner.
+  const hasRealAnswer =
+    assistantEntry
+    && !isPlaceholderAssistantContent(assistantEntry.content)
+    && !forceMessage;
+  if (hasRealAnswer) {
+    if (persist && chatId) persistChatMessages(chatId, chatHistory);
+    return true;
+  }
+
+  const planResult = extractPlanFinalResult(status);
+  const message = planResult || buildInterruptedStatusMessage(status);
+
+  if (assistantEntry) {
+    assistantEntry.content = message;
+  }
+  if (chatId === activeChatId) {
+    const target = resolvePendingGroup(pending) || getLastAssistantGroup();
+    renderInterruptedPlan(target, assistantEntry, status?.plan);
+    if (target) {
+      const textEl = target.querySelector(".chat-text");
+      if (textEl) {
+        textEl.classList.remove("chat-text--loading");
+        textEl.textContent = message;
+      }
+    }
+    renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: false });
+  }
+  if (persist && chatId) {
+    persistChatMessages(chatId, chatHistory);
+  }
+  schedulePendingSendDrain(chatId);
+  return true;
+}
+
+function ensureBackgroundExecutionCard(status, { showStop = false } = {}) {
+  // 已有真实 execute_code 进度卡片时，不要再叠一张「Agent 运行中」导致 CODE 区混乱
+  if (activeCodeExecutionId) return null;
+  const codeInner = getCodePanelInner();
+  if (!codeInner) return null;
+
+  const runningRealCard = codeInner.querySelector(
+    `.code-execution-progress--running:not([data-execution-id="${BACKGROUND_EXECUTION_ID}"])`,
+  );
+  if (runningRealCard) return null;
+
+  showCodePanel();
+  let card = getExecutionCard(BACKGROUND_EXECUTION_ID);
+  if (!card) {
+    card = createExecutionCardElement(BACKGROUND_EXECUTION_ID, { showStop });
+    codeInner.appendChild(card);
+  }
+
+  const stage = status?.codeStage
+    || status?.planSummary
+    || (status?.runningStepTitle ? `执行：${status.runningStepTitle}` : "")
+    || (status?.kernelBusy ? "内核执行中" : "等待中");
+  const title = status?.codeActive ? "代码运行中" : (status?.hasActiveRun ? "Agent 运行中" : "后台代码运行中");
+  const hint = status?.backgroundActive
+    ? "流式连接已断开，正在轮询后端状态。请勿重复发送消息以免打断任务。"
+    : "长任务执行中，界面将自动刷新进度。";
+  const existing = getActiveChatRecord()?.codePanel?.find(
+    (item) => item.type === "execution" && item.id === BACKGROUND_EXECUTION_ID,
+  );
+  const watch = backgroundWatches.get(status?.chatId || activeChatId);
+  const serverStartedAt = Number(status?.codeStartedAt);
+  const serverElapsedSec = Number(status?.codeElapsedSec);
+  const startedAt = (Number.isFinite(serverStartedAt) && serverStartedAt > 0 ? serverStartedAt * 1000 : 0)
+    || (Number.isFinite(serverElapsedSec) && serverElapsedSec >= 0 ? Date.now() - serverElapsedSec * 1000 : 0)
+    || Number(existing?.startedAt)
+    || Number(watch?.startedAt)
+    || Date.now();
+  const elapsedSec = Number.isFinite(serverElapsedSec) && serverElapsedSec >= 0
+    ? serverElapsedSec
+    : Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const elapsedLabel = status?.codeElapsedLabel || formatElapsedLabel(elapsedSec);
+  const description = status?.codeDescription || status?.codeSummary || status?.plan?.goal || "";
+  const highlights = Array.isArray(status?.codeHighlights) ? status.codeHighlights : [];
+  const isDownloadTask = Boolean(status?.codeIsDownloadTask);
+  const progressStage = status?.codeProgressStage || "";
+
+  applyExecutionCardState(
+    card,
+    {
+      type: "execution",
+      id: BACKGROUND_EXECUTION_ID,
+      title,
+      description,
+      stage: progressStage || stage,
+      highlights,
+      startedAt,
+      elapsedSec,
+      elapsedLabel,
+      done: false,
+      stopped: false,
+      hint,
+      isDownloadTask,
+      progressOverallPct: status?.codeProgressOverallPct,
+      progressFilePct: status?.codeProgressFilePct,
+      progressRun: status?.codeProgressRun || "",
+      progressFileIndex: status?.codeProgressFileIndex,
+      progressFileTotal: status?.codeProgressFileTotal,
+      progressBytes: status?.codeProgressBytes,
+      progressBytesTotal: status?.codeProgressBytesTotal,
+      progressLabel: status?.codeProgressLabel || "",
+      progressIndeterminate: Boolean(status?.codeProgressIndeterminate),
+      progressCompletedFiles: status?.codeProgressCompletedFiles,
+    },
+    { showStop },
+  );
+  recordCodeArtifact({
+    type: "execution",
+    id: BACKGROUND_EXECUTION_ID,
+    title,
+    description,
+    stage: progressStage || stage,
+    highlights,
+    startedAt,
+    elapsedSec,
+    elapsedLabel,
+    done: false,
+    stopped: false,
+    hint,
+    isDownloadTask,
+    progressOverallPct: status?.codeProgressOverallPct,
+    progressFilePct: status?.codeProgressFilePct,
+    progressRun: status?.codeProgressRun || "",
+    progressFileIndex: status?.codeProgressFileIndex,
+    progressFileTotal: status?.codeProgressFileTotal,
+    progressBytes: status?.codeProgressBytes,
+    progressBytesTotal: status?.codeProgressBytesTotal,
+    progressLabel: status?.codeProgressLabel || "",
+    progressIndeterminate: Boolean(status?.codeProgressIndeterminate),
+    progressCompletedFiles: status?.codeProgressCompletedFiles,
+  });
+  scrollCodePanelToBottom();
+  return card;
+}
+
+function removeBackgroundExecutionCard() {
+  const card = getExecutionCard(BACKGROUND_EXECUTION_ID);
+  if (card) card.remove();
+  const chat = getActiveChatRecord();
+  if (!chat?.codePanel) return;
+  const before = chat.codePanel.length;
+  chat.codePanel = chat.codePanel.filter(
+    (item) => !(item.type === "execution" && item.id === BACKGROUND_EXECUTION_ID),
+  );
+  if (chat.codePanel.length !== before) persistActiveChat();
+  syncCodePanelVisibility();
+}
+
+function finishBackgroundExecutionCard() {
+  const card = getExecutionCard(BACKGROUND_EXECUTION_ID);
+  const chat = getActiveChatRecord();
+  const existing = chat?.codePanel?.find(
+    (item) => item.type === "execution" && item.id === BACKGROUND_EXECUTION_ID,
+  );
+  if (!card && !existing) return;
+  // Synthetic "Agent 运行中" cards are not real code runs — drop them instead
+  // of leaving a misleading "代码运行完成" stub after a plain chat reply.
+  const title = String(existing?.title || card?.querySelector(".code-execution-progress__title")?.textContent || "");
+  if (!title || title.includes("Agent 运行中") || title.includes("后台代码运行中")) {
+    removeBackgroundExecutionCard();
+    return;
+  }
+  if (!card) {
+    removeBackgroundExecutionCard();
+    return;
+  }
+  const artifact = stripDownloadProgressFields({
+    type: "execution",
+    id: BACKGROUND_EXECUTION_ID,
+    title: "代码运行完成",
+    description: existing?.description || "",
+    code: existing?.code || "",
+    stage: "已完成",
+    done: true,
+    stopped: false,
+    hint: "",
+  });
+  applyExecutionCardState(card, artifact);
+  recordCodeArtifact(artifact);
+}
+
+function shouldShowBackgroundExecutionCard(status, assistantEntry = null) {
+  if (!status) return false;
+  const codeReallyRunning = Boolean(status.kernelBusy || status.codeActive);
+  if (codeReallyRunning) return true;
+  // Reply already finalized: do not keep a leftover "Agent 运行中" card while
+  // the backend briefly still reports hasActiveRun during cleanup.
+  if (assistantEntry?._finalReplyLocked) return false;
+  return Boolean(status.hasActiveRun);
+}
+
+function syncRunStatusToUI(chatId, status, options = {}) {
+  if (!isTaskLikelyActive(status, chatId)) return false;
+
+  const message = buildRunStatusMessage(status);
+  const { pending = null, assistantEntry = null, persist = true } = options;
+
+  if (chatId === activeChatId) {
+    const target = resolvePendingGroup(pending) || getLastAssistantGroup();
+    if (target && message && !assistantEntry?._finalReplyLocked) setLiveStatus(target, message);
+    if (status.plan?.steps?.length && target) {
+      const entryHasPlan = assistantEntryHasPlan(assistantEntry);
+      const domHasPlan = Boolean(target.querySelector?.(".chat-thinking__step--plan"));
+      // Never paste a leftover settled plan.json into a brand-new turn's Thinking.
+      if (planHasActiveSteps(status) || entryHasPlan || domHasPlan) {
+        const planTitle = resolvePlanSnapshotTitle(status.plan.goal);
+        appendThinkingStep(
+          target,
+          {
+            id: "current-plan",
+            kind: "plan",
+            title: planTitle,
+            // Status polling replaces the existing plan card after a reload.
+            // Keep the structured snapshot so its counters match the step list.
+            data: buildThinkingPlanData(status.plan),
+            body: status.plan.steps
+              .map((s) => {
+                const mark =
+                  s.status === "done" ? "✓" : s.status === "running" ? "▶" : s.status === "failed" ? "✗" : "○";
+                return `${mark} ${s.title || s.goal || s.id}`;
+              })
+              .join("\n"),
+          },
+          { persist: false },
+        );
+      }
+    }
+    if (shouldShowBackgroundExecutionCard(status, assistantEntry)) {
+      ensureBackgroundExecutionCard(status, { showStop: isActiveChatSending() });
+    } else {
+      removeBackgroundExecutionCard();
+    }
+    scrollThreadToBottom();
+  }
+
+  return true;
+}
+
+function stopBackgroundRunWatch(chatId) {
+  const watch = backgroundWatches.get(chatId);
+  if (!watch) return;
+  if (watch.timer) window.clearInterval(watch.timer);
+  backgroundWatches.delete(chatId);
+}
+
+async function pollBackgroundRunStatus(chatId) {
+  const watch = backgroundWatches.get(chatId);
+  if (!watch) return;
+
+  const status = await fetchRunStatus(chatId);
+  if (!status) {
+    const offlinePlan = planSnapshotFromThinking(watch.assistantEntry);
+    const offlineStatus = {
+      ok: true,
+      plan: offlinePlan,
+      planSummary: "服务连接已断开，运行状态无法确认",
+      stalePlanStep: Boolean(offlinePlan?.steps?.some((step) => step?.status === "running")),
+    };
+    reconcileStaleTaskUi(chatId, offlineStatus, {
+      pending: watch.pending,
+      assistantEntry: watch.assistantEntry,
+      forceMessage: true,
+    });
+    return;
+  }
+  if (isStaleTaskState(status)) {
+    reconcileStaleTaskUi(chatId, status, {
+      pending: watch.pending,
+      assistantEntry: watch.assistantEntry,
+    });
+    return;
+  }
+  if (!isTaskLikelyActive(status, chatId)) {
+    stopBackgroundRunWatch(chatId);
+    if (chatId === activeChatId) {
+      finishBackgroundExecutionCard();
+      markRunningExecutionsStopped();
+      if (watch.assistantEntry) {
+        const finalText = resolveFinalAssistantText({
+          current: watch.assistantEntry.content,
+          status,
+        });
+        if (finalText) {
+          freezeAssistantFinalText(watch.assistantEntry, finalText);
+          updateMessageGroup(resolvePendingGroup(watch.pending), finalText);
+          persistChatMessages(chatId, chatHistory);
+        }
+      }
+    }
+    schedulePendingSendDrain(chatId);
+    return;
+  }
+
+  syncRunStatusToUI(chatId, status, {
+    pending: watch.pending,
+    assistantEntry: watch.assistantEntry,
+    messages: watch.assistantEntry ? chatHistory : undefined,
+  });
+}
+
+function startBackgroundRunWatch(chatId, { pending = null, assistantEntry = null } = {}) {
+  if (!chatId) return;
+  stopBackgroundRunWatch(chatId);
+  backgroundWatches.set(chatId, {
+    timer: window.setInterval(() => {
+      void pollBackgroundRunStatus(chatId);
+    }, BACKGROUND_WATCH_POLL_MS),
+    startedAt: Date.now(),
+    pending,
+    assistantEntry,
+  });
+  void pollBackgroundRunStatus(chatId);
+}
+
+async function resumeBackgroundRunIfNeeded(chatId) {
+  if (!chatId || isChatStreaming(chatId)) return;
+  const status = await fetchRunStatus(chatId);
+  if (!status) {
+    const lastAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant");
+    const offlinePlan = planSnapshotFromThinking(lastAssistant);
+    if (offlinePlan?.steps?.some((step) => step?.status === "running")) {
+      reconcileStaleTaskUi(chatId, {
+        ok: true,
+        plan: offlinePlan,
+        planSummary: "服务连接已断开，运行状态无法确认",
+        stalePlanStep: true,
+      }, { assistantEntry: lastAssistant || null, forceMessage: true });
+    }
+    return;
+  }
+  if (isStaleTaskState(status)) {
+    const lastAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant");
+    reconcileStaleTaskUi(chatId, status, { assistantEntry: lastAssistant || null });
+    return;
+  }
+  // The execution may have already ended at an approval gate.  In that case
+  // there is no live stream to replace the old plan snapshot after a reload.
+  syncPersistedPlanSnapshot(chatId, status);
+  if (!isTaskLikelyActive(status, chatId)) {
+    // A finished plan may still have a persisted running CODE card. Reuse the
+    // soft cleanup path so a page reload cannot resurrect that stale card.
+    const lastAssistant = [...chatHistory].reverse().find((item) => item.role === "assistant");
+    reconcileStaleTaskUi(chatId, status, { assistantEntry: lastAssistant || null });
+    return;
+  }
+
+  const lastAssistant = (chatId === activeChatId
+    ? [...chatHistory]
+    : [...(getChatRecord(chatId)?.messages || [])]
+  ).reverse().find((item) => item.role === "assistant");
+
+  // 优先接入服务端实时事件广播（思考流 / 下载进度）
+  void attachLiveEventStream(chatId, status);
+
+  if (!backgroundWatches.has(chatId)) {
+    startBackgroundRunWatch(chatId, { assistantEntry: lastAssistant || null });
+  }
+  syncRunStatusToUI(chatId, status, {
+    assistantEntry: lastAssistant || null,
+    persist: false,
+  });
+}
+
+function detachLiveEventStream(chatId) {
+  const follow = liveFollows.get(chatId);
+  if (!follow) return;
+  try {
+    follow.abortController.abort();
+  } catch {
+    // ignore
+  }
+  liveFollows.delete(chatId);
+}
+
+function ensureFollowerStreamShell(chatId, follow, messages, assistantEntry) {
+  if (chatStreams.has(chatId)) return chatStreams.get(chatId);
+  const shell = {
+    generation: -1,
+    runId: follow?.runId || "",
+    abortController: follow?.abortController || new AbortController(),
+    messages,
+    assistantEntry,
+    pending: null,
+    idleTimer: null,
+    statusPollTimer: null,
+    lastStreamEventAt: Date.now(),
+    codeExecutionId: follow?.codeExecutionId || null,
+    isFollower: true,
+  };
+  chatStreams.set(chatId, shell);
+  return shell;
+}
+
+function applyLiveFollowEvent(chatId, event) {
+  if (!chatId || !event?.type) return;
+  const follow = liveFollows.get(chatId);
+  if (follow && event._seq != null) {
+    follow.lastSeq = Math.max(follow.lastSeq || 0, Number(event._seq) || 0);
+  }
+  if (follow && (event.runId || event.type === "live_joined")) {
+    follow.runId = String(event.runId || follow.runId || "");
+  }
+
+  if (event.type === "live_joined") {
+    if (chatId === activeChatId) {
+      const target = getLastAssistantGroup();
+      const textEl = target?.querySelector(".chat-text");
+      if (textEl) {
+        textEl.classList.add("chat-text--loading");
+        textEl.textContent = event.message || "已加入实时同步…";
+      }
+    }
+    return;
+  }
+
+  const chat = ensureChatRecord(chatId);
+  const messages = chat.messages || [];
+  let assistantEntry = [...messages].reverse().find((item) => item.role === "assistant");
+  if (!assistantEntry) {
+    assistantEntry = {
+      role: "assistant",
+      content: "实时同步中…",
+      thinkingSteps: [],
+      thinkingRoundCount: 0,
+      executionLog: [],
+    };
+    messages.push(assistantEntry);
+    chat.messages = messages;
+  }
+  if (chatId === activeChatId) {
+    chatHistory = messages;
+  }
+
+  const eventSeq = Number(event?._seq);
+  const eventRunId = String(event?.runId || "").trim();
+  // Sequence numbers restart for every Agent run. Do not apply a checkpoint
+  // from an older run to this run's replay buffer.
+  if (eventRunId && assistantEntry.liveEventRunId !== eventRunId) {
+    assistantEntry.liveEventRunId = eventRunId;
+    assistantEntry.liveEventSeq = 0;
+  }
+  const seenSeq = Number(assistantEntry?.liveEventSeq || 0);
+  if (Number.isFinite(eventSeq) && eventSeq > 0 && eventSeq <= seenSeq) {
+    return;
+  }
+
+  const markLiveEventSeen = () => {
+    if (!(Number.isFinite(eventSeq) && eventSeq > 0) || !assistantEntry) return;
+    recordLiveEventCheckpoint(chatId, assistantEntry, event);
+  };
+
+  const isVisible = chatId === activeChatId;
+  if (!isVisible) {
+    const shell = ensureFollowerStreamShell(chatId, follow, messages, assistantEntry);
+    if (follow) {
+      shell.runId = follow.runId || shell.runId;
+      shell.codeExecutionId = follow.codeExecutionId;
+    }
+    handleAgentStreamEventBackground(chatId, messages, assistantEntry, event);
+    markLiveEventSeen();
+    if (follow) {
+      follow.codeExecutionId = chatStreams.get(chatId)?.codeExecutionId || follow.codeExecutionId;
+    }
+    persistChatMessages(chatId, messages);
+  } else {
+    let target = getLastAssistantGroup();
+    if (!target) {
+      target = appendMessage("assistant", assistantEntry.content || "实时同步中…", {
+        loading: true,
+      });
+    }
+    handleAgentStreamEvent(target, event);
+    markLiveEventSeen();
+    if (event.type === "final" && event.content) {
+      assistantEntry.content = stripExecutionMemoryBlock(event.content);
+      persistChatMessages(chatId, messages);
+    }
+    if (event.type === "done" && event.text) {
+      assistantEntry.content = stripExecutionMemoryBlock(event.text);
+      updateMessageGroup(target, assistantEntry.content);
+      persistChatMessages(chatId, messages);
+    }
+    if (follow && activeCodeExecutionId) {
+      follow.codeExecutionId = activeCodeExecutionId;
+    }
+  }
+
+  // A page reload reconnects through the replay endpoint. Persist the replay
+  // checkpoint even for status-only frames, otherwise every reload replays
+  // the same tool events and counts them as new Thinking rounds again.
+  if (Number.isFinite(eventSeq) && eventSeq > 0) {
+    persistChatMessages(chatId, messages);
+  }
+
+  if (event.type === "final" || event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "stream_end") {
+    releaseComposerAfterStream(chatId);
+  }
+}
+
+async function attachLiveEventStream(chatId, status = null) {
+  if (!chatId || isChatStreaming(chatId) || liveFollows.has(chatId)) return;
+  if (!window.agentLiveEventStream) return;
+
+  let snap = status;
+  if (!snap) {
+    snap = await fetchRunStatus(chatId);
+  }
+  if (!snap?.ok) return;
+  if (!(snap.hasActiveRun || snap.kernelBusy || snap.liveAvailable)) return;
+
+  const chat = getChatRecord(chatId);
+  const latestAssistant = [...(chat?.messages || [])]
+    .reverse()
+    .find((item) => item?.role === "assistant");
+  const liveRunId = String(snap.runId || "").trim();
+  const persistedSeq =
+    latestAssistant?.liveEventRunId === liveRunId
+      ? Math.max(0, Number(latestAssistant.liveEventSeq) || 0)
+      : 0;
+  const localCheckpoint = getLiveEventCheckpoint(chatId);
+  const localSeq = localCheckpoint?.runId === liveRunId ? localCheckpoint.seq : 0;
+  const afterSeq = Math.max(persistedSeq, localSeq);
+
+  const abortController = new AbortController();
+  liveFollows.set(chatId, {
+    abortController,
+    runId: liveRunId,
+    codeExecutionId: null,
+    lastSeq: afterSeq,
+  });
+
+  if (chatId === activeChatId) {
+    syncComposerForActiveChat();
+    const target = getLastAssistantGroup();
+    if (target) {
+      const textEl = target.querySelector(".chat-text");
+      if (textEl && isPlaceholderAssistantContent(textEl.textContent)) {
+        textEl.classList.add("chat-text--loading");
+        textEl.textContent = "正在接入实时同步…";
+      }
+    }
+  }
+
+  void (async () => {
+    try {
+      await window.agentLiveEventStream({
+        chatId,
+        afterSeq,
+        signal: abortController.signal,
+        onEvent: (event) => applyLiveFollowEvent(chatId, event),
+      });
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        console.warn("live event stream error", error);
+      }
+    } finally {
+      liveFollows.delete(chatId);
+      const stream = chatStreams.get(chatId);
+      if (stream?.isFollower) chatStreams.delete(chatId);
+      if (chatId === activeChatId) {
+        syncComposerForActiveChat();
+        schedulePendingSendDrain(chatId);
+      }
+    }
+  })();
+}
+
+function isStoppedAssistantEntry(item) {
+  if (!item || item.role !== "assistant") return false;
+  if (item.stopped === true) return true;
+  const text = String(item.content || "").trim();
+  return text === "（已停止生成）";
+}
+
+function markAssistantStopped(assistantEntry) {
+  if (!assistantEntry) return;
+  assistantEntry.stopped = true;
+  assistantEntry.content = "（已停止生成）";
+}
+
+function truncateExecutionSummary(text, max = 360) {
+  const value = String(text || "").trim();
+  if (value.length <= max) return value;
+  return `${value.slice(0, max - 1)}…`;
+}
+
+function compactExecutionContextSummary(log) {
+  const tool = String(log?.tool || "").trim();
+  const summary = String(log?.summary || "").trim();
+  if (!summary) return "";
+  if (tool === "execute_code") {
+    return "已执行代码；详细 stdout/stderr 请查看代码卡片或产物文件";
+  }
+  return truncateExecutionSummary(summary, 180);
+}
+
+function stripExecutionMemoryBlock(content) {
+  const text = String(content || "");
+  const marker = "\n\n[本轮执行记录]\n";
+  const idx = text.indexOf(marker);
+  if (idx >= 0) return text.slice(0, idx).trim();
+  if (text.startsWith("[本轮执行记录]\n")) return "";
+  return text.trim();
+}
+
+function assistantContentForDisplay(item) {
+  return stripExecutionMemoryBlock(item?.content);
+}
+
+function formatExecutionLogBlock(logs) {
+  if (!Array.isArray(logs) || !logs.length) return "";
+  return logs
+    .slice(-12)
+    .map((log) => {
+      const title = String(log?.title || log?.tool || "步骤").trim();
+      const summary = compactExecutionContextSummary(log);
+      return summary ? `- ${title}: ${summary}` : `- ${title}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function buildExecutionContextForApi() {
+  return "";
+}
+
+function appendExecutionLog(entry, assistant = getLastAssistantEntry(), options = {}) {
+  if (!assistant) return;
+  if (!Array.isArray(assistant.executionLog)) assistant.executionLog = [];
+  const tool = String(entry?.tool || "").trim();
+  const title = String(entry?.title || tool || "步骤").trim();
+  const summary = truncateExecutionSummary(entry?.summary || "");
+  const last = assistant.executionLog[assistant.executionLog.length - 1];
+  if (last && !last.summary && summary && (last.tool === tool || last.title === title)) {
+    last.summary = summary;
+    if (options.chatId && options.messages) {
+      persistChatMessages(options.chatId, options.messages);
+    } else {
+      persistActiveChat();
+    }
+    return;
+  }
+  if (last && last.title === title && last.summary === summary) return;
+  assistant.executionLog.push({ tool, title, summary });
+  if (assistant.executionLog.length > 24) {
+    assistant.executionLog = assistant.executionLog.slice(-24);
+  }
+  if (options.chatId && options.messages) {
+    persistChatMessages(options.chatId, options.messages);
+  } else {
+    persistActiveChat();
+  }
+}
+
+function messagesForAgentApi() {
+  const result = [];
+  for (let i = 0; i < chatHistory.length; i += 1) {
+    const item = chatHistory[i];
+    if (item.role === "user") {
+      const next = chatHistory[i + 1];
+      if (next && isStoppedAssistantEntry(next)) {
+        i += 1;
+        continue;
+      }
+      result.push({ role: "user", content: String(item.content || "") });
+      continue;
+    }
+    if (item.role !== "assistant") continue;
+    const content = assistantContentForDisplay(item);
+    if (isPlaceholderAssistantContent(content)) continue;
+    result.push({ role: "assistant", content });
+  }
+  if (result.length === 0) {
+    const lastUser = [...chatHistory].reverse().find((item) => item.role === "user" && String(item.content || "").trim());
+    if (lastUser) {
+      result.push({ role: "user", content: String(lastUser.content || "") });
+    }
+  }
+  return result;
+}
+
+function abandonStaleAssistantPlaceholders(messages) {
+  messages.forEach((item) => {
+    if (
+      item?.role === "assistant"
+      && !item.stopped
+      && isPlaceholderAssistantContent(item.content)
+    ) {
+      markAssistantStopped(item);
+    }
+  });
+}
+
+function getLastAssistantEntry() {
+  for (let i = chatHistory.length - 1; i >= 0; i -= 1) {
+    if (chatHistory[i]?.role === "assistant") return chatHistory[i];
+  }
+  return null;
+}
+
+function removeEmptyChat(chatId) {
+  if (!chatId) return;
+  const chat = chatStore.chats.find((item) => item.id === chatId);
+  if (chat && chat.messages.length === 0) {
+    chatStore.chats = chatStore.chats.filter((item) => item.id !== chatId);
+    // Drop any empty shell the kernel panel may have created on disk.
+    if (chatPersistenceMode === "server") {
+      void window.deleteChatSession?.(chatId);
+    }
+  }
+}
+
+function assistantHasPersistableContent(item) {
+  return (
+    String(item?.content || "").trim() ||
+    (Array.isArray(item?.thinkingSteps) && item.thinkingSteps.length > 0) ||
+    (Array.isArray(item?.executionLog) && item.executionLog.length > 0)
+  );
+}
+
+function persistActiveChat() {
+  if (!activeChatId) return;
+  chatStore.activeChatId = activeChatId;
+  persistChatMessages(activeChatId, chatHistory);
+}
+
+function recordCodeArtifactForChat(chatId, artifact) {
+  const chat = ensureChatRecord(chatId);
+  if (!chat || !Array.isArray(chat.codePanel)) return;
+
+  if (artifact.type === "execution") {
+    const index = chat.codePanel.findIndex(
+      (item) => item.type === "execution" && item.id === artifact.id,
+    );
+    if (index >= 0) {
+      const merged = { ...chat.codePanel[index], ...artifact };
+      chat.codePanel[index] = merged;
+    } else {
+      chat.codePanel.push(artifact);
+    }
+  } else {
+    const existingIndex = chat.codePanel.findIndex(
+      (item) => item.type === "approval" && item.id === artifact.id,
+    );
+    if (existingIndex >= 0) {
+      chat.codePanel[existingIndex] = { ...chat.codePanel[existingIndex], ...artifact };
+    } else {
+      chat.codePanel.push(artifact);
+    }
+  }
+  saveChatStore();
+  scheduleServerSessionSave(chatId);
+  renderRecentChats();
+}
+
+function resetCodePanel() {
+  if (agentCodeInner) agentCodeInner.innerHTML = "";
+  syncCodePanelVisibility();
+}
+
+function renderChatThread() {
+  if (!threadInner) return;
+  threadInner.innerHTML = "";
+  if (chatHistory.length === 0) {
+    threadInner.innerHTML = welcomeCardHtml();
+    renderQueuedSendNotices(activeChatId);
+    renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: isActiveChatSending() });
+    renderTodosBoard(getActivePlanSnapshot());
+    scrollThreadToBottom();
+    return;
+  }
+  chatHistory.forEach((item) => {
+    if (item.role !== "user" && item.role !== "assistant") return;
+    const fallback = item.role === "assistant" && item.thinkingSteps?.length ? "" : "（无回复）";
+    const group = appendMessage(item.role, item.role === "assistant" ? assistantContentForDisplay(item) || fallback : (item.content || fallback));
+    if (item.role === "assistant" && Array.isArray(item.thinkingSteps) && item.thinkingSteps.length) {
+      item.thinkingSteps.forEach((step) => appendThinkingStep(group, step, { persist: false }));
+      const roundStats = thinkingRoundStats(item.thinkingSteps);
+      setThinkingRoundCount(group, roundStats.count, { exact: roundStats.exact });
+      updateThinkingSummaryCount(getThinkingStepsEl(group));
+      const thinkingEl = group.querySelector(".chat-thinking");
+      if (thinkingEl) thinkingEl.open = false;
+    }
+  });
+  renderQueuedSendNotices(activeChatId);
+  renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: isActiveChatSending() });
+  renderTodosBoard(getActivePlanSnapshot());
+}
+
+function deleteChat(chatId, event) {
+  if (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+  if (!chatId) return;
+  if (isChatStreaming(chatId)) return;
+
+  // Explicit server delete (kernel release alone no longer wipes session dirs).
+  if (chatPersistenceMode === "server") {
+    void window.deleteChatSession?.(chatId);
+  } else {
+    window.releaseChatKernel?.(chatId);
+  }
+
+  const wasActive = chatId === activeChatId;
+  chatStore.chats = chatStore.chats.filter((item) => item.id !== chatId);
+
+  if (wasActive) {
+    const nextChat = [...chatStore.chats]
+      .filter((chat) => chat.messages?.length > 0)
+      .sort((a, b) => b.createdAt - a.createdAt)[0];
+
+    if (nextChat) {
+      activeChatId = nextChat.id;
+      chatHistory = nextChat.messages.map((item) => normalizeMessage(item));
+    } else {
+      activeChatId = createId();
+      chatHistory = [];
+    }
+    chatStore.activeChatId = activeChatId;
+    renderChatThread();
+    resetComposer();
+    window.KernelPanel?.refresh?.({ force: true });
+  }
+
+  saveChatStore();
+  renderRecentChats();
+}
+
+function renderRecentChats() {
+  if (!chatRecentList) return;
+  chatRecentList.innerHTML = "";
+
+  const chats = [...chatStore.chats]
+    .filter((chat) => chat.messages?.length > 0)
+    .sort((a, b) => b.createdAt - a.createdAt);
+
+  if (chats.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "sidebar-recent-sessions__empty";
+    empty.textContent = "No chats yet";
+    chatRecentList.appendChild(empty);
+    return;
+  }
+
+  chats.forEach((chat) => {
+    const item = document.createElement("div");
+    item.className = "sidebar-recent-session";
+    if (isChatStreaming(chat.id) || liveFollows.has(chat.id)) {
+      item.classList.add("sidebar-recent-session--streaming");
+    }
+    if (chat.id === activeChatId) item.classList.add("sidebar-recent-session--active");
+
+    const link = document.createElement("a");
+    link.className = "sidebar-recent-session__link";
+    link.href = "#";
+    const lease = chat.operatorLease;
+    const leasedByOther =
+      lease?.deviceId
+      && lease.deviceId !== getOrCreateDeviceId()
+      && Number(lease.expiresAt || 0) > Date.now() / 1000;
+    const baseTitle = chat.title || "New Chat";
+    link.textContent = leasedByOther ? `${baseTitle} · 他机操作中` : baseTitle;
+    link.title = leasedByOther
+      ? `${baseTitle}（正由其他设备写入，本机只读旁观）`
+      : baseTitle;
+    link.addEventListener("click", (event) => {
+      event.preventDefault();
+      loadChat(chat.id);
+    });
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.type = "button";
+    deleteBtn.className = "sidebar-recent-session__delete";
+    deleteBtn.setAttribute("aria-label", "Delete chat");
+    deleteBtn.title = "Delete chat";
+    deleteBtn.textContent = "×";
+    if (isChatStreaming(chat.id)) {
+      deleteBtn.disabled = true;
+    }
+    deleteBtn.addEventListener("click", (event) => deleteChat(chat.id, event));
+
+    item.appendChild(link);
+    item.appendChild(deleteBtn);
+    chatRecentList.appendChild(item);
+  });
+}
+
+function startNewChat() {
+  const previousChatId = activeChatId;
+  persistActiveChat();
+  removeEmptyChat(activeChatId);
+
+  // 每个 chat 有独立内核：开新对话时不要 cancel/interrupt 旧会话的 Agent / Jupyter。
+  // 旧会话若仍在跑，SSE 继续后台接收事件并写入该会话的记录。
+  if (previousChatId && isChatStreaming(previousChatId)) {
+    renderRecentChats();
+  }
+
+  // 切到新会话时，清掉「当前可见」代码执行指针；后台会话用 stream.codeExecutionId
+  activeCodeExecutionId = null;
+
+  activeChatId = createId();
+  chatHistory = [];
+  supervisorHistory = [];
+  chatStore.activeChatId = activeChatId;
+  ensureChatRecord(activeChatId);
+  saveChatStore();
+
+  renderChatThread();
+  resetComposer();
+  syncComposerForActiveChat();
+  setPage("agent");
+  void refreshReportPage();
+  window.KernelPanel?.refresh?.({ force: true });
+  window.KernelPanel?.startPolling?.(12000);
+}
+
+function loadChat(chatId) {
+  if (!chatId || chatId === activeChatId) return;
+  persistActiveChat();
+
+  const chat = chatStore.chats.find((item) => item.id === chatId);
+  if (!chat) return;
+
+  activeChatId = chat.id;
+  chatStore.activeChatId = activeChatId;
+  supervisorHistory = [];
+  chatHistory = chat.messages.map((item) => normalizeMessage(item));
+  // 切回仍在跑的会话时，恢复该会话自己的代码执行卡片 ID
+  activeCodeExecutionId = chatStreams.get(chatId)?.codeExecutionId || null;
+  saveChatStore();
+
+  renderChatThread();
+  resetComposer();
+  syncComposerForActiveChat();
+  renderTodosBoard(getActivePlanSnapshot());
+  setPage("agent");
+  void refreshReportPage();
+  void resumeBackgroundRunIfNeeded(chatId);
+  if (isActiveChatSending()) {
+    window.KernelPanel?.stopPolling?.();
+  } else {
+    window.KernelPanel?.refresh?.({ force: true });
+  }
+}
+
+async function syncChatStoreFromServer() {
+  if (!window.fetchChatSessions) return false;
+  try {
+    const data = await window.fetchChatSessions();
+    if (!data?.ok || !Array.isArray(data.chats)) return false;
+    if (data.chats.length > 0) {
+      chatStore = {
+        activeChatId: data.activeChatId || data.chats[0]?.id || null,
+        chats: data.chats.map(normalizeChat),
+      };
+    } else {
+      chatStore = { activeChatId: null, chats: [] };
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function refreshChatStoreFromServerIfIdle() {
+  if (chatPersistenceMode !== "server" || isActiveChatSending()) return;
+  const prevActive = activeChatId;
+  const synced = await syncChatStoreFromServer();
+  if (!synced) return;
+
+  const activeChat = chatStore.chats.find((item) => item.id === prevActive && item.messages?.length > 0);
+  if (activeChat) {
+    activeChatId = prevActive;
+    chatStore.activeChatId = prevActive;
+    chatHistory = activeChat.messages.map((item) => normalizeMessage(item));
+    renderChatThread();
+    renderRecentChats();
+    return;
+  }
+  applyActiveChatFromStore();
+}
+
+function applyActiveChatFromStore() {
+  const savedActive = chatStore.activeChatId;
+  const savedChat = chatStore.chats.find((item) => item.id === savedActive && item.messages?.length > 0);
+  if (savedChat) {
+    activeChatId = savedChat.id;
+    chatHistory = savedChat.messages.map((item) => normalizeMessage(item));
+  } else {
+    activeChatId = createId();
+    chatHistory = [];
+    chatStore.activeChatId = activeChatId;
+  }
+  saveChatStore();
+  renderChatThread();
+  renderRecentChats();
+}
+
+async function initChatSessions() {
+  const serverOk = await window.probeProxyServer?.();
+  if (serverOk) {
+    chatPersistenceMode = "server";
+    try {
+      localStorage.removeItem(CHAT_STORE_KEY);
+    } catch {
+      // ignore storage failures
+    }
+    await syncChatStoreFromServer();
+  } else {
+    chatPersistenceMode = "local";
+    chatStore = loadChatStoreFromLocal();
+  }
+
+  applyActiveChatFromStore();
+  void resumeBackgroundRunIfNeeded(activeChatId);
+}
+
+function appendMarkdownInline(target, text) {
+  const source = String(text || "");
+  const token = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^\s)]+\))/g;
+  let cursor = 0;
+  let match;
+  while ((match = token.exec(source)) !== null) {
+    if (match.index > cursor) target.append(document.createTextNode(source.slice(cursor, match.index)));
+    const value = match[0];
+    if (value.startsWith("**")) {
+      const strong = document.createElement("strong");
+      strong.textContent = value.slice(2, -2);
+      target.append(strong);
+    } else if (value.startsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = value.slice(1, -1);
+      target.append(code);
+    } else {
+      const link = /^\[([^\]]+)\]\(([^\s)]+)\)$/.exec(value);
+      const href = link?.[2] || "";
+      if (/^https?:\/\//i.test(href)) {
+        const anchor = document.createElement("a");
+        anchor.href = href;
+        anchor.target = "_blank";
+        anchor.rel = "noopener noreferrer";
+        anchor.textContent = link[1];
+        target.append(anchor);
+      } else {
+        target.append(document.createTextNode(link?.[1] || value));
+      }
+    }
+    cursor = match.index + value.length;
+  }
+  if (cursor < source.length) target.append(document.createTextNode(source.slice(cursor)));
+}
+
+function isMarkdownTableLine(line) {
+  return /^\s*\|?.+\|.+\|?\s*$/.test(line);
+}
+
+function isMarkdownTableSeparator(line) {
+  return /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+}
+
+function markdownTableCells(line) {
+  return line.trim().replace(/^\||\|$/g, "").split("|").map((cell) => cell.trim());
+}
+
+function renderMarkdown(target, text) {
+  target.replaceChildren();
+  const lines = String(text || "").replace(/\r\n?/g, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    if (/^\s*```/.test(line)) {
+      const language = line.replace(/^\s*```/, "").trim();
+      const codeLines = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```/.test(lines[index])) {
+        codeLines.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (language) code.dataset.language = language;
+      code.textContent = codeLines.join("\n");
+      pre.append(code);
+      target.append(pre);
+      continue;
+    }
+    if (isMarkdownTableLine(line) && index + 1 < lines.length && isMarkdownTableSeparator(lines[index + 1])) {
+      const wrapper = document.createElement("div");
+      wrapper.className = "chat-markdown__table-wrap";
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const headerRow = document.createElement("tr");
+      markdownTableCells(line).forEach((cell) => {
+        const th = document.createElement("th");
+        appendMarkdownInline(th, cell);
+        headerRow.append(th);
+      });
+      thead.append(headerRow);
+      table.append(thead);
+      const tbody = document.createElement("tbody");
+      index += 2;
+      while (index < lines.length && isMarkdownTableLine(lines[index])) {
+        const row = document.createElement("tr");
+        markdownTableCells(lines[index]).forEach((cell) => {
+          const td = document.createElement("td");
+          appendMarkdownInline(td, cell);
+          row.append(td);
+        });
+        tbody.append(row);
+        index += 1;
+      }
+      table.append(tbody);
+      wrapper.append(table);
+      target.append(wrapper);
+      continue;
+    }
+    const heading = /^(#{1,4})\s+(.+)$/.exec(line);
+    if (heading) {
+      const title = document.createElement(`h${heading[1].length + 2}`);
+      appendMarkdownInline(title, heading[2]);
+      target.append(title);
+      index += 1;
+      continue;
+    }
+    const quote = /^>\s?(.*)$/.exec(line);
+    if (quote) {
+      const blockquote = document.createElement("blockquote");
+      appendMarkdownInline(blockquote, quote[1]);
+      target.append(blockquote);
+      index += 1;
+      continue;
+    }
+    const listMatch = /^\s*[-*+]\s+(.+)$/.exec(line);
+    const orderedMatch = /^\s*\d+[.)]\s+(.+)$/.exec(line);
+    if (listMatch || orderedMatch) {
+      const list = document.createElement(orderedMatch ? "ol" : "ul");
+      const itemPattern = orderedMatch ? /^\s*\d+[.)]\s+(.+)$/ : /^\s*[-*+]\s+(.+)$/;
+      while (index < lines.length) {
+        const itemMatch = itemPattern.exec(lines[index]);
+        if (!itemMatch) break;
+        const item = document.createElement("li");
+        appendMarkdownInline(item, itemMatch[1]);
+        list.append(item);
+        index += 1;
+      }
+      target.append(list);
+      continue;
+    }
+    if (/^\s*(?:---|\*\*\*|___)\s*$/.test(line)) {
+      target.append(document.createElement("hr"));
+      index += 1;
+      continue;
+    }
+    const paragraph = document.createElement("p");
+    const paragraphLines = [line];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !/^\s*```/.test(lines[index])
+      && !/^(#{1,4})\s+/.test(lines[index]) && !/^>\s?/.test(lines[index])
+      && !/^\s*(?:[-*+]\s+|\d+[.)]\s+)/.test(lines[index])) {
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    appendMarkdownInline(paragraph, paragraphLines.join("\n"));
+    target.append(paragraph);
+  }
+}
+
+function renderChatText(textEl, text, role) {
+  if (role === "assistant") renderMarkdown(textEl, stripExecutionMemoryBlock(text));
+  else textEl.textContent = text;
+}
+
+function appendMessage(role, text, options = {}) {
+  if (!threadInner) return null;
+
+  const group = document.createElement("div");
+  group.className = `chat-group ${role}`;
+  group.innerHTML = `
+    <div class="chat-bubble">
+      <div class="chat-text"></div>
+    </div>
+  `;
+  const textEl = group.querySelector(".chat-text");
+  if (options.loading) {
+    textEl.classList.add("chat-text--loading");
+    textEl.textContent = "";
+    setLiveStatus(group, "思考中…");
+  } else {
+    renderChatText(textEl, text, role);
+  }
+  threadInner.appendChild(group);
+  scrollThreadToBottom();
+  return group;
+}
+
+function setLiveStatus(group, message) {
+  const bubble = group?.querySelector(".chat-bubble");
+  const textEl = group?.querySelector(".chat-text");
+  const text = String(message || "").trim();
+  if (!bubble || !textEl || !text) return;
+  let statusEl = bubble.querySelector(".chat-live-status");
+  if (!statusEl) {
+    statusEl = document.createElement("div");
+    statusEl.className = "chat-live-status";
+    statusEl.setAttribute("role", "status");
+    bubble.insertBefore(statusEl, textEl);
+  }
+  statusEl.textContent = text;
+}
+
+function clearLiveStatus(group) {
+  group?.querySelector(".chat-live-status")?.remove();
+}
+
+function getLastAssistantGroup() {
+  if (!threadInner) return null;
+  const groups = threadInner.querySelectorAll(".chat-group.assistant");
+  return groups.length ? groups[groups.length - 1] : null;
+}
+
+function resolvePendingGroup(pending) {
+  return pending || getLastAssistantGroup();
+}
+
+function showCodePanel() {
+  if (leftPanelMode !== "code") return;
+  if (agentLeftPanel) agentLeftPanel.hidden = false;
+  if (agentCodePanel) agentCodePanel.hidden = false;
+  if (branchChatPanel) branchChatPanel.hidden = true;
+  const todosPanel = document.getElementById("todos-panel");
+  if (todosPanel) todosPanel.hidden = true;
+}
+
+function syncCodePanelVisibility() {
+  if (!agentLeftPanel || !agentCodePanel || !agentCodeInner) return;
+  if (leftPanelMode !== "code") {
+    agentCodePanel.hidden = true;
+    return;
+  }
+  agentLeftPanel.hidden = false;
+  agentCodePanel.hidden = false;
+  if (branchChatPanel) branchChatPanel.hidden = true;
+  const todosPanel = document.getElementById("todos-panel");
+  if (todosPanel) todosPanel.hidden = true;
+}
+
+function setLeftPanelMode(mode) {
+  const normalized = mode === "branch" || mode === "todos" ? mode : "code";
+  leftPanelMode = normalized;
+  if (leftPanelModeSelect && leftPanelModeSelect.value !== leftPanelMode) {
+    leftPanelModeSelect.value = leftPanelMode;
+  }
+  if (agentCodePanel) agentCodePanel.hidden = leftPanelMode !== "code";
+  if (branchChatPanel) branchChatPanel.hidden = leftPanelMode !== "branch";
+  const todosPanel = document.getElementById("todos-panel");
+  if (todosPanel) todosPanel.hidden = leftPanelMode !== "todos";
+  if (leftPanelMode === "branch" || leftPanelMode === "todos") {
+    if (agentLeftPanel) agentLeftPanel.hidden = false;
+  } else {
+    syncCodePanelVisibility();
+  }
+  if (leftPanelMode === "todos") {
+    renderTodosBoard(getActivePlanSnapshot());
+  }
+}
+
+function setSupervisorOpen(open) {
+  setLeftPanelMode(open ? "branch" : "code");
+}
+
+function getCodePanelInner() {
+  return agentCodeInner;
+}
+
+function getActivePlanSnapshot() {
+  const entry = [...(chatHistory || [])].reverse().find((item) => item?.role === "assistant");
+  const fromThinking = planSnapshotFromThinking(entry);
+  if (fromThinking?.steps?.length) return fromThinking;
+  // Live plan is only for the in-flight turn; ignore settled leftovers.
+  const live = window.__srnagentLivePlan;
+  if (live?.steps?.length && planHasActiveSteps(live)) return live;
+  return null;
+}
+
+function rememberLivePlan(plan) {
+  if (plan && Array.isArray(plan.steps)) {
+    window.__srnagentLivePlan = {
+      goal: String(plan.goal || ""),
+      steps: plan.steps,
+    };
+  }
+}
+
+function todosListIconSvg() {
+  return `<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+    <path d="M3 4h10M3 8h10M3 12h7"></path>
+    <circle cx="1.5" cy="4" r="0.8" fill="currentColor" stroke="none"></circle>
+    <circle cx="1.5" cy="8" r="0.8" fill="currentColor" stroke="none"></circle>
+    <circle cx="1.5" cy="12" r="0.8" fill="currentColor" stroke="none"></circle>
+  </svg>`;
+}
+
+function todosCheckIconSvg() {
+  return `<svg viewBox="0 0 16 16" width="16" height="16" fill="none" aria-hidden="true">
+    <circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.4"></circle>
+    <path d="M5 8.15 7.05 10.15 11.1 5.85" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+  </svg>`;
+}
+
+function buildTodosBoardElement(plan) {
+  const data = plan?.data && typeof plan.data === "object" ? plan.data : null;
+  const steps = Array.isArray(data?.steps)
+    ? data.steps
+    : (Array.isArray(plan?.steps) ? plan.steps : []);
+  if (!steps.length) return null;
+
+  const normalized = steps.map((step) => ({
+    id: String(step?.id || ""),
+    title: String(step?.title || step?.goal || step?.id || ""),
+    status: String(step?.status || "pending"),
+    autoInserted: Boolean(step?.autoInserted),
+  }));
+
+  const board = document.createElement("div");
+  board.className = "chat-todos";
+  board.setAttribute("role", "list");
+  board.setAttribute("aria-label", "To-dos");
+
+  const head = document.createElement("div");
+  head.className = "chat-todos__head";
+  head.innerHTML = `
+    <span class="chat-todos__icon">${todosListIconSvg()}</span>
+    <span class="chat-todos__title">To-dos</span>
+    <span class="chat-todos__count">${normalized.length}</span>
+  `;
+  board.appendChild(head);
+
+  const list = document.createElement("div");
+  list.className = "chat-todos__list";
+  normalized.forEach((step) => {
+    const status = step.status || "pending";
+    const row = document.createElement("div");
+    row.className = `chat-todos__item chat-todos__item--${status}`;
+    row.setAttribute("role", "listitem");
+    row.dataset.status = status;
+    if (step.id) row.dataset.stepId = step.id;
+
+    const check = document.createElement("span");
+    check.className = "chat-todos__check";
+    check.setAttribute("aria-hidden", "true");
+    if (status === "done") {
+      check.classList.add("chat-todos__check--done");
+      check.innerHTML = todosCheckIconSvg();
+    } else if (status === "running") {
+      check.classList.add("chat-todos__check--running");
+    } else if (status === "failed") {
+      check.classList.add("chat-todos__check--failed");
+      check.textContent = "✕";
+    } else if (status === "awaiting_approval") {
+      check.classList.add("chat-todos__check--await");
+      check.textContent = "?";
+    } else if (status === "interrupted") {
+      check.classList.add("chat-todos__check--interrupted");
+      check.textContent = "!";
+    }
+
+    const text = document.createElement("span");
+    text.className = "chat-todos__text";
+    text.textContent = step.title || "未命名步骤";
+    row.appendChild(check);
+    row.appendChild(text);
+    if (step.autoInserted) {
+      const tag = document.createElement("span");
+      tag.className = "chat-todos__tag";
+      tag.textContent = "自动";
+      row.appendChild(tag);
+    }
+    list.appendChild(row);
+  });
+  board.appendChild(list);
+  return board;
+}
+
+function renderTodosBoard(plan, mount) {
+  const host = mount || document.getElementById("todos-board");
+  if (!host) return;
+  host.innerHTML = "";
+  const board = buildTodosBoardElement(plan);
+  if (board) {
+    host.appendChild(board);
+    return;
+  }
+  const empty = document.createElement("div");
+  empty.className = "chat-todos chat-todos--empty";
+  empty.innerHTML = `
+    <div class="chat-todos__head">
+      <span class="chat-todos__icon">${todosListIconSvg()}</span>
+      <span class="chat-todos__title">To-dos</span>
+      <span class="chat-todos__count">0</span>
+    </div>
+    <div class="chat-todos__empty-text">暂无执行计划。分析任务开始后，步骤会显示在这里。</div>
+  `;
+  host.appendChild(empty);
+}
+
+function ensureThinkingPanel(group) {
+  if (!group || group.querySelector(".chat-thinking")) return;
+  const bubble = group.querySelector(".chat-bubble");
+  const textEl = group.querySelector(".chat-text");
+  if (!bubble || !textEl) return;
+
+  const panel = document.createElement("details");
+  panel.className = "chat-thinking";
+  panel.open = true;
+  panel.innerHTML = `
+    <summary class="chat-thinking__summary">Thinking</summary>
+    <div class="chat-thinking__steps"></div>
+  `;
+  bubble.insertBefore(panel, textEl);
+}
+
+function getThinkingStepsEl(group) {
+  return group?.querySelector(".chat-thinking__steps") || null;
+}
+
+function getThinkingSummaryEl(group) {
+  return group?.querySelector(".chat-thinking__summary") || null;
+}
+
+function resolvePlanSnapshotTitle(goal, eventType = "") {
+  const baseTitle = String(goal || "").trim() || "当前流程";
+  if (eventType === "plan_revised") return `${baseTitle}（已更新）`;
+  if (eventType === "plan_complete") return `${baseTitle}（已完成）`;
+  if (eventType === "plan_incomplete" || eventType === "plan_failed") return `${baseTitle}（未完成）`;
+  return baseTitle;
+}
+
+function summarizePlanStepStatus(status) {
+  if (status === "done") return { mark: "✓", label: "已完成" };
+  if (status === "running") return { mark: "▶", label: "进行中" };
+  if (status === "awaiting_approval") return { mark: "?", label: "等待确认" };
+  if (status === "interrupted") return { mark: "!", label: "已中断" };
+  if (status === "failed") return { mark: "✗", label: "失败" };
+  return { mark: "○", label: "待执行" };
+}
+
+function buildThinkingPlanData(plan, eventType = "", message = "") {
+  const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+  const done = steps.filter((step) => step?.status === "done").length;
+  const running = steps.filter((step) => step?.status === "running").length;
+  const interrupted = steps.filter((step) => step?.status === "interrupted").length;
+  const awaitingApproval = steps.filter((step) => step?.status === "awaiting_approval").length;
+  const failed = steps.filter((step) => step?.status === "failed").length;
+  const pending = Math.max(0, steps.length - done - running - interrupted - failed);
+  const autoInserted = steps.filter((step) => step?.autoInserted);
+  return {
+    eventType: String(eventType || ""),
+    message: String(message || ""),
+    total: steps.length,
+    done,
+    running,
+    interrupted,
+    awaitingApproval,
+    failed,
+    pending,
+    autoInsertedCount: autoInserted.length,
+    autoInsertedTitles: autoInserted.map((step) => String(step?.title || step?.goal || step?.id || "")).filter(Boolean),
+    steps: steps.map((step) => ({
+      id: String(step?.id || ""),
+      title: String(step?.title || step?.goal || step?.id || ""),
+      status: String(step?.status || "pending"),
+      autoInserted: Boolean(step?.autoInserted),
+    })),
+  };
+}
+
+function setThinkingRoundCount(group, roundCount, { exact = true } = {}) {
+  const panel = group?.querySelector(".chat-thinking");
+  if (!panel) return;
+  const value = Number(roundCount);
+  panel.dataset.roundCount = Number.isFinite(value) && value > 0 ? String(value) : "0";
+  panel.dataset.roundExact = exact ? "true" : "false";
+}
+
+function thinkingDomRoundStats(stepsEl) {
+  if (!stepsEl) return { count: 0, exact: false };
+  const roundIds = [];
+  stepsEl.querySelectorAll(".chat-thinking__step").forEach((item) => {
+    if (item.dataset.roundId) roundIds.push(item.dataset.roundId);
+  });
+  const trusted = roundIds.filter((id) => !id.startsWith("legacy:") && !id.startsWith("turn:"));
+  if (trusted.length) return { count: new Set(trusted).size, exact: true };
+  return { count: new Set(roundIds).size, exact: false };
+}
+
+function countUniqueThinkingDomSteps(stepsEl) {
+  return thinkingDomRoundStats(stepsEl).count;
+}
+
+function updateThinkingSummaryCount(stepsEl) {
+  if (!stepsEl) return;
+  const panel = stepsEl.closest(".chat-thinking");
+  const summaryEl = panel?.querySelector(".chat-thinking__summary");
+  if (summaryEl) {
+    const live = thinkingDomRoundStats(stepsEl);
+    const roundCount = live.count || Number(panel?.dataset.roundCount || 0);
+    const exact = live.count > 0 ? live.exact : panel?.dataset.roundExact === "true";
+    summaryEl.textContent = roundCount > 0
+      ? (exact ? `Thinking (${roundCount} 轮)` : `Thinking (${roundCount} 次工具决策)`)
+      : "Thinking";
+  }
+}
+
+function renderPlanThinkingStep(item, step) {
+  const data = step?.data && typeof step.data === "object" ? step.data : {};
+  const steps = Array.isArray(data.steps) ? data.steps : [];
+  const planLike = {
+    goal: String(step?.title || "").replace(/（已(?:更新|完成|未完成)）$/, ""),
+    steps,
+    data,
+  };
+  rememberLivePlan(planLike);
+  const board = buildTodosBoardElement(planLike);
+  if (board) {
+    item.appendChild(board);
+    renderTodosBoard(planLike);
+  } else if (step.body) {
+    const body = document.createElement("pre");
+    body.className = "chat-thinking__step-body";
+    body.textContent = step.body;
+    item.appendChild(body);
+  }
+
+  const autoInsertedCount = Number(data.autoInsertedCount) || 0;
+  if (autoInsertedCount > 0) {
+    const hint = document.createElement("div");
+    hint.className = "chat-thinking__plan-note";
+    const titles = Array.isArray(data.autoInsertedTitles) ? data.autoInsertedTitles.filter(Boolean) : [];
+    hint.textContent = titles.length
+      ? `已根据当前上下文自动补全前置步骤：${titles.join(" -> ")}`
+      : "已根据当前上下文自动补全前置步骤";
+    item.appendChild(hint);
+  } else if (data.eventType === "plan_revised") {
+    const hint = document.createElement("div");
+    hint.className = "chat-thinking__plan-note";
+    hint.textContent = "计划已根据最新执行结果更新。";
+    item.appendChild(hint);
+  }
+}
+
+function streamThinkingStepId(event, kind) {
+  const runId = String(event?.runId || "").trim();
+  const seq = Number(event?._seq);
+  if (!runId || !Number.isFinite(seq) || seq <= 0) return "";
+  return `stream:${runId}:${kind}:${seq}`;
+}
+
+function eventThinkingRoundId(event) {
+  const scoped = String(event?.roundId || "").trim();
+  if (scoped) return scoped;
+  // Servers released before roundId support reset `turn` at every plan step,
+  // so it cannot be used as a stable persisted count. Use the durable tool
+  // call identity instead and label it as a tool-decision count in the UI.
+  const runId = String(event?.runId || "").trim();
+  const toolCallId = String(event?.toolCallId || "").trim();
+  if (runId && /^call_/.test(toolCallId)) return `legacy:${runId}:${toolCallId}`;
+  if (runId && event?.type === "tool_call" && Number.isFinite(Number(event?._seq))) {
+    return `legacy:${runId}:tool:${Number(event._seq)}`;
+  }
+  return "";
+}
+
+function executionThinkingStepId(event, kind) {
+  const runId = String(event?.runId || "").trim();
+  const toolCallId = String(event?.toolCallId || "").trim();
+  if (runId && toolCallId) return `execution:${runId}:${toolCallId}:${kind}`;
+  // Servers started before toolCallId support can still update progress using
+  // the code description rather than creating a Thinking step per event.
+  const label = String(event?.summary || event?.description || "").trim();
+  if (runId && label) return `execution:${runId}:${kind}:${label}`;
+  return streamThinkingStepId(event, kind);
+}
+
+function appendThinkingStep(group, step, options = {}) {
+  ensureThinkingPanel(group);
+  const stepsEl = getThinkingStepsEl(group);
+  if (!stepsEl) return;
+
+  step = { ...step, roundId: stableThinkingRoundId(step) };
+  const stepId = String(step?.id || "").trim();
+  const stepKey = thinkingStepFingerprint(step);
+  let item = stepId
+    ? stepsEl.querySelector(`.chat-thinking__step[data-step-id="${CSS.escape(stepId)}"]`)
+    : null;
+  if (!item && step.kind === "plan") {
+    item = stepsEl.querySelector(".chat-thinking__step--plan");
+  }
+  if (!item) {
+    item = [...stepsEl.querySelectorAll(".chat-thinking__step")].find((candidate) => (
+      !candidate.dataset.stepId && candidate.dataset.stepKey === stepKey
+    )) || null;
+  }
+  if (!item) {
+    item = document.createElement("div");
+    item.className = `chat-thinking__step chat-thinking__step--${step.kind}`;
+    stepsEl.appendChild(item);
+  } else {
+    item.className = `chat-thinking__step chat-thinking__step--${step.kind}`;
+    item.innerHTML = "";
+  }
+  if (stepId) item.dataset.stepId = stepId;
+  item.dataset.stepKey = stepKey;
+  const roundId = step.roundId;
+  if (roundId) item.dataset.roundId = roundId;
+  else delete item.dataset.roundId;
+
+  if (step.kind === "plan") {
+    renderPlanThinkingStep(item, step);
+  } else {
+    const title = document.createElement("div");
+    title.className = "chat-thinking__step-title";
+    title.textContent = step.title;
+    item.appendChild(title);
+    if (step.body) {
+      const body = document.createElement("pre");
+      body.className = "chat-thinking__step-body";
+      body.textContent = step.body;
+      item.appendChild(body);
+    }
+  }
+
+  const panel = stepsEl.closest(".chat-thinking");
+  if (panel) {
+    const live = thinkingDomRoundStats(stepsEl);
+    if (live.count > 0) {
+      panel.dataset.roundCount = String(live.count);
+      panel.dataset.roundExact = live.exact ? "true" : "false";
+    } else if (!panel.dataset.roundCount) {
+      panel.dataset.roundCount = "0";
+      panel.dataset.roundExact = "false";
+    }
+  }
+  updateThinkingSummaryCount(stepsEl);
+  scrollThreadToBottom();
+
+  if (options.persist !== false) {
+    recordThinkingStep(step);
+  }
+}
+
+function approvalStatusLabel(status) {
+  if (status === "approved") return "已允许运行";
+  if (status === "auto-approved") return "已自动允许运行";
+  if (status === "denied") return "已拒绝";
+  return "";
+}
+
+function renderApprovalArtifact(artifact, interactive) {
+  const codeInner = getCodePanelInner();
+  if (!codeInner) return null;
+
+  showCodePanel();
+
+  const card = document.createElement("div");
+  card.className = "code-approval";
+  card.dataset.requestId = artifact.id;
+  if (artifact.status === "approved" || artifact.status === "auto-approved") {
+    card.classList.add("code-approval--approved");
+  }
+  if (artifact.status === "denied") {
+    card.classList.add("code-approval--denied");
+  }
+
+  card.innerHTML = `
+    <div class="code-approval__title">Agent 请求运行代码</div>
+    <div class="code-approval__desc"></div>
+    <pre class="code-approval__code"></pre>
+    <div class="code-approval__actions"></div>
+  `;
+
+  card.querySelector(".code-approval__desc").textContent =
+    artifact.description || "即将在当前 conda / Jupyter 环境中执行以下 Python 代码。";
+  card.querySelector(".code-approval__code").textContent = artifact.code || "";
+
+  const actions = card.querySelector(".code-approval__actions");
+  if (artifact.status && artifact.status !== "pending") {
+    const label = approvalStatusLabel(artifact.status);
+    actions.innerHTML = `<span class="code-approval__status ${artifact.status === "denied" ? "code-approval__status--denied" : "code-approval__status--ok"}">${label}</span>`;
+  } else if (interactive) {
+    actions.innerHTML = `
+      <button class="btn btn--outline btn--sm code-approval__deny" type="button">拒绝</button>
+      <button class="btn btn--primary btn--sm code-approval__allow" type="button">允许运行</button>
+      <button class="btn btn--outline btn--sm code-approval__allow-all" type="button">允许所有操作</button>
+    `;
+  } else {
+    actions.innerHTML = '<span class="code-approval__status">等待批准</span>';
+  }
+
+  codeInner.appendChild(card);
+  scrollCodePanelToBottom();
+  return card;
+}
+
+function sanitizeCodePanel(codePanel) {
+  const items = Array.isArray(codePanel) ? [...codePanel] : [];
+  const runningIndices = items
+    .map((item, index) => (item.type === "execution" && !item.done && !item.stopped ? index : -1))
+    .filter((index) => index >= 0);
+
+  runningIndices.forEach((index, order) => {
+    const keepRunning =
+      (isChatStreaming(activeChatId) || backgroundWatches.has(activeChatId))
+      && order === runningIndices.length - 1;
+    if (!keepRunning) {
+      items[index] = stripDownloadProgressFields({
+        ...items[index],
+        done: true,
+        stopped: true,
+        title: "代码已停止",
+        stage: "已终止",
+        hint: "",
+      });
+    }
+  });
+  return items;
+}
+
+function markRunningExecutionsStopped() {
+  const chat = ensureActiveChatRecord();
+  if (!Array.isArray(chat.codePanel)) return;
+
+  // 背景监控卡直接移除，不要标成「已停止」干扰真实下载进度卡
+  removeBackgroundExecutionCard();
+
+  let changed = false;
+  chat.codePanel.forEach((item, index) => {
+    if (item.type === "execution" && !item.done && !item.stopped) {
+      if (item.id === BACKGROUND_EXECUTION_ID) return;
+      chat.codePanel[index] = stripDownloadProgressFields({
+        ...item,
+        done: true,
+        stopped: true,
+        title: "代码已停止",
+        stage: "已终止",
+        hint: "",
+      });
+      changed = true;
+    }
+  });
+  if (changed) persistActiveChat();
+
+  getCodePanelInner()?.querySelectorAll(".code-execution-progress--running").forEach((card) => {
+    if (card.dataset.executionId === BACKGROUND_EXECUTION_ID) {
+      card.remove();
+      return;
+    }
+    applyExecutionStoppedCard(card);
+  });
+  activeCodeExecutionId = null;
+}
+
+function finishRunningExecutionsCompleted(chatId = activeChatId) {
+  const chat = chatId === activeChatId ? getActiveChatRecord() : getChatRecord(chatId);
+  if (!chat?.codePanel || !Array.isArray(chat.codePanel)) return;
+  let changed = false;
+  chat.codePanel = chat.codePanel.map((item) => {
+    if (
+      item?.type !== "execution"
+      || item.id === BACKGROUND_EXECUTION_ID
+      || item.done
+      || item.stopped
+    ) {
+      return item;
+    }
+    changed = true;
+    return stripDownloadProgressFields({
+      ...item,
+      title: "代码运行完成",
+      stage: "已完成",
+      done: true,
+      stopped: false,
+      hint: "",
+    });
+  });
+  if (!changed) return;
+  if (chatId === activeChatId) {
+    persistActiveChat();
+    renderCodePanel(chat.codePanel, { interactive: false });
+  } else {
+    saveChatStore();
+    scheduleServerSessionSave(chatId);
+  }
+}
+
+function getExecutionCard(executionId) {
+  if (!executionId) return null;
+  return getCodePanelInner()?.querySelector(
+    `[data-execution-id="${CSS.escape(String(executionId))}"]`,
+  ) || null;
+}
+
+function executionIdForEvent(event) {
+  const runId = String(event?.runId || "").trim();
+  const toolCallId = String(event?.toolCallId || "").trim();
+  return runId && toolCallId ? `execution:${runId}:${toolCallId}` : "";
+}
+
+function findRunningExecutionArtifact(chat = getActiveChatRecord()) {
+  if (!chat?.codePanel || !Array.isArray(chat.codePanel)) return null;
+  const running = chat.codePanel.filter(
+    (item) =>
+      item?.type === "execution"
+      && item.id
+      && item.id !== BACKGROUND_EXECUTION_ID
+      && !item.done
+      && !item.stopped,
+  );
+  return running.at(-1) || null;
+}
+
+function restoreActiveCodeExecutionId(chat = getActiveChatRecord()) {
+  const running = findRunningExecutionArtifact(chat);
+  activeCodeExecutionId = running?.id || null;
+  return activeCodeExecutionId;
+}
+
+function wireExecutionStopButton(card) {
+  card?.querySelector(".code-execution-progress__stop")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void handleStop();
+  });
+}
+
+function wireExecutionToggleButton(card) {
+  const btn = card?.querySelector(".code-execution-progress__toggle");
+  if (!btn || btn.dataset.wired === "true") return;
+  btn.dataset.wired = "true";
+  btn.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void (async () => {
+      const codeEl = card.querySelector(".code-execution-progress__code");
+      let code = card.dataset.executionCode || codeEl?.textContent || "";
+      if (!code && card.classList.contains("code-execution-progress--done")) {
+        if (codeEl) codeEl.textContent = "正在加载代码…";
+        await hydrateExecutionCodes();
+        const executionId = card.dataset.executionId;
+        const chat = getActiveChatRecord();
+        const artifact = chat?.codePanel?.find(
+          (item) => item.type === "execution" && item.id === executionId,
+        );
+        code = artifact?.code || card.dataset.executionCode || "";
+      }
+      if (codeEl) {
+        codeEl.textContent = code || "暂无保存的代码记录";
+        if (code) card.dataset.executionCode = code;
+      }
+      const expanded = card.classList.toggle("code-execution-progress--expanded");
+      btn.setAttribute("aria-expanded", expanded ? "true" : "false");
+      btn.textContent = expanded ? "收起" : "查看代码";
+      if (codeEl) codeEl.hidden = !expanded;
+    })();
+  });
+}
+
+function resolveExecutionCode(event, artifact = {}) {
+  if (artifact.code) return String(artifact.code);
+  if (event?.code) return String(event.code);
+  const chat = getActiveChatRecord();
+  if (!chat?.codePanel) return "";
+  const desc = event?.description || event?.summary || artifact.description || "";
+  const approvals = chat.codePanel.filter(
+    (item) =>
+      item.type === "approval" &&
+      (item.status === "approved" || item.status === "auto-approved"),
+  );
+  const match = [...approvals].reverse().find((item) => item.description === desc);
+  return String((match || approvals[approvals.length - 1])?.code || "");
+}
+
+function compactCodePanelForRender(codePanel) {
+  const items = Array.isArray(codePanel) ? codePanel : [];
+  const completedDescriptions = new Set(
+    items
+      .filter((item) => item.type === "execution" && item.done && !item.stopped)
+      .map((item) => item.description)
+      .filter(Boolean),
+  );
+  return items.filter((item) => {
+    if (item.type !== "approval") return true;
+    if (item.status !== "approved" && item.status !== "auto-approved") return true;
+    return !completedDescriptions.has(item.description);
+  });
+}
+
+async function hydrateExecutionCodes() {
+  const chat = getActiveChatRecord();
+  if (!chat?.codePanel || !activeChatId) return;
+
+  // replay.py stores only an ordered list of code cells. Older execution cards
+  // have no tool-call ID, so assigning chunks by array index can display a
+  // different cell than the thinking entry. New cards persist their code from
+  // the correlated code_execution_started event; leave legacy blanks blank.
+}
+
+function createExecutionCardElement(executionId, { showStop = false } = {}) {
+  const card = document.createElement("div");
+  card.className = "code-execution-progress code-execution-progress--running";
+  card.dataset.executionId = executionId;
+  card.innerHTML = `
+    <div class="code-execution-progress__header">
+      <span class="code-execution-progress__dot"></span>
+      <span class="code-execution-progress__title">代码运行中</span>
+      <span class="code-execution-progress__elapsed"></span>
+      <button class="code-execution-progress__toggle" type="button" aria-expanded="false" aria-label="查看代码" title="查看运行的代码" hidden>查看代码</button>
+      <button class="code-execution-progress__stop" type="button" aria-label="停止代码" title="停止运行" ${showStop ? "" : "hidden"}>停止</button>
+    </div>
+    <div class="code-execution-progress__desc"></div>
+    <div class="code-execution-progress__stage-row">
+      <span class="code-execution-progress__stage-label">当前阶段</span>
+      <span class="code-execution-progress__stage"></span>
+    </div>
+    <div class="code-execution-progress__bar-wrap" hidden>
+      <div class="code-execution-progress__bar-label"></div>
+      <div class="code-execution-progress__bar-track">
+        <div class="code-execution-progress__bar-fill"></div>
+      </div>
+      <div class="code-execution-progress__bar-meta"></div>
+    </div>
+    <ul class="code-execution-progress__highlights"></ul>
+    <div class="code-execution-progress__empty">等待任务输出…</div>
+    <div class="code-execution-progress__hint"></div>
+    <pre class="code-execution-progress__code" hidden></pre>
+  `;
+  wireExecutionStopButton(card);
+  wireExecutionToggleButton(card);
+  return card;
+}
+
+function applyExecutionCardState(card, artifact, { showStop = false } = {}) {
+  if (!card) return;
+
+  card.classList.remove("code-execution-progress--running", "code-execution-progress--done", "code-execution-progress--stopped");
+  const dot = card.querySelector(".code-execution-progress__dot");
+  dot?.classList.remove("code-execution-progress__dot--done");
+
+  if (artifact.stopped) {
+    card.classList.add("code-execution-progress--stopped");
+  } else if (artifact.done) {
+    card.classList.add("code-execution-progress--done");
+    dot?.classList.add("code-execution-progress__dot--done");
+  } else {
+    card.classList.add("code-execution-progress--running");
+  }
+
+  card.querySelector(".code-execution-progress__title").textContent =
+    artifact.title || (artifact.stopped ? "代码已停止" : artifact.done ? "代码运行完成" : "代码运行中");
+  card.querySelector(".code-execution-progress__elapsed").textContent = artifact.elapsedLabel
+    ? `· ${artifact.elapsedLabel}`
+    : "";
+  card.querySelector(".code-execution-progress__desc").textContent = artifact.description || "";
+  const batchSummary = extractBatchExecutionSummary(artifact);
+  const hasBatchSummary = Boolean(batchSummary && !artifact.done && !artifact.stopped);
+  const concurrency = extractExecutionConcurrency(artifact);
+  const runningCount = batchSummary?.running ?? concurrency;
+  const phaseSummary = hasBatchSummary
+    ? [
+      `总样本 ${batchSummary.total}`,
+      runningCount != null ? `运行中 ${runningCount}` : "",
+      `已完成 ${batchSummary.done}`,
+    ].filter(Boolean).join(" · ")
+    : [
+      artifact.elapsedLabel ? `已运行 ${artifact.elapsedLabel}` : "",
+      runningCount != null ? `并行任务 ${runningCount}` : "",
+      artifact.stopped ? "当前进度 已终止" : artifact.done ? "当前进度 已完成" : "当前进度 等待首个状态",
+    ].filter(Boolean).join(" · ");
+  const stageLabelEl = card.querySelector(".code-execution-progress__stage-label");
+  const stageEl = card.querySelector(".code-execution-progress__stage");
+  if (stageLabelEl) {
+    stageLabelEl.textContent = hasBatchSummary ? "样本进度" : "运行概况";
+  }
+  if (stageEl) {
+    stageEl.textContent = phaseSummary || (artifact.stage || (artifact.stopped ? "已终止" : artifact.done ? "已完成" : "运行中"));
+  }
+
+  const highlights = filterExecutionHighlights(artifact.highlights, artifact);
+  const listEl = card.querySelector(".code-execution-progress__highlights");
+  const emptyEl = card.querySelector(".code-execution-progress__empty");
+  listEl.innerHTML = "";
+
+  const isCompact = Boolean(artifact.done || artifact.stopped);
+  const isActiveDownload = !isCompact && Boolean(artifact.isDownloadTask);
+  const barWrap = card.querySelector(".code-execution-progress__bar-wrap");
+  const barFill = card.querySelector(".code-execution-progress__bar-fill");
+  const bytes = Number(artifact.progressBytes);
+  const bytesTotal = Number(artifact.progressBytesTotal);
+  const fileIndex = Number(artifact.progressFileIndex);
+  const fileTotal = Number(artifact.progressFileTotal);
+  const filePctRaw = Number(artifact.progressFilePct);
+  let filePct = Number.isFinite(filePctRaw) ? filePctRaw : null;
+  if (Number.isFinite(bytes) && Number.isFinite(bytesTotal) && bytesTotal > 0) {
+    filePct = Math.max(0, Math.min(100, (bytes / bytesTotal) * 100));
+  }
+
+  let overallPct = Number(artifact.progressOverallPct);
+  let hasPct = artifact.progressOverallPct != null && Number.isFinite(overallPct);
+  // 整体% 不能用「当前文件序号/总数」冒充完成；有本文件进度时按加权重算
+  if (
+    Number.isFinite(fileIndex)
+    && Number.isFinite(fileTotal)
+    && fileTotal > 0
+    && filePct != null
+  ) {
+    const weighted = ((fileIndex - 1) + filePct / 100) / fileTotal * 100;
+    if (!hasPct || (overallPct >= 99.5 && filePct < 95) || Math.abs(overallPct - weighted) > 8) {
+      overallPct = weighted;
+      hasPct = true;
+    }
+  }
+  // 批量任务进度（stage 含"已完成 12/30 样本"）：用百分比驱动进度条
+  const batchProgressDone = batchSummary?.done || 0;
+  const batchProgressTotal = batchSummary?.total || 0;
+  const batchRunning = batchSummary?.running;
+  const hasSampleBatchProgress = batchProgressTotal > 0 && !isActiveDownload;
+  if (hasSampleBatchProgress && !hasPct && filePct == null) {
+    overallPct = (batchProgressDone / batchProgressTotal) * 100;
+    hasPct = true;
+  }
+  const hasBytes = Number(artifact.progressBytes) > 0;
+  const hasProgress =
+    (isActiveDownload && isDownloadProgressArtifact(artifact) && (hasPct || hasBytes))
+    || hasSampleBatchProgress;
+  // Batch quantification (e.g. tRAX) reports sample progress rather than
+  // download bytes. Do not leave its card saying "等待输出" once a stage or
+  // sample counter is available.
+  const hideOutput = hasProgress;
+
+  if (highlights.length && !hideOutput) {
+    emptyEl.hidden = true;
+    listEl.hidden = false;
+    highlights.slice(-4).forEach((line) => {
+      const item = document.createElement("li");
+      item.className = "code-execution-progress__highlight";
+      item.textContent = line;
+      listEl.appendChild(item);
+    });
+  } else {
+    emptyEl.hidden = Boolean(artifact.done || artifact.stopped || hideOutput);
+    if (!emptyEl.hidden) {
+      emptyEl.textContent = artifact.stage
+        ? `当前状态：${artifact.stage}`
+        : "等待任务输出…";
+    }
+    listEl.hidden = true;
+  }
+
+  card.querySelector(".code-execution-progress__hint").textContent = artifact.hint || "";
+  const stopBtn = card.querySelector(".code-execution-progress__stop");
+  if (stopBtn) stopBtn.hidden = !(showStop && !artifact.done && !artifact.stopped);
+
+  const barLabel = card.querySelector(".code-execution-progress__bar-label");
+  const barMeta = card.querySelector(".code-execution-progress__bar-meta");
+  let barPct = hasPct ? overallPct : filePct;
+  if (barPct == null || !Number.isFinite(barPct)) barPct = 0;
+
+  const runLabel = artifact.progressRun || "";
+  let displayLabel = artifact.progressLabel || artifact.stage || "下载中…";
+  // 批量任务进度：显示整体样本完成度，避免把 inflight 原始列表塞进 UI
+  if (hasSampleBatchProgress) {
+    displayLabel = `样本进度 ${batchProgressDone}/${batchProgressTotal}（${overallPct.toFixed(1)}%）`;
+  }
+  if (runLabel && fileIndex && fileTotal && hasPct && filePct != null) {
+    displayLabel = `${runLabel} · 本文件 ${filePct.toFixed(1)}% · 整体 ${Number(barPct).toFixed(1)}% (${fileIndex}/${fileTotal})`;
+  } else if (runLabel && hasPct && filePct != null) {
+    displayLabel = `${runLabel} · 本文件 ${filePct.toFixed(1)}% · 整体 ${Number(barPct).toFixed(1)}%`;
+  } else if (runLabel && hasPct) {
+    displayLabel = `${runLabel} · 整体 ${Number(barPct).toFixed(1)}%`;
+  }
+
+  const isIndeterminate = Boolean(artifact.progressIndeterminate) && !hasPct && hasBytes && filePct == null;
+  if (barWrap && barFill) {
+    barFill.classList.remove("code-execution-progress__bar-fill--indeterminate");
+    if (!hasProgress) {
+      if (!artifact.done && !artifact.stopped) {
+        barWrap.hidden = false;
+        barFill.classList.add("code-execution-progress__bar-fill--indeterminate");
+        barFill.style.width = "";
+        if (barLabel) {
+          barLabel.textContent = "任务已启动，等待进度输出";
+        }
+        if (barMeta) {
+          barMeta.textContent = [
+            artifact.elapsedLabel ? `已运行 ${artifact.elapsedLabel}` : "",
+            runningCount != null ? `并行任务 ${runningCount}` : "",
+            artifact.stage ? `状态 ${artifact.stage}` : "",
+          ].filter(Boolean).join(" · ");
+        }
+      } else {
+        barWrap.hidden = true;
+        barFill.style.width = "0";
+      }
+    } else {
+      barWrap.hidden = false;
+      barFill.classList.toggle(
+        "code-execution-progress__bar-fill--indeterminate",
+        isIndeterminate,
+      );
+      if (isIndeterminate) {
+        barFill.style.width = "";
+      } else {
+        const pct = Math.max(0, Math.min(100, barPct));
+        barFill.style.width = `${pct}%`;
+      }
+      if (barLabel) {
+        barLabel.textContent = displayLabel;
+      }
+      if (barMeta) {
+        if (hasSampleBatchProgress) {
+          barMeta.textContent = [
+            `总样本 ${batchProgressTotal}`,
+            batchRunning != null ? `运行中 ${batchRunning}` : "",
+            `已完成 ${batchProgressDone}`,
+          ].filter(Boolean).join(" · ");
+        } else if (Number.isFinite(bytes) && Number.isFinite(bytesTotal) && bytesTotal > 0) {
+          const fmt = (value) => `${(value / 1024 / 1024).toFixed(1)} MB`;
+          const fileText = filePct != null ? `本文件 ${filePct.toFixed(1)}%` : "";
+          const overallText = `整体 ${Number(barPct).toFixed(1)}%`;
+          barMeta.textContent = [fmt(bytes) + " / " + fmt(bytesTotal), fileText, overallText]
+            .filter(Boolean)
+            .join(" · ");
+        } else if (Number.isFinite(bytes) && bytes > 0) {
+          barMeta.textContent = hasPct
+            ? `整体 ${Number(barPct).toFixed(1)}% · ${(bytes / 1024 / 1024).toFixed(1)} MB`
+            : `${(bytes / 1024 / 1024).toFixed(1)} MB 已下载`;
+        } else if (artifact.progressFileIndex && artifact.progressFileTotal) {
+          barMeta.textContent = `文件 ${artifact.progressFileIndex}/${artifact.progressFileTotal}${hasPct ? ` · 整体 ${Number(barPct).toFixed(1)}%` : ""}`;
+        } else if (hasPct) {
+          barMeta.textContent = `整体 ${Number(barPct).toFixed(1)}%`;
+        } else {
+          barMeta.textContent = "下载中…";
+        }
+      }
+    }
+  }
+
+  const code = resolveExecutionCode(null, artifact) || card.dataset.executionCode || "";
+  if (code) card.dataset.executionCode = code;
+
+  const codeEl = card.querySelector(".code-execution-progress__code");
+  const toggleBtn = card.querySelector(".code-execution-progress__toggle");
+  const stageRow = card.querySelector(".code-execution-progress__stage-row");
+  const descEl = card.querySelector(".code-execution-progress__desc");
+  const hintEl = card.querySelector(".code-execution-progress__hint");
+
+  if (codeEl) {
+    codeEl.textContent = code;
+    codeEl.hidden = !card.classList.contains("code-execution-progress--expanded") || !code;
+  }
+  if (toggleBtn) {
+    toggleBtn.hidden = !isCompact;
+    if (!card.classList.contains("code-execution-progress--expanded")) {
+      toggleBtn.setAttribute("aria-expanded", "false");
+      toggleBtn.textContent = "查看代码";
+    }
+  }
+
+  card.classList.toggle("code-execution-progress--compact", isCompact);
+  if (stageRow) stageRow.hidden = isCompact;
+  if (descEl) descEl.hidden = isCompact;
+  if (hintEl) hintEl.hidden = isCompact || !artifact.hint;
+  if (isCompact) {
+    emptyEl.hidden = true;
+    listEl.hidden = true;
+  }
+}
+
+function applyExecutionStoppedCard(card) {
+  if (!card) return;
+  applyExecutionCardState(card, stripDownloadProgressFields({
+    stopped: true,
+    done: true,
+    title: "代码已停止",
+    stage: "已终止",
+    hint: "",
+    highlights: [],
+  }));
+}
+
+function renderExecutionArtifact(artifact, options = {}) {
+  const codeInner = getCodePanelInner();
+  if (!codeInner || !artifact?.id) return null;
+
+  showCodePanel();
+
+  let card = getExecutionCard(artifact.id);
+  if (!card) {
+    card = createExecutionCardElement(artifact.id, {
+      showStop: Boolean(options.showStop && !artifact.done && !artifact.stopped),
+    });
+    codeInner.appendChild(card);
+  }
+  applyExecutionCardState(card, normalizeExecutionArtifact(artifact), {
+    showStop: Boolean(options.showStop && !artifact.done && !artifact.stopped),
+  });
+  scrollCodePanelToBottom();
+  return card;
+}
+
+function renderCodePanel(codePanel, options = {}) {
+  const interactive = Boolean(options.interactive) || isActiveChatSending();
+  const scrollState = captureCodePanelScrollState();
+  const preserveScroll = Boolean(scrollState && !scrollState.stickToBottom);
+  suppressCodeAutoScroll = preserveScroll;
+  resetCodePanel();
+
+  const normalized = (compactCodePanelForRender(codePanel) || []).map((item) => {
+    if (item.type === "execution" && !item.id) {
+      return { ...item, id: createId() };
+    }
+    return item;
+  });
+  const sanitized = sanitizeCodePanel(normalized);
+  if (sanitized.length === 0) return;
+
+  const chat = getActiveChatRecord();
+  if (chat && JSON.stringify(chat.codePanel) !== JSON.stringify(sanitized)) {
+    chat.codePanel = sanitized;
+    persistActiveChat();
+  }
+
+  restoreActiveCodeExecutionId(chat);
+
+  sanitized.forEach((artifact) => {
+    if (artifact.type === "approval") {
+      renderApprovalArtifact(artifact, interactive);
+    } else if (artifact.type === "execution") {
+      renderExecutionArtifact(normalizeExecutionArtifact(hydrateExecutionElapsed(artifact)), {
+        showStop: interactive && isActiveChatSending() && !artifact.done && !artifact.stopped,
+      });
+    }
+  });
+  suppressCodeAutoScroll = false;
+  syncCodePanelVisibility();
+  void hydrateExecutionCodes();
+  if (preserveScroll) {
+    restoreCodePanelScrollState(scrollState);
+  } else {
+    scrollCodePanelToBottom();
+  }
+}
+
+function markApprovalCard(card, status) {
+  if (!card) return;
+  card.classList.toggle("code-approval--approved", status === "approved" || status === "auto-approved");
+  card.classList.toggle("code-approval--denied", status === "denied");
+  const actions = card.querySelector(".code-approval__actions");
+  if (!actions) return;
+  if (status === "denied") {
+    actions.innerHTML = '<span class="code-approval__status code-approval__status--denied">已拒绝</span>';
+    return;
+  }
+  actions.innerHTML = `<span class="code-approval__status code-approval__status--ok">${approvalStatusLabel(status)}</span>`;
+}
+
+async function settleCodeApproval(card, event, approved, options = {}) {
+  const runId = options.runId || getChatStream(activeChatId)?.runId || "";
+  const desc = event.description || "即将在当前 conda / Jupyter 环境中执行以下 Python 代码。";
+  const status = approved ? (options.auto ? "auto-approved" : "approved") : "denied";
+
+  const buttons = card.querySelectorAll("button");
+  buttons.forEach((btn) => {
+    btn.disabled = true;
+  });
+
+  try {
+    if (!runId) {
+      throw new Error("当前 Agent 运行已结束，无法批准代码。请重新发送消息。");
+    }
+    if (!options.skipBackendApprove) {
+      await window.approveAgentCode?.(runId, event.requestId, approved);
+    }
+    if (approved && event.code) {
+      pendingExecutionCode = event.code;
+    }
+    recordCodeArtifact({
+      type: "approval",
+      id: event.requestId,
+      description: desc,
+      code: event.code || "",
+      status,
+    });
+    markApprovalCard(card, status);
+  } catch (error) {
+    buttons.forEach((btn) => {
+      btn.disabled = false;
+    });
+    const actions = card.querySelector(".code-approval__actions");
+    if (actions) {
+      actions.innerHTML = `<span class="code-approval__status code-approval__status--denied">${error instanceof Error ? error.message : String(error)}</span>`;
+    }
+    throw error;
+  }
+
+  syncCodePanelVisibility();
+  scrollThreadToBottom();
+}
+
+function wireApprovalCard(card, event, options = {}) {
+  if (!card || card.dataset.approvalWired === "true") return;
+  card.dataset.approvalWired = "true";
+
+  card.querySelector(".code-approval__allow")?.addEventListener("click", () => {
+    void settleCodeApproval(card, event, true, options);
+  });
+  card.querySelector(".code-approval__deny")?.addEventListener("click", () => {
+    void settleCodeApproval(card, event, false, options);
+  });
+  card.querySelector(".code-approval__allow-all")?.addEventListener("click", () => {
+    setAutoApproveCode(true);
+    void settleCodeApproval(card, event, true, { ...options, auto: true });
+  });
+}
+
+function approvePendingCodeCards(options = {}) {
+  const codeInner = getCodePanelInner();
+  if (!codeInner) return;
+  codeInner.querySelectorAll(".code-approval").forEach((card) => {
+    if (card.classList.contains("code-approval--approved") || card.classList.contains("code-approval--denied")) {
+      return;
+    }
+    const requestId = card.dataset.requestId;
+    if (!requestId) return;
+    const chat = getActiveChatRecord();
+    const artifact = chat?.codePanel?.find((item) => item.type === "approval" && item.id === requestId);
+    const event = {
+      requestId,
+      description: artifact?.description || card.querySelector(".code-approval__desc")?.textContent || "",
+      code: artifact?.code || card.querySelector(".code-approval__code")?.textContent || "",
+    };
+    wireApprovalCard(card, event, options);
+    if (options.auto || autoApproveCode) {
+      void settleCodeApproval(card, event, true, {
+        ...options,
+        auto: true,
+      });
+    }
+  });
+}
+
+function showCodeApproval(_group, event, options = {}) {
+  const codeInner = getCodePanelInner();
+  if (!codeInner) return;
+
+  const shouldAuto = Boolean(options.autoApprove ?? autoApproveCode);
+  const runId = options.runId || getChatStream(activeChatId)?.runId || "";
+  let desc = event.description || "即将在当前 conda / Jupyter 环境中执行以下 Python 代码。";
+  if (event.supervisor?.reason) {
+    desc = `需用户确认（${event.supervisor.level || "skill"}）：${event.supervisor.reason}\n\n${desc}`;
+  }
+
+  let card = codeInner.querySelector(`[data-request-id="${event.requestId}"]`);
+  if (card) {
+    if (card.classList.contains("code-approval--approved") || card.classList.contains("code-approval--denied")) {
+      return;
+    }
+    wireApprovalCard(card, event, { ...options, runId });
+    if (shouldAuto) {
+      void settleCodeApproval(card, event, true, {
+        runId,
+        auto: true,
+      });
+    }
+    return;
+  }
+
+  recordCodeArtifact({
+    type: "approval",
+    id: event.requestId,
+    description: desc,
+    code: event.code || "",
+    status: shouldAuto ? "auto-approved" : "pending",
+  });
+
+  card = renderApprovalArtifact(
+    {
+      type: "approval",
+      id: event.requestId,
+      description: desc,
+      code: event.code || "",
+      status: shouldAuto ? "auto-approved" : "pending",
+    },
+    !shouldAuto,
+  );
+  if (!card) return;
+
+  if (shouldAuto) {
+    wireApprovalCard(card, event, { ...options, runId });
+    void settleCodeApproval(card, event, true, {
+      runId,
+      auto: true,
+    });
+    return;
+  }
+
+  wireApprovalCard(card, event, { ...options, runId });
+  syncCodePanelVisibility();
+  scrollThreadToBottom();
+}
+
+function formatWaitTime(seconds) {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  if (value < 60) return `${value} 秒`;
+  if (value < 3600) {
+    const minutes = Math.round(value / 60);
+    return `${minutes} 分钟`;
+  }
+  const hours = Math.floor(value / 3600);
+  const minutes = Math.round((value % 3600) / 60);
+  return minutes > 0 ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
+}
+
+function ensureCodeExecutionProgress(_group, executionId) {
+  const codeInner = getCodePanelInner();
+  if (!codeInner || !executionId) return null;
+
+  showCodePanel();
+
+  let card = getExecutionCard(executionId);
+  if (!card) {
+    card = createExecutionCardElement(executionId, { showStop: isActiveChatSending() });
+    codeInner.appendChild(card);
+  }
+  return card;
+}
+
+function updateCodeExecutionProgress(group, event) {
+  if (event.type === "code_execution_started") {
+    markRunningExecutionsStopped();
+    removeBackgroundExecutionCard();
+    activeCodeExecutionId = executionIdForEvent(event) || createId();
+    const stream = chatStreams.get(activeChatId);
+    if (stream) stream.codeExecutionId = activeCodeExecutionId;
+  }
+
+  const executionId = activeCodeExecutionId || restoreActiveCodeExecutionId();
+  if (!executionId) return;
+
+  const chat = getActiveChatRecord();
+  const existing = chat?.codePanel?.find(
+    (item) => item.type === "execution" && item.id === executionId,
+  );
+  if (existing?.done || existing?.stopped) return;
+
+  const card = ensureCodeExecutionProgress(group, executionId);
+  if (!card) return;
+
+  const executionCode = resolveExecutionCode(event) || pendingExecutionCode || existing?.code || "";
+  if (event.type === "code_execution_started" && executionCode) {
+    pendingExecutionCode = "";
+  }
+
+  const elapsed = event.elapsedLabel || (event.elapsedSec != null ? `${event.elapsedSec} 秒` : "") || existing?.elapsedLabel || "";
+  const startedAt = existing?.startedAt
+    || (event.elapsedSec != null ? Date.now() - Number(event.elapsedSec) * 1000 : Date.now());
+  const title = event.type === "code_execution_started" ? "代码已开始运行" : "代码仍在运行";
+  const stageText = event.stage || (event.type === "code_execution_started" ? "已启动，等待输出" : "运行中");
+
+  const {
+    isDownloadTask,
+    highlights,
+    phaseDescription,
+  } = resolveExecutionPhaseTitle(
+    { ...event, stage: stageText },
+    existing,
+  );
+
+  let hint = "点击「停止」将中断 Jupyter 内核中的代码。";
+  if (isDownloadTask) {
+    hint = "下载进度实时更新；点击「停止」可中断内核。";
+  } else if (event.type === "code_execution_started") {
+    hint = "代码已启动，进度将实时刷新；点击「停止」可中断内核。";
+  }
+
+  const artifact = {
+    type: "execution",
+    id: executionId,
+    title,
+    description: phaseDescription || event.description || event.summary || existing?.description || "",
+    code: executionCode,
+    stage: stageText,
+    highlights: highlights.slice(-4),
+    startedAt,
+    elapsedSec: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)),
+    elapsedLabel: elapsed,
+    hint,
+    done: false,
+    stopped: false,
+    isDownloadTask,
+  };
+
+  if (isDownloadTask) {
+    const pick = (key) => (event[key] != null ? event[key] : existing?.[key]);
+    Object.assign(artifact, {
+      progressOverallPct: pick("progressOverallPct"),
+      progressFilePct: pick("progressFilePct"),
+      progressRun: pick("progressRun"),
+      progressFileIndex: pick("progressFileIndex"),
+      progressFileTotal: pick("progressFileTotal"),
+      progressBytes: pick("progressBytes"),
+      progressBytesTotal: pick("progressBytesTotal"),
+      progressLabel: pick("progressLabel"),
+      progressIndeterminate: event.progressIndeterminate != null
+        ? event.progressIndeterminate
+        : existing?.progressIndeterminate,
+    });
+    // 事件缺字段时 pick 会残留旧整体%；用当前字节纠偏，避免 21MB/218MB 却显示 100%
+    const b = Number(artifact.progressBytes);
+    const bt = Number(artifact.progressBytesTotal);
+    const fi = Number(artifact.progressFileIndex);
+    const ft = Number(artifact.progressFileTotal);
+    if (Number.isFinite(b) && Number.isFinite(bt) && bt > 0) {
+      const fp = Math.max(0, Math.min(100, (b / bt) * 100));
+      artifact.progressFilePct = fp;
+      if (Number.isFinite(fi) && Number.isFinite(ft) && ft > 0) {
+        const weighted = ((fi - 1) + fp / 100) / ft * 100;
+        const reported = Number(artifact.progressOverallPct);
+        if (!Number.isFinite(reported) || (reported >= 99.5 && fp < 95) || Math.abs(reported - weighted) > 8) {
+          artifact.progressOverallPct = Math.round(weighted * 10) / 10;
+          artifact.progressLabel = `${artifact.progressRun || "FASTQ"} · 本文件 ${fp.toFixed(1)}% · 整体 ${artifact.progressOverallPct.toFixed(1)}% (${fi}/${ft})`;
+        }
+      }
+    }
+  }
+
+  applyExecutionCardState(card, artifact, { showStop: isActiveChatSending() });
+  recordCodeArtifact(artifact);
+
+  // 下载进度更新时不要反复把面板滚到底，避免进度条视觉跳动
+  if (!isDownloadTask || event.type === "code_execution_started") {
+    scrollCodePanelToBottom();
+  }
+}
+
+function finishCodeExecutionProgress(_group, event = {}) {
+  const executionId = executionIdForEvent(event) || activeCodeExecutionId;
+  const card = executionId ? getExecutionCard(executionId) : null;
+  if (!card) return;
+
+  const chat = getActiveChatRecord();
+  const existing = chat?.codePanel?.find(
+    (item) => item.type === "execution" && item.id === executionId,
+  );
+
+  const artifact = stripDownloadProgressFields({
+    type: "execution",
+    id: executionId,
+    title: "代码运行完成",
+    description: existing?.description || "",
+    code: existing?.code || card.dataset.executionCode || "",
+    stage: "已完成",
+    done: true,
+    stopped: false,
+    hint: "",
+  });
+
+  applyExecutionCardState(card, artifact);
+  recordCodeArtifact(artifact);
+  if (executionId === activeCodeExecutionId) activeCodeExecutionId = null;
+  const stream = chatStreams.get(activeChatId);
+  if (stream && stream.codeExecutionId === executionId) stream.codeExecutionId = null;
+
+  scrollCodePanelToBottom();
+  scrollThreadToBottom();
+  void hydrateExecutionCodes();
+  // 每步代码执行结束后立即刷新右侧 Environment / Visualization
+  window.KernelPanel?.refresh?.({ force: true });
+}
+
+function buildCodeProgressArtifact(event, existing, executionId) {
+  const elapsed = event.elapsedLabel
+    || (event.elapsedSec != null ? `${event.elapsedSec} 秒` : "")
+    || existing?.elapsedLabel
+    || "";
+  const startedAt = existing?.startedAt
+    || (event.elapsedSec != null ? Date.now() - Number(event.elapsedSec) * 1000 : Date.now());
+  const title = event.type === "code_execution_started" ? "代码已开始运行" : "代码仍在运行";
+  const stageText = event.stage
+    || (event.type === "code_execution_started" ? "已启动，等待输出" : "运行中");
+  const hasProgressFields = Boolean(
+    event.progressOverallPct != null
+    || event.progressFilePct != null
+    || event.progressRun
+    || event.progressFileTotal
+    || event.progressBytesTotal
+    || event.progressLabel
+    || Number(event.progressBytes) > 0
+    || event.progressIndeterminate,
+  );
+  const isDownloadTask = Boolean(event.isDownloadTask || existing?.isDownloadTask || hasProgressFields);
+  const executionCode = resolveExecutionCode(event) || existing?.code || "";
+  const rawHighlights = Array.isArray(event.highlights)
+    ? event.highlights.filter(Boolean)
+    : String(event.snippet || "")
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean);
+  const highlights = filterExecutionHighlights(rawHighlights, { isDownloadTask });
+
+  const artifact = {
+    type: "execution",
+    id: executionId,
+    title,
+    description: event.description || event.summary || existing?.description || "",
+    code: executionCode,
+    stage: stageText,
+    highlights: highlights.slice(-4),
+    startedAt,
+    elapsedSec: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)),
+    elapsedLabel: elapsed,
+    hint: isDownloadTask
+      ? "下载进度实时更新；点击「停止」可中断内核。"
+      : "代码已启动，进度将实时刷新；点击「停止」可中断内核。",
+    done: false,
+    stopped: false,
+    isDownloadTask,
+  };
+
+  if (isDownloadTask) {
+    const pick = (key) => (event[key] != null ? event[key] : existing?.[key]);
+    Object.assign(artifact, {
+      progressOverallPct: pick("progressOverallPct"),
+      progressFilePct: pick("progressFilePct"),
+      progressRun: pick("progressRun"),
+      progressFileIndex: pick("progressFileIndex"),
+      progressFileTotal: pick("progressFileTotal"),
+      progressBytes: pick("progressBytes"),
+      progressBytesTotal: pick("progressBytesTotal"),
+      progressLabel: pick("progressLabel"),
+      progressIndeterminate: event.progressIndeterminate != null
+        ? event.progressIndeterminate
+        : existing?.progressIndeterminate,
+    });
+    // 事件缺字段时 pick 会残留旧整体%；用当前字节纠偏，避免 21MB/218MB 却显示 100%
+    const b = Number(artifact.progressBytes);
+    const bt = Number(artifact.progressBytesTotal);
+    const fi = Number(artifact.progressFileIndex);
+    const ft = Number(artifact.progressFileTotal);
+    if (Number.isFinite(b) && Number.isFinite(bt) && bt > 0) {
+      const fp = Math.max(0, Math.min(100, (b / bt) * 100));
+      artifact.progressFilePct = fp;
+      if (Number.isFinite(fi) && Number.isFinite(ft) && ft > 0) {
+        const weighted = ((fi - 1) + fp / 100) / ft * 100;
+        const reported = Number(artifact.progressOverallPct);
+        if (!Number.isFinite(reported) || (reported >= 99.5 && fp < 95) || Math.abs(reported - weighted) > 8) {
+          artifact.progressOverallPct = Math.round(weighted * 10) / 10;
+          artifact.progressLabel = `${artifact.progressRun || "FASTQ"} · 本文件 ${fp.toFixed(1)}% · 整体 ${artifact.progressOverallPct.toFixed(1)}% (${fi}/${ft})`;
+        }
+      }
+    }
+  }
+  return artifact;
+}
+
+/** 非当前可见会话：只落盘进度到该 chat 的 codePanel，不改当前 DOM */
+function recordBackgroundCodeProgress(streamChatId, event) {
+  const stream = chatStreams.get(streamChatId);
+  if (!stream || !streamChatId) return;
+  const chat = ensureChatRecord(streamChatId);
+  if (!Array.isArray(chat.codePanel)) chat.codePanel = [];
+
+  if (event.type === "code_execution_started") {
+    chat.codePanel = chat.codePanel.map((item) => {
+      if (item.type === "execution" && !item.done && !item.stopped && item.id !== BACKGROUND_EXECUTION_ID) {
+        return stripDownloadProgressFields({
+          ...item,
+          done: true,
+          stopped: true,
+          title: "代码已停止",
+          stage: "已终止",
+          hint: "",
+        });
+      }
+      return item;
+    });
+    stream.codeExecutionId = executionIdForEvent(event) || createId();
+  }
+
+  const executionId = stream.codeExecutionId;
+  if (!executionId) return;
+
+  const existing = chat.codePanel.find(
+    (item) => item.type === "execution" && item.id === executionId,
+  );
+  if (existing?.done || existing?.stopped) return;
+
+  const artifact = buildCodeProgressArtifact(event, existing, executionId);
+  recordCodeArtifactForChat(streamChatId, artifact);
+}
+
+function finishBackgroundCodeProgress(streamChatId, event = {}) {
+  const stream = chatStreams.get(streamChatId);
+  const executionId = executionIdForEvent(event) || stream?.codeExecutionId;
+  if (!streamChatId || !executionId) return;
+  const chat = ensureChatRecord(streamChatId);
+  const existing = chat?.codePanel?.find(
+    (item) => item.type === "execution" && item.id === executionId,
+  );
+  recordCodeArtifactForChat(
+    streamChatId,
+    stripDownloadProgressFields({
+      type: "execution",
+      id: executionId,
+      title: "代码运行完成",
+      description: existing?.description || "",
+      code: existing?.code || "",
+      stage: "已完成",
+      done: true,
+      stopped: false,
+      hint: "",
+    }),
+  );
+  if (stream.codeExecutionId === executionId) stream.codeExecutionId = null;
+}
+
+function appendThinkingStepToEntry(assistantEntry, step) {
+  if (!assistantEntry) return;
+  if (!Array.isArray(assistantEntry.thinkingSteps)) assistantEntry.thinkingSteps = [];
+  const nextStep = {
+    id: step.id || "",
+    kind: step.kind || "tool",
+    title: step.title || "",
+    body: step.body || "",
+    data: step.data && typeof step.data === "object" ? step.data : null,
+    roundId: stableThinkingRoundId(step),
+  };
+  const nextFingerprint = thinkingStepFingerprint(nextStep);
+  let index = nextStep.id
+    ? assistantEntry.thinkingSteps.findIndex((item) => String(item?.id || "") === nextStep.id)
+    : -1;
+  if (index < 0 && nextStep.kind === "plan") {
+    index = assistantEntry.thinkingSteps.findIndex((item) => String(item?.kind || "") === "plan");
+  }
+  if (index < 0) {
+    index = assistantEntry.thinkingSteps.findIndex((item) => (
+      !String(item?.id || "").trim()
+      && thinkingStepFingerprint(item) === nextFingerprint
+    ));
+  }
+  if (index >= 0) {
+    assistantEntry.thinkingSteps[index] = nextStep;
+  } else {
+    assistantEntry.thinkingSteps.push(nextStep);
+  }
+  assistantEntry.thinkingRoundCount = countUniqueThinkingSteps(assistantEntry.thinkingSteps);
+}
+
+function handleAgentStreamEventBackground(streamChatId, streamMessages, assistantEntry, event) {
+  if (!event?.type || !assistantEntry) return;
+
+  if (event.type === "status" && event.message) {
+    return;
+  }
+  if (
+    event.type === "plan_created"
+    || event.type === "plan_revised"
+    || event.type === "plan_step_start"
+    || event.type === "plan_step_done"
+    || event.type === "plan_step_failed"
+    || event.type === "plan_approval_required"
+    || event.type === "plan_complete"
+    || event.type === "plan_incomplete"
+    || event.type === "plan_failed"
+  ) {
+    const msg = event.message || "";
+    const isFinalPlanEvent = event.type === "plan_complete" || event.type === "plan_incomplete" || event.type === "plan_failed";
+    const isApprovalEvent = event.type === "plan_approval_required";
+    if (msg && (isFinalPlanEvent || isApprovalEvent)) {
+      if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
+        freezeAssistantFinalText(assistantEntry, msg);
+      } else {
+        assistantEntry.content = msg;
+      }
+    }
+    if (event.plan?.steps?.length) {
+      const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
+      const planData = buildThinkingPlanData(event.plan, event.type, msg);
+      rememberLivePlan({ goal: event.plan.goal || planTitle, steps: event.plan.steps });
+      appendThinkingStepToEntry(assistantEntry, {
+        id: "current-plan",
+        kind: "plan",
+        title: planTitle,
+        data: planData,
+        body: event.plan.steps
+          .map((s) => {
+            const mark =
+              s.status === "done" ? "✓" : s.status === "running" ? "▶" : s.status === "failed" ? "✗" : "○";
+            return `${mark} ${s.title || s.goal || s.id}`;
+          })
+          .join("\n"),
+      });
+      if (streamChatId === activeChatId) {
+        renderTodosBoard(getActivePlanSnapshot());
+      }
+    }
+    return;
+  }
+  if (event.type === "code_execution_started" || event.type === "code_execution_progress") {
+    recordBackgroundCodeProgress(streamChatId, event);
+    appendThinkingStepToEntry(assistantEntry, {
+      id: executionThinkingStepId(event, "tool"),
+      kind: "tool",
+      title: event.summary || "代码执行中",
+      body: event.stage || "运行中",
+      roundId: eventThinkingRoundId(event),
+    });
+    return;
+  }
+  if (event.type === "done" && event.text) {
+    finishRunningExecutionsCompleted(streamChatId);
+    freezeAssistantFinalText(assistantEntry, stripExecutionMemoryBlock(event.text));
+    return;
+  }
+  if (event.type === "final" && event.content) {
+    freezeAssistantFinalText(assistantEntry, stripExecutionMemoryBlock(event.content));
+    return;
+  }
+  if (event.type === "thinking" && String(event.content || "").trim()) return;
+  if (event.type === "tool_call" && event.name !== "finish") {
+    appendExecutionLog(
+      { tool: event.name, title: event.summary || event.name, summary: "" },
+      assistantEntry,
+      { chatId: streamChatId, messages: streamMessages },
+    );
+    appendThinkingStepToEntry(assistantEntry, {
+      id: event.name === "execute_code"
+        ? executionThinkingStepId(event, "tool")
+        : streamThinkingStepId(event, "tool"),
+      kind: "tool",
+      title: event.summary || event.name,
+      roundId: eventThinkingRoundId(event),
+    });
+    return;
+  }
+  if (event.type === "tool_result") {
+    const executionSummary = event.name === "execute_code"
+      ? "已执行代码；详细 stdout/stderr 请查看代码卡片或产物文件"
+      : (event.content || "");
+    appendExecutionLog(
+      { tool: event.name, title: event.summary || event.name, summary: executionSummary },
+      assistantEntry,
+      { chatId: streamChatId, messages: streamMessages },
+    );
+    if (event.name === "execute_code") {
+      appendThinkingStepToEntry(assistantEntry, {
+        id: executionThinkingStepId(event, "result"),
+        kind: "result",
+        title: `${event.summary || "代码"}：完成`,
+        roundId: eventThinkingRoundId(event),
+      });
+      finishBackgroundCodeProgress(streamChatId, event);
+      if (streamChatId === activeChatId) {
+        window.KernelPanel?.refresh?.({ force: true });
+      }
+    } else if (event.name === "manage_visualization" && streamChatId === activeChatId) {
+      window.KernelPanel?.refresh?.({ force: true });
+    }
+  }
+}
+
+function handleAgentStreamEvent(group, event) {
+  if (!group || !event?.type) return;
+
+  if (event.type === "status" && event.message) {
+    setLiveStatus(group, event.message);
+    scrollThreadToBottom();
+    return;
+  }
+
+  if (event.type === "heartbeat") {
+    const msg = event.message || "任务运行中…";
+    // Heartbeats are transport telemetry, never assistant content.
+    const entry = getLastAssistantEntry();
+    if (!entry?._finalReplyLocked) setLiveStatus(group, msg);
+    if (event.kernelBusy && !activeCodeExecutionId && !entry?._finalReplyLocked) {
+      ensureBackgroundExecutionCard(
+        {
+          ok: true,
+          hasActiveRun: Boolean(event.hasActiveRun),
+          kernelBusy: true,
+          planSummary: msg,
+        },
+        { showStop: isActiveChatSending() },
+      );
+    } else if (entry?._finalReplyLocked && !event.kernelBusy && !activeCodeExecutionId) {
+      removeBackgroundExecutionCard();
+    }
+    scrollThreadToBottom();
+    return;
+  }
+
+  if (
+    event.type === "plan_created" ||
+    event.type === "plan_revised" ||
+    event.type === "plan_step_start" ||
+    event.type === "plan_step_done" ||
+    event.type === "plan_step_failed" ||
+    event.type === "plan_approval_required" ||
+    event.type === "plan_complete" ||
+    event.type === "plan_incomplete" ||
+    event.type === "plan_failed"
+  ) {
+    const entry = getLastAssistantEntry();
+    const msg = event.message || "";
+    const isFinalPlanEvent = event.type === "plan_complete" || event.type === "plan_incomplete" || event.type === "plan_failed";
+    const isApprovalEvent = event.type === "plan_approval_required";
+    if (entry && msg && (isFinalPlanEvent || isApprovalEvent)) {
+      if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
+        freezeAssistantFinalText(entry, msg);
+      } else {
+        entry.content = msg;
+      }
+    }
+    const textEl = group.querySelector(".chat-text");
+    if (textEl && msg && (isFinalPlanEvent || isApprovalEvent)) {
+      clearLiveStatus(group);
+      if (isFinalPlanEvent && !looksLikeStatusBanner(msg)) {
+        textEl.classList.remove("chat-text--loading");
+        renderChatText(textEl, msg, "assistant");
+      } else {
+        textEl.classList.remove("chat-text--loading");
+        renderChatText(textEl, msg, "assistant");
+      }
+    }
+    if (isApprovalEvent && msg) persistActiveChat();
+    if (event.plan?.steps?.length) {
+      const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
+      const planData = buildThinkingPlanData(event.plan, event.type, msg);
+      appendThinkingStep(group, {
+        id: "current-plan",
+        kind: "plan",
+        title: planTitle,
+        data: planData,
+        body: event.plan.steps
+          .map((s) => {
+            const mark =
+              s.status === "done" ? "✓" : s.status === "running" ? "▶" : s.status === "failed" ? "✗" : "○";
+            return `${mark} ${s.title || s.goal || s.id}`;
+          })
+          .join("\n"),
+      });
+    } else if (msg) {
+      appendThinkingStep(group, {
+        id: streamThinkingStepId(event, "plan"),
+        kind: "plan",
+        title: "计划",
+        body: msg,
+      });
+    }
+    scrollThreadToBottom();
+    return;
+  }
+
+  if (event.type === "done" && event.text) {
+    finishRunningExecutionsCompleted();
+    const entry = getLastAssistantEntry();
+    const text = stripExecutionMemoryBlock(event.text);
+    if (entry) freezeAssistantFinalText(entry, text);
+    updateMessageGroup(group, text);
+    persistActiveChat();
+    return;
+  }
+
+  if (event.type === "final" && event.content) {
+    const entry = getLastAssistantEntry();
+    const text = stripExecutionMemoryBlock(event.content);
+    if (entry) freezeAssistantFinalText(entry, text);
+    updateMessageGroup(group, text);
+    persistActiveChat();
+    return;
+  }
+
+  if (event.type === "thinking" && String(event.content || "").trim()) return;
+
+  if (event.type === "tool_call" && event.name !== "finish") {
+    appendExecutionLog({
+      tool: event.name,
+      title: event.summary || event.name,
+      summary: "",
+    });
+    appendThinkingStep(group, {
+      id: event.name === "execute_code"
+        ? executionThinkingStepId(event, "tool")
+        : streamThinkingStepId(event, "tool"),
+      kind: "tool",
+      title: event.summary || event.name,
+      roundId: eventThinkingRoundId(event),
+    });
+    return;
+  }
+
+  if (event.type === "code_execution_started" || event.type === "code_execution_progress") {
+    updateCodeExecutionProgress(group, event);
+    appendThinkingStep(group, {
+      id: executionThinkingStepId(event, "tool"),
+      kind: "tool",
+      title: event.summary || "代码执行中",
+      body: event.stage || "运行中",
+      roundId: eventThinkingRoundId(event),
+    });
+    return;
+  }
+
+  if (event.type === "tool_result") {
+    const executionSummary = event.name === "execute_code"
+      ? "已执行代码；详细 stdout/stderr 请查看代码卡片或产物文件"
+      : (event.content || "");
+    appendExecutionLog({
+      tool: event.name,
+      title: event.summary || event.name,
+      summary: executionSummary,
+    });
+    if (event.name === "execute_code") {
+      finishCodeExecutionProgress(group, event);
+      appendThinkingStep(group, {
+        id: executionThinkingStepId(event, "result"),
+        kind: "result",
+        title: `${event.summary || "代码"}：完成`,
+        roundId: eventThinkingRoundId(event),
+      });
+      window.KernelPanel?.refresh?.({ force: true });
+    } else if (event.name === "manage_visualization") {
+      window.KernelPanel?.refresh?.({ force: true });
+    }
+    return;
+  }
+}
+
+function setComposerMode(mode) {
+  if (!sendBtn) return;
+  sendBtn.dataset.mode = mode;
+  const isStop = mode === "stop";
+  sendBtn.setAttribute("aria-label", isStop ? "停止" : "发送");
+  sendBtn.classList.toggle("chat-send-btn--stop", isStop);
+  sendBtn.type = isStop ? "button" : "submit";
+}
+
+function resetComposerControls() {
+  syncComposerForActiveChat();
+  if (!isActiveChatSending()) {
+    window.KernelPanel?.stopPolling?.();
+    window.KernelPanel?.refresh?.();
+  }
+}
+
+function releaseComposerAfterStream(chatId) {
+  // A terminal server event is authoritative. Do not leave a stale live
+  // follower/background watch keeping the composer in stop mode.
+  stopBackgroundRunWatch(chatId);
+  const follow = liveFollows.get(chatId);
+  if (follow) {
+    liveFollows.delete(chatId);
+    follow.abortController?.abort();
+  }
+  finishChatStream(chatId);
+}
+
+function isStreamGenerationLive(chatId, generation) {
+  const stream = chatStreams.get(chatId);
+  return Boolean(stream && stream.generation === generation);
+}
+
+async function handleStop() {
+  if (!isActiveChatSending()) return;
+  const stream = chatStreams.get(activeChatId);
+  const follow = liveFollows.get(activeChatId);
+  const runId = stream?.runId || follow?.runId || "";
+
+  if (stream && !stream.isFollower) {
+    stream.generation = -1;
+    stream.abortController?.abort();
+  }
+  if (follow) {
+    // 先取消后端任务，再断开旁观流
+  }
+  // 立即清除队列，避免取消请求等待期间任务恰好结束而自动发送一条追加消息。
+  clearPendingSends(activeChatId);
+  markRunningExecutionsStopped();
+  stopBackgroundRunWatch(activeChatId);
+  if (window.cancelAgentRun) {
+    await window.cancelAgentRun(runId || null, activeChatId);
+  }
+  detachLiveEventStream(activeChatId);
+  if (stream?.isFollower) {
+    chatStreams.delete(activeChatId);
+  }
+  syncComposerForActiveChat();
+}
+
+function updateMessageGroup(group, text) {
+  if (!group) return;
+  const textEl = group.querySelector(".chat-text");
+  if (!textEl) return;
+  clearLiveStatus(group);
+  textEl.classList.remove("chat-text--loading");
+  renderChatText(textEl, text, group.classList.contains("assistant") ? "assistant" : "user");
+
+  const thinkingEl = group.querySelector(".chat-thinking");
+  if (thinkingEl && !thinkingEl.querySelector(".chat-thinking__step")) {
+    thinkingEl.remove();
+  } else if (thinkingEl) {
+    thinkingEl.open = false;
+  }
+  scrollThreadToBottom();
+}
+
+function resetComposer() {
+  if (!composer) return;
+  composer.value = "";
+  composer.style.height = "auto";
+}
+
+function queuedSendNoticeText(position, total) {
+  return `⏳ 当前任务运行中，消息已加入队列（第 ${position} 条，共 ${total} 条）。当前任务结束后自动发送。`;
+}
+
+function removeQueuedSendNotice(item) {
+  if (item?.notice?.isConnected) item.notice.remove();
+  if (item) item.notice = null;
+}
+
+function updateQueuedSendNotices(chatId) {
+  const queue = pendingSends.get(chatId) || [];
+  queue.forEach((item, index) => {
+    const label = item.notice?.querySelector(".queued-send-notice__text");
+    if (label) label.textContent = queuedSendNoticeText(index + 1, queue.length);
+  });
+  if (chatId === activeChatId) scrollThreadToBottom();
+}
+
+function appendQueuedSendNotice(chatId, item) {
+  const group = appendMessage("assistant", "");
+  if (!group) return;
+
+  group.classList.add("chat-group--queued-send");
+  group.dataset.queuedSendId = item.id;
+  const textEl = group.querySelector(".chat-text");
+  if (!textEl) return;
+
+  const row = document.createElement("div");
+  row.className = "queued-send-notice";
+  const label = document.createElement("span");
+  label.className = "queued-send-notice__text";
+  row.appendChild(label);
+
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "queued-send-notice__cancel";
+  cancel.textContent = "撤回";
+  cancel.title = "撤回这条已排队的消息";
+  cancel.setAttribute("aria-label", "撤回这条已排队的消息");
+  cancel.addEventListener("click", () => withdrawPendingSend(chatId, item.id));
+  row.appendChild(cancel);
+
+  textEl.replaceChildren(row);
+  item.notice = group;
+}
+
+function renderQueuedSendNotices(chatId) {
+  const queue = pendingSends.get(chatId) || [];
+  queue.forEach((item) => appendQueuedSendNotice(chatId, item));
+  updateQueuedSendNotices(chatId);
+}
+
+function withdrawPendingSend(chatId, itemId) {
+  const queue = pendingSends.get(chatId);
+  if (!queue) return;
+  const index = queue.findIndex((item) => item.id === itemId);
+  if (index < 0) return;
+
+  const [item] = queue.splice(index, 1);
+  removeQueuedSendNotice(item);
+  if (queue.length === 0) pendingSends.delete(chatId);
+  else updateQueuedSendNotices(chatId);
+}
+
+function clearPendingSends(chatId) {
+  const queue = pendingSends.get(chatId) || [];
+  queue.forEach(removeQueuedSendNotice);
+  pendingSends.delete(chatId);
+}
+
+async function handleSend() {
+  if (!composer) return;
+  if (isActiveChatSending()) {
+    // 主任务运行中：不打断，把消息加入队列，当前任务结束后自动发送
+    const queued = composer.value.trim();
+    if (!queued) return;
+    const q = pendingSends.get(activeChatId) || [];
+    const item = { id: createId(), text: queued, notice: null };
+    q.push(item);
+    pendingSends.set(activeChatId, q);
+    resetComposer();
+    appendQueuedSendNotice(activeChatId, item);
+    updateQueuedSendNotices(activeChatId);
+    persistChatMessages(activeChatId, chatHistory);
+    return;
+  }
+
+  const value = composer.value.trim();
+  if (!value) return;
+
+  const llm = window.getLlmConfig?.();
+  const account = llm?.account;
+  const vendor = llm?.vendor;
+  const agent = llm?.config?.agent;
+
+  if (account?.authMode === "api_key" && !account?.apiKey) {
+    appendMessage(
+      "assistant",
+      "请先在 Config 页面配置 API Key 并点击「保存配置」，然后再试。\n\n提示：从 localhost 换成服务器 IP 访问时，浏览器配置不共享，需要重新填写并保存。",
+    );
+    return;
+  }
+
+  const serverOk = await window.probeProxyServer?.(true);
+  if (!serverOk) {
+    appendMessage(
+      "assistant",
+      `无法连接 UI 后端（${window.llmProxyBase || "serve.py"}）。\n\n请确认：\n1. 服务器已运行：cd ui && python3 serve.py\n2. 浏览器地址为 http://<服务器IP>:8765/index.html\n3. 防火墙已放行 8765 端口\n4. 硬刷新页面（Ctrl+Shift+R）加载最新脚本`,
+    );
+    return;
+  }
+
+  const streamChatId = activeChatId;
+  const streamMessages = chatHistory;
+  let pending = null;
+  let streamGeneration = 0;
+  let runId = null;
+  let abortController = null;
+  let answered = false;
+  let historyRecorded = false;
+  let assistantEntry = null;
+  let streamComposerReleased = false;
+  let reply = "";
+
+  const touchStreamActivity = () => {
+    const stream = chatStreams.get(streamChatId);
+    if (stream) stream.lastStreamEventAt = Date.now();
+  };
+
+  const clearStreamIdleTimer = () => {
+    const stream = chatStreams.get(streamChatId);
+    if (stream?.idleTimer) {
+      window.clearInterval(stream.idleTimer);
+      stream.idleTimer = null;
+    }
+  };
+
+  const startStreamIdleTimer = () => {
+    clearStreamIdleTimer();
+    const stream = chatStreams.get(streamChatId);
+    if (!stream) return;
+    stream.idleTimer = window.setInterval(() => {
+      void (async () => {
+        const current = chatStreams.get(streamChatId);
+        if (!current || Date.now() - current.lastStreamEventAt < STREAM_IDLE_MS) return;
+        const status = await fetchRunStatus(streamChatId);
+        if (isTaskLikelyActive(status, streamChatId)) {
+          current.lastStreamEventAt = Date.now();
+          return;
+        }
+        current.abortController?.abort();
+        window.cancelAgentRun?.(current.runId, streamChatId);
+      })();
+    }, 5000);
+  };
+
+  const clearStreamStatusPoll = () => {
+    const stream = chatStreams.get(streamChatId);
+    if (stream?.statusPollTimer) {
+      window.clearInterval(stream.statusPollTimer);
+      stream.statusPollTimer = null;
+    }
+  };
+
+  const startStreamStatusPoll = () => {
+    clearStreamStatusPoll();
+    const stream = chatStreams.get(streamChatId);
+    if (!stream) return;
+    stream.statusPollTimer = window.setInterval(() => {
+      if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
+      void (async () => {
+        const status = await fetchRunStatus(streamChatId);
+        if (isTaskLikelyActive(status, streamChatId)) {
+          if (status.codeActive === false && !status.kernelBusy && status.codePanelRunning) {
+            // The agent may be planning or waiting on the LLM, but no code is
+            // executing. Do not keep an old code card counting elapsed time.
+            markRunningExecutionsStopped();
+          }
+          syncRunStatusToUI(streamChatId, status || { ok: true, codePanelRunning: true }, {
+            pending,
+            assistantEntry,
+            messages: streamMessages,
+          });
+          return;
+        }
+        // `cleanup_run` can clear the backend active-run flag a few
+        // milliseconds before the direct SSE reader receives its terminal
+        // `done` frame. Keep the current card intact until that stream settles.
+        const direct = chatStreams.get(streamChatId);
+        if (direct && !direct.isFollower && direct.generation === streamGeneration) return;
+        const offlinePlan = planSnapshotFromThinking(assistantEntry);
+        reconcileStaleTaskUi(streamChatId, status || {
+          ok: true,
+          plan: offlinePlan,
+          planSummary: "服务连接已断开，运行状态无法确认",
+          stalePlanStep: Boolean(offlinePlan?.steps?.some((step) => step?.status === "running")),
+          staleCodePanel: true,
+        }, {
+          pending,
+          assistantEntry,
+          forceMessage: true,
+        });
+      })();
+    }, STREAM_STATUS_POLL_MS);
+  };
+
+  try {
+    stopBackgroundRunWatch(streamChatId);
+    // New turn: drop leftover To-dos from a previous settled plan.json.
+    clearLivePlan();
+    abandonStaleAssistantPlaceholders(streamMessages);
+    persistChatMessages(streamChatId, streamMessages);
+    appendMessage("user", value);
+    streamMessages.push({ role: "user", content: value });
+    assistantEntry = { role: "assistant", content: "", thinkingSteps: [], thinkingRoundCount: 0 };
+    streamMessages.push(assistantEntry);
+    ensureActiveChatRecord();
+    persistChatMessages(streamChatId, streamMessages);
+    resetComposer();
+
+    pending = appendMessage("assistant", "思考中…", { loading: true });
+
+    streamGeneration = ++nextStreamGeneration;
+    runId = createId();
+    abortController = new AbortController();
+    activeCodeExecutionId = null;
+
+    chatStreams.set(streamChatId, {
+      generation: streamGeneration,
+      runId,
+      abortController,
+      messages: streamMessages,
+      assistantEntry,
+      pending,
+      idleTimer: null,
+      statusPollTimer: null,
+      lastStreamEventAt: Date.now(),
+      codeExecutionId: null,
+    });
+
+    syncComposerForActiveChat();
+    window.KernelPanel?.stopPolling?.();
+    touchStreamActivity();
+    startStreamIdleTimer();
+    startStreamStatusPoll();
+
+    const fullConfig = window.loadLlmConfig?.() || llm?.config;
+    const streamResult = await window.agentChatStream({
+      account,
+      vendor,
+      agent: fullConfig?.agent || agent,
+      messages: messagesForAgentApi(),
+      executionContext: buildExecutionContextForApi(),
+      runId,
+      chatId: streamChatId,
+      deviceId: getOrCreateDeviceId(),
+      autoApproveCode: approvalMode === "auto",
+      approvalMode,
+      signal: abortController.signal,
+      onEvent: (event) => {
+        if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
+        touchStreamActivity();
+        // Direct streams and reload-follow streams share the same server
+        // sequence. Keep a browser-local checkpoint immediately so a reload
+        // never replays already-rendered Thinking events as new rounds.
+        recordLiveEventCheckpoint(streamChatId, assistantEntry, event);
+        const isVisible = streamChatId === activeChatId;
+        if (event.type === "run_start") {
+          if (isVisible) {
+            const target = resolvePendingGroup(pending);
+            setLiveStatus(target, "已连接，等待 Agent 响应…");
+          }
+          return;
+        }
+        if (event.type === "heartbeat") {
+          touchStreamActivity();
+          if (isVisible) {
+            handleAgentStreamEvent(resolvePendingGroup(pending), event);
+          }
+          return;
+        }
+        if (isVisible) {
+          const target = resolvePendingGroup(pending);
+          if (event.type === "code_approval_required") {
+            showCodeApproval(target, event, {
+              runId,
+              autoApprove: approvalMode === "auto",
+            });
+            return;
+          }
+          if (event.type === "supervisor_approval") {
+            const reason = event.reason || event.action || "监管者已评估";
+            appendThinkingStep(target, {
+              id: streamThinkingStepId(event, "supervisor"),
+              kind: "result",
+              title: `监管者审批：${event.action || "?"}`,
+              body: `${event.level || ""} · ${reason}`,
+            });
+            if (event.action === "allow" || event.action === "deny") {
+              // No UI card needed when supervisor resolves fully.
+            }
+            return;
+          }
+          if (event.type === "run_report_ready") {
+            const taskHint = event.taskLabel ? `${event.taskLabel}：` : "";
+            appendThinkingStep(target, {
+              id: streamThinkingStepId(event, "report"),
+              kind: "result",
+              title: "运行报告已追加",
+              body: `${taskHint}${event.reportSummary || "可在左侧 Report 页查看"}`,
+            });
+            void refreshReportPage();
+            return;
+          }
+          handleAgentStreamEvent(target, event);
+        } else {
+          handleAgentStreamEventBackground(streamChatId, streamMessages, assistantEntry, event);
+          persistChatMessages(streamChatId, streamMessages);
+        }
+        if (event.type === "final" && event.content) {
+          answered = true;
+          if (!historyRecorded) {
+            if (assistantEntry) {
+              freezeAssistantFinalText(
+                assistantEntry,
+                stripExecutionMemoryBlock(event.content),
+              );
+            }
+            historyRecorded = true;
+            persistChatMessages(streamChatId, streamMessages);
+          }
+        }
+        if (event.type === "done") {
+          answered = true;
+          if (event.text && assistantEntry) {
+            freezeAssistantFinalText(
+              assistantEntry,
+              stripExecutionMemoryBlock(event.text),
+            );
+            historyRecorded = true;
+            if (isVisible) {
+              updateMessageGroup(
+                resolvePendingGroup(pending),
+                stripExecutionMemoryBlock(event.text),
+              );
+            }
+            persistChatMessages(streamChatId, streamMessages);
+          }
+        }
+        if (event.type === "final" || event.type === "done") {
+          // The reply is complete even if the SSE transport has not closed
+          // yet. Release the stop button immediately; the generation guard in
+          // `finally` prevents this retiring stream from touching a new turn.
+          if (!streamComposerReleased) {
+            streamComposerReleased = true;
+            releaseComposerAfterStream(streamChatId);
+          }
+          // Drop synthetic CODE "Agent 运行中" as soon as the reply lands —
+          // do not wait for SSE close / cleanup_run (can lag several seconds).
+          if (streamChatId === activeChatId && !activeCodeExecutionId) {
+            removeBackgroundExecutionCard();
+          }
+        }
+        if (event.type === "cancelled" || event.type === "error") {
+          if (event.type === "error" && assistantEntry) {
+            const message = `调用失败：${event.message || "Agent 执行失败"}`;
+            assistantEntry.content = message;
+            if (isVisible) {
+              const target = resolvePendingGroup(pending);
+              updateMessageGroup(target, message);
+              ensureThinkingPanel(target);
+              appendThinkingStep(target, {
+                id: streamThinkingStepId(event, "error"),
+                kind: "result",
+                title: "错误",
+                body: message,
+              });
+            } else {
+              appendThinkingStepToEntry(assistantEntry, {
+                id: streamThinkingStepId(event, "error"),
+                kind: "result",
+                title: "错误",
+                body: message,
+              });
+            }
+            persistChatMessages(streamChatId, streamMessages);
+            answered = true;
+          }
+          if (event.type === "cancelled" && assistantEntry) {
+            markAssistantStopped(assistantEntry);
+            if (isVisible) {
+              updateMessageGroup(resolvePendingGroup(pending), "（已停止生成）");
+            }
+            persistChatMessages(streamChatId, streamMessages);
+            answered = true;
+          }
+          if (!streamComposerReleased) {
+            streamComposerReleased = true;
+            releaseComposerAfterStream(streamChatId);
+          }
+        }
+      },
+    });
+    reply = streamResult?.text || "";
+    if (streamResult?.incomplete) {
+      // The backend saves a completed reply independently of the browser
+      // stream. Recover it immediately when the terminal SSE frame is lost,
+      // rather than making the user refresh the page.
+      const recovered = await recoverPersistedFinalReply(streamChatId);
+      if (recovered) reply = recovered;
+      if (reply) finishRunningExecutionsCompleted(streamChatId);
+    }
+    const meta = streamResult?.meta;
+    if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
+    if (!historyRecorded) {
+      const finalText = resolveFinalAssistantText({
+        current: assistantEntry?.content,
+        reply,
+      });
+      if (assistantEntry && finalText) freezeAssistantFinalText(assistantEntry, finalText);
+      else if (!assistantEntry) {
+        streamMessages.push({ role: "assistant", content: finalText || "", thinkingSteps: [], thinkingRoundCount: 0 });
+      }
+      if (streamChatId === activeChatId) {
+        const displayText = finalText || "（无回复内容）";
+        updateMessageGroup(resolvePendingGroup(pending), displayText);
+      }
+    } else if (streamChatId === activeChatId) {
+      const displayText = resolveFinalAssistantText({
+        current: assistantEntry?.content,
+        reply,
+      });
+      if (assistantEntry && displayText) freezeAssistantFinalText(assistantEntry, displayText);
+      updateMessageGroup(resolvePendingGroup(pending), displayText || assistantEntry?.content || "");
+    }
+    if (meta) {
+      updateAgentBackendStatus(meta);
+    }
+    persistChatMessages(streamChatId, streamMessages);
+  } catch (error) {
+    const isAbort = error instanceof DOMException && error.name === "AbortError";
+    const isCancelled = error instanceof Error && error.name === "AgentCancelledError";
+    const superseded = !isStreamGenerationLive(streamChatId, streamGeneration);
+    if (superseded) {
+      if (!answered && (isAbort || isCancelled) && assistantEntry) {
+        if (isPlaceholderAssistantContent(assistantEntry.content)) {
+          markAssistantStopped(assistantEntry);
+          if (streamChatId === activeChatId) {
+            updateMessageGroup(resolvePendingGroup(pending), "（已停止生成）");
+          }
+          persistChatMessages(streamChatId, streamMessages);
+        }
+      }
+      return;
+    }
+    if (answered) return;
+    if (isAbort || isCancelled) {
+      if (assistantEntry) markAssistantStopped(assistantEntry);
+      if (streamChatId === activeChatId) {
+        updateMessageGroup(resolvePendingGroup(pending), "（已停止生成）");
+      }
+      persistChatMessages(streamChatId, streamMessages);
+      return;
+    }
+    const message = `调用失败：${error instanceof Error ? error.message : String(error)}`;
+    if (streamChatId === activeChatId) {
+      const target = resolvePendingGroup(pending);
+      updateMessageGroup(target, message);
+      ensureThinkingPanel(target);
+      appendThinkingStep(target, { kind: "result", title: "错误", body: message });
+    } else if (assistantEntry) {
+      appendThinkingStepToEntry(assistantEntry, { kind: "result", title: "错误", body: message });
+    }
+    if (assistantEntry) assistantEntry.content = message;
+    persistChatMessages(streamChatId, streamMessages);
+  } finally {
+    // A terminal event may already have released this composer, and the user
+    // may have started the next turn. Never let a retiring stream clear that
+    // newer turn's state.
+    if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
+    clearStreamIdleTimer();
+    clearStreamStatusPoll();
+    // Clear synthetic background CODE card BEFORE run-status stale detection,
+    // otherwise a leftover "Agent 运行中" card looks like an interrupted task
+    // and overwrites the real assistant reply (e.g. completed plan result).
+    if (streamChatId === activeChatId) {
+      removeBackgroundExecutionCard();
+    }
+    const status = await fetchRunStatus(streamChatId);
+    const resolved = resolveFinalAssistantText({
+      current: assistantEntry?.content,
+      reply,
+      status,
+    });
+    if (assistantEntry && resolved && !assistantEntry._finalReplyLocked) {
+      freezeAssistantFinalText(assistantEntry, resolved);
+      if (streamChatId === activeChatId) {
+        updateMessageGroup(resolvePendingGroup(pending), resolved);
+      }
+      persistChatMessages(streamChatId, streamMessages);
+    } else if (assistantEntry?._finalReplyLocked && streamChatId === activeChatId) {
+      // Heartbeats may have overwritten the visible bubble while the reply stayed locked.
+      updateMessageGroup(resolvePendingGroup(pending), assistantEntry.content);
+    }
+
+    if (isStaleTaskState(status)) {
+      reconcileStaleTaskUi(streamChatId, status, {
+        pending,
+        assistantEntry,
+        persist: true,
+        forceMessage: false,
+      });
+      finishChatStream(streamChatId);
+      return;
+    }
+
+    if (isPlanSettled(status) || status?.codePanelRunning || status?.staleCodePanel) {
+      cleanupDanglingTaskUi(streamChatId);
+    }
+
+    const codeReallyRunning = Boolean(status?.kernelBusy || status?.codeActive);
+    const stillRunning = isTaskLikelyActive(status, streamChatId)
+      && (codeReallyRunning || !assistantEntry?._finalReplyLocked);
+    if (stillRunning) {
+      // Keep watching kernel drain, but do not rewrite a locked final reply.
+      syncRunStatusToUI(streamChatId, status, {
+        pending,
+        assistantEntry,
+        messages: streamMessages,
+        persist: false,
+      });
+      startBackgroundRunWatch(streamChatId, { pending, assistantEntry });
+      finishChatStream(streamChatId, { keepBackgroundWatch: true });
+      return;
+    }
+
+    if (assistantEntry && looksLikeStatusBanner(assistantEntry.content)) {
+      const fallback = resolveFinalAssistantText({
+        current: assistantEntry.content,
+        status,
+      }) || "（流式连接已结束，未检测到后台任务）";
+      freezeAssistantFinalText(assistantEntry, fallback);
+      if (streamChatId === activeChatId) {
+        updateMessageGroup(resolvePendingGroup(pending), fallback);
+      }
+      persistChatMessages(streamChatId, streamMessages);
+    }
+    finishChatStream(streamChatId);
+    // 主任务结束后，自动发送排队中的消息（不打断语义）
+    void drainPendingSends(streamChatId);
+  }
+}
+
+/** 主任务结束后消费待发送队列，自动发送下一条消息（递归直至队列清空）。 */
+async function drainPendingSends(chatId) {
+  if (!chatId || chatId !== activeChatId) return;
+  const q = pendingSends.get(chatId);
+  if (!q || q.length === 0) return;
+  const next = q.shift();
+  if (q.length === 0) pendingSends.delete(chatId);
+  if (!next) return;
+  if (isActiveChatSending()) {
+    // 意外又进入发送状态（如其它设备触发），放回队列稍后再试
+    q.unshift(next);
+    pendingSends.set(chatId, q);
+    return;
+  }
+  removeQueuedSendNotice(next);
+  if (q.length > 0) updateQueuedSendNotices(chatId);
+  if (composer) composer.value = next.text;
+  await handleSend();
+}
+
+/**
+ * A direct SSE stream, background watcher, and live follower can finish in
+ * different orders. Defer queue consumption one tick so all terminal cleanup
+ * has removed its "running" marker before `handleSend` checks it.
+ */
+function schedulePendingSendDrain(chatId) {
+  if (!chatId || chatId !== activeChatId || !(pendingSends.get(chatId)?.length)) return;
+  window.setTimeout(() => {
+    if (!isActiveChatSending()) void drainPendingSends(chatId);
+  }, 0);
+}
+
+function escapeStatusHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildModelSwitchSelect() {
+  const providers = window.listLlmProviders?.() || [];
+  if (!providers.length) return "";
+  const modelCounts = providers.reduce((acc, p) => {
+    const key = p.model || p.name || p.id;
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const options = providers
+    .map((p) => {
+      const selected = p.isDefault ? " selected" : "";
+      const model = p.model || p.name || p.id;
+      const text = modelCounts[model] > 1 ? p.label || model : model;
+      return `<option value="${escapeStatusHtml(p.id)}"${selected}>${escapeStatusHtml(text)}</option>`;
+    })
+    .join("");
+  const disabled = providers.length < 2 ? " disabled" : "";
+  return `<select class="status-pill__model-select" aria-label="切换模型"${disabled}>${options}</select>`;
+}
+
+function updateComposerStatus() {
+  const statusPill = document.querySelector(".agent-chat__composer-footer .status-pill");
+  const llm = window.getLlmConfig?.();
+  const account = llm?.account;
+  if (!statusPill) return;
+
+  const port = window.location.port || (window.location.protocol === "https:" ? "443" : "80");
+  const host = window.location.hostname || "—";
+  const backendOk = window.__proxyServerReady === true;
+  const modelSelect = buildModelSwitchSelect();
+
+  if (!account) {
+    const statusText = `${backendOk ? "后端已连接" : "后端未连接"} · ${host}:${port}`;
+    statusPill.innerHTML = `
+      <span class="sidebar-status__dot" style="background:${backendOk ? "var(--ok)" : "var(--accent)"}"></span>
+      <a href="#" class="status-pill__link">${escapeStatusHtml(statusText)}</a>
+      ${modelSelect}
+    `;
+    return;
+  }
+
+  const hasKey = account.authMode === "local" || Boolean(account.apiKey);
+  const skillCount = window.__agentBackendSkills?.length || 0;
+  const statusParts = [
+    backendOk ? "已连接" : "未连接",
+    `${host}:${port}`,
+    "sRNAgent",
+    skillCount ? `${skillCount} skill(s)` : "",
+  ].filter(Boolean);
+  const warn = hasKey ? "" : `<span class="status-pill__warn">未配置 Key</span>`;
+  statusPill.innerHTML = `
+    <span class="sidebar-status__dot" style="background:${backendOk && hasKey ? "var(--ok)" : "var(--accent)"}"></span>
+    <a href="#" class="status-pill__link">${escapeStatusHtml(statusParts.join(" · "))}</a>
+    ${modelSelect}
+    ${warn}
+  `;
+}
+
+function updateAgentBackendStatus(meta) {
+  window.__agentBackendSkills = meta?.skills || [];
+  window.__agentExecution = meta?.execution || window.__agentExecution || {};
+  updateComposerStatus();
+}
+
+async function loadAgentBackendStatus() {
+  updateComposerStatus();
+  const ok = await window.probeProxyServer?.();
+  updateComposerStatus();
+  if (!ok || !window.fetchAgentStatus) return;
+  try {
+    const status = await window.fetchAgentStatus();
+    window.__agentBackendSkills = status.skills || [];
+    window.__agentExecution = status.execution || {};
+    updateComposerStatus();
+  } catch (_error) {
+    updateComposerStatus();
+  }
+}
+
+function setPage(page) {
+  currentPage = page;
+
+  document.querySelectorAll(".nav-item[data-page]").forEach((item) => {
+    item.classList.toggle("nav-item--active", item.dataset.page === page);
+  });
+
+  document.querySelectorAll(".page-view[data-view]").forEach((view) => {
+    view.classList.toggle("page-view--active", view.dataset.view === page);
+  });
+
+  const label = document.querySelector(`.nav-item[data-page="${page}"] .nav-item__text`)?.textContent?.trim() || page;
+  if (breadcrumbCurrent) breadcrumbCurrent.textContent = label;
+
+  const isAgent = page === "agent";
+  const isAnalysis = page === "analysis";
+  const isReport = page === "report";
+
+  if (agentSessions) agentSessions.hidden = !isAgent;
+
+  shell.classList.remove("shell--nav-drawer-open");
+
+  if (isAgent) scrollThreadToBottom();
+  if (isAgent) updateComposerStatus();
+  if (isReport) void refreshReportPage();
+  if (page === "overview") void window.OverviewLab?.ensure?.();
+}
+
+async function refreshReportPage() {
+  if (!reportPageBody) return;
+  const chat = getActiveChatRecord();
+  const title = chat?.title || "New Chat";
+  const chatLabel = activeChatId
+    ? `${title} · ${String(activeChatId).slice(0, 8)}…`
+    : "未选择会话";
+  if (reportPageMeta) reportPageMeta.textContent = chatLabel;
+  if (reportPageSubtitle) {
+    reportPageSubtitle.textContent = activeChatId
+      ? "绑定当前会话；每次任务结束后追加一份报告，清空后从下一次任务重新记录。"
+      : "当前会话的任务报告会持续追加；清空后从下一次任务重新开始记录。";
+  }
+  if (reportClearBtn) reportClearBtn.disabled = !activeChatId;
+  if (!activeChatId) {
+    reportPageBody.textContent = "请先在 Agent 页打开或新建一个对话。";
+    return;
+  }
+  reportPageBody.textContent = "加载中…";
+  try {
+    const data = await window.fetchRunReport?.(activeChatId);
+    if (!data?.ok) {
+      reportPageBody.textContent =
+        data?.error || "尚无运行报告。完成一次主任务后会自动追加到这里。";
+      return;
+    }
+    reportPageBody.textContent = data.markdown || JSON.stringify(data.report, null, 2);
+    const taskCount = Number(data.taskCount || data.report?.tasks?.length || 0);
+    if (reportPageMeta && data.report?.updatedAt) {
+      reportPageMeta.textContent = `${chatLabel} · ${taskCount} 份任务报告 · 更新于 ${data.report.updatedAt}`;
+    }
+  } catch (error) {
+    reportPageBody.textContent = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function clearReportPage() {
+  if (!activeChatId) return;
+  const confirmed = window.confirm("清空当前会话的全部 Report 内容？清空后不可恢复，下一次任务会重新开始记录。");
+  if (!confirmed) return;
+  if (reportClearBtn) reportClearBtn.disabled = true;
+  try {
+    const data = await window.clearRunReport?.(activeChatId);
+    if (!data?.ok) {
+      window.alert(data?.error || "清空失败");
+      return;
+    }
+    if (reportPageBody) {
+      reportPageBody.textContent = "报告已清空。下一次任务结束后会重新写入。";
+    }
+    if (reportPageMeta) {
+      const chat = getActiveChatRecord();
+      const title = chat?.title || "New Chat";
+      reportPageMeta.textContent = `${title} · ${String(activeChatId).slice(0, 8)}… · 已清空`;
+    }
+  } catch (error) {
+    window.alert(error instanceof Error ? error.message : String(error));
+  } finally {
+    if (reportClearBtn) reportClearBtn.disabled = false;
+  }
+}
+
+function appendAnalysisLog(message) {
+  if (!analysisLog) return;
+  const stamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+  const prefix = analysisLog.textContent.includes("Waiting") ? "" : `${analysisLog.textContent}\n`;
+  analysisLog.textContent = `${prefix}[${stamp}] ${message}`.trim();
+}
+
+function selectAnalysisCategory(category) {
+  currentAnalysisCategory = category;
+  const label = categoryLabels[category] || category;
+
+  document.querySelectorAll(".analysis-nav__item").forEach((item) => {
+    item.classList.toggle("analysis-nav__item--active", item.dataset.category === category);
+  });
+
+  if (parameterHint) parameterHint.hidden = true;
+  if (parameterForm) parameterForm.hidden = false;
+  appendAnalysisLog(`Selected analysis: ${label}`);
+}
+
+function bindUploadCard(cardId, inputId, modeLabel) {
+  const card = document.getElementById(cardId);
+  const input = document.getElementById(inputId);
+  if (!card || !input) return;
+
+  const openPicker = () => input.click();
+
+  card.addEventListener("click", openPicker);
+  card.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      openPicker();
+    }
+  });
+
+  card.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    card.classList.add("upload-card--dragover");
+  });
+
+  card.addEventListener("dragleave", () => {
+    card.classList.remove("upload-card--dragover");
+  });
+
+  card.addEventListener("drop", (event) => {
+    event.preventDefault();
+    card.classList.remove("upload-card--dragover");
+    const file = event.dataTransfer?.files?.[0];
+    if (file) handleAnalysisFile(file, modeLabel);
+  });
+
+  input.addEventListener("change", () => {
+    const file = input.files?.[0];
+    if (file) handleAnalysisFile(file, modeLabel);
+    input.value = "";
+  });
+}
+
+function handleAnalysisFile(file, modeLabel) {
+  appendAnalysisLog(`${modeLabel}: selected ${file.name}`);
+  if (analysisLog) {
+    appendAnalysisLog(`Ready to load .h5ad dataset (${(file.size / 1024 / 1024).toFixed(2)} MB)`);
+  }
+}
+
+navToggle?.addEventListener("click", () => {
+  shell.classList.toggle("shell--nav-drawer-open");
+});
+
+navBackdrop?.addEventListener("click", () => {
+  shell.classList.remove("shell--nav-drawer-open");
+});
+
+collapseToggle?.addEventListener("click", () => {
+  shell.classList.toggle("shell--nav-collapsed");
+});
+
+themeToggle?.addEventListener("click", () => {
+  const next = document.documentElement.getAttribute("data-theme-mode") === "light" ? "dark" : "light";
+  setTheme(next);
+});
+
+document.querySelectorAll(".nav-item[data-page]").forEach((item) => {
+  item.addEventListener("click", (event) => {
+    event.preventDefault();
+    setPage(item.dataset.page || "agent");
+  });
+});
+
+newChatBtn?.addEventListener("click", () => {
+  startNewChat();
+});
+
+runAnalysisBtn?.addEventListener("click", () => {
+  const label = categoryLabels[currentAnalysisCategory] || "Analysis";
+  appendAnalysisLog(`Running ${label}... (mock)`);
+  window.setTimeout(() => {
+    appendAnalysisLog(`${label} completed successfully.`);
+  }, 800);
+});
+
+composer?.addEventListener("compositionstart", () => {
+  isComposing = true;
+});
+
+composer?.addEventListener("compositionend", () => {
+  isComposing = false;
+});
+
+composer?.addEventListener("input", () => {
+  imeEnterStroke = false;
+  composer.style.height = "auto";
+  composer.style.height = `${composer.scrollHeight}px`;
+});
+
+composer?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey) return;
+
+  // 仅看当前按键的 IME 状态，不用模块级 isComposing（避免残留导致无法发送）
+  if (event.isComposing || event.keyCode === 229) {
+    imeEnterStroke = true;
+    return;
+  }
+
+  // 同一次物理 Enter：先确认 IME，再弹起的 keydown 不发送
+  if (imeEnterStroke) {
+    return;
+  }
+
+  event.preventDefault();
+  void handleSend();
+});
+
+composer?.addEventListener("keyup", (event) => {
+  if (event.key === "Enter") {
+    imeEnterStroke = false;
+  }
+});
+
+composerForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (event.isComposing || imeEnterStroke) return;
+  void handleSend();
+});
+
+document.querySelector(".agent-chat__composer-footer")?.addEventListener("click", (event) => {
+  if (event.target.closest(".status-pill__model-select")) return;
+  const link = event.target.closest(".status-pill__link");
+  if (!link) return;
+  event.preventDefault();
+  setPage("config");
+});
+
+document.querySelector(".agent-chat__composer-footer")?.addEventListener("change", (event) => {
+  const select = event.target.closest(".status-pill__model-select");
+  if (!select) return;
+  const ok = window.setDefaultLlmProvider?.(select.value);
+  if (!ok) updateComposerStatus();
+});
+
+sendBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  handleSend();
+});
+
+bindUploadCard("drop-zone-analysis", "file-input-analysis", "Analysis Mode");
+bindUploadCard("drop-zone-preview", "file-input-preview", "Preview Mode");
+
+initTheme();
+ensureExecutionElapsedTimer();
+void initChatSessions();
+updateAutoApproveUi();
+setLeftPanelMode("code");
+setPage("agent");
+setComposerMode("send");
+scrollThreadToBottom();
+window.updateComposerStatus = updateComposerStatus;
+updateComposerStatus();
+loadAgentBackendStatus();
+window.getActiveChatId = () => activeChatId;
+window.isAgentSending = () => isActiveChatSending();
+window.KernelPanel?.refresh?.();
+
+autoApproveToggle?.addEventListener("click", () => {
+  cycleApprovalMode();
+});
+
+function appendSupervisorMessage(role, text) {
+  if (!supervisorThread) return;
+  const el = document.createElement("div");
+  el.className = `supervisor-msg supervisor-msg--${role === "user" ? "user" : "assistant"}`;
+  el.textContent = text;
+  supervisorThread.appendChild(el);
+  supervisorThread.scrollTop = supervisorThread.scrollHeight;
+}
+
+function setSupervisorComposerMode(mode) {
+  if (!supervisorSendBtn) return;
+  supervisorSendBtn.dataset.mode = mode;
+  const isStop = mode === "stop";
+  supervisorSendBtn.setAttribute("aria-label", isStop ? "停止" : "发送");
+  supervisorSendBtn.classList.toggle("chat-send-btn--stop", isStop);
+  supervisorSendBtn.type = isStop ? "button" : "submit";
+}
+
+function resizeSupervisorInput() {
+  if (!supervisorInput) return;
+  supervisorInput.style.height = "auto";
+  supervisorInput.style.height = `${Math.min(supervisorInput.scrollHeight, 120)}px`;
+}
+
+function handleSupervisorStop() {
+  if (!supervisorBusy) return;
+  supervisorAbortController?.abort();
+  supervisorAbortController = null;
+}
+
+async function handleSupervisorSend(event) {
+  event?.preventDefault?.();
+  if (supervisorBusy) {
+    handleSupervisorStop();
+    return;
+  }
+  const question = String(supervisorInput?.value || "").trim();
+  if (!question) return;
+  if (!activeChatId) {
+    appendSupervisorMessage("assistant", "请先打开一个主会话。");
+    return;
+  }
+  const llm = window.getLlmConfig?.();
+  if (llm?.account?.authMode === "api_key" && !llm?.account?.apiKey) {
+    appendSupervisorMessage("assistant", "请先在 Config 页面配置 API Key 并保存。");
+    return;
+  }
+  if (!llm?.account) {
+    appendSupervisorMessage("assistant", "请先在 Config 配置 API Key。");
+    return;
+  }
+  const serverOk = await window.probeProxyServer?.(true);
+  if (!serverOk) {
+    appendSupervisorMessage(
+      "assistant",
+      `无法连接 UI 后端（${window.llmProxyBase || "serve.py"}）。请确认 serve.py 已启动并硬刷新页面。`,
+    );
+    return;
+  }
+
+  supervisorBusy = true;
+  setSupervisorComposerMode("stop");
+  if (supervisorInput) supervisorInput.value = "";
+  resizeSupervisorInput();
+  appendSupervisorMessage("user", question);
+  supervisorHistory.push({ role: "user", content: question });
+  appendSupervisorMessage("assistant", "监管者查阅中…");
+  const pending = supervisorThread?.lastElementChild;
+  supervisorAbortController = new AbortController();
+  try {
+    const { text } = await window.supervisorChatStream({
+      account: llm.account,
+      vendor: llm.vendor,
+      agent: llm.config?.agent,
+      chatId: activeChatId,
+      parentChatId: activeChatId,
+      messages: supervisorHistory,
+      signal: supervisorAbortController.signal,
+      onEvent: (evt) => {
+        if (evt.type === "status" && pending) pending.textContent = evt.message || "查阅中…";
+      },
+    });
+    const answer = text || "（无回复）";
+    if (pending) pending.textContent = answer;
+    supervisorHistory.push({ role: "assistant", content: answer });
+  } catch (error) {
+    const aborted =
+      (error instanceof DOMException && error.name === "AbortError") ||
+      (error instanceof Error && /abort/i.test(error.message));
+    if (pending) {
+      pending.textContent = aborted
+        ? "已停止。"
+        : `调用失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    if (aborted) {
+      supervisorHistory.push({ role: "assistant", content: "已停止。" });
+    }
+  } finally {
+    supervisorBusy = false;
+    supervisorAbortController = null;
+    setSupervisorComposerMode("send");
+  }
+}
+
+async function openRunReport() {
+  setPage("report");
+  await refreshReportPage();
+}
+
+supervisorOpenBtn?.addEventListener("click", () => setLeftPanelMode("branch"));
+leftPanelModeSelect?.addEventListener("change", () => {
+  setLeftPanelMode(leftPanelModeSelect.value);
+});
+supervisorInput?.addEventListener("input", () => {
+  supervisorImeEnterStroke = false;
+  resizeSupervisorInput();
+});
+supervisorInput?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || event.shiftKey) return;
+  if (event.isComposing || event.keyCode === 229) {
+    supervisorImeEnterStroke = true;
+    return;
+  }
+  if (supervisorImeEnterStroke) return;
+  event.preventDefault();
+  void handleSupervisorSend(event);
+});
+supervisorInput?.addEventListener("keyup", (event) => {
+  if (event.key === "Enter") supervisorImeEnterStroke = false;
+});
+supervisorForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  if (event.isComposing || supervisorImeEnterStroke) return;
+  void handleSupervisorSend(event);
+});
+supervisorSendBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  void handleSupervisorSend(event);
+});
+setSupervisorComposerMode("send");
+reportRefreshBtn?.addEventListener("click", () => {
+  void refreshReportPage();
+});
+reportClearBtn?.addEventListener("click", () => {
+  void clearReportPage();
+});
+
+window.addEventListener("llm-config-updated", () => {
+  updateComposerStatus();
+  loadAgentBackendStatus();
+});
+
+window.addEventListener("proxy-server-probed", () => {
+  updateComposerStatus();
+  loadAgentBackendStatus();
+  if (window.__proxyServerReady) {
+    chatPersistenceMode = "server";
+    try {
+      localStorage.removeItem(CHAT_STORE_KEY);
+    } catch {
+      // ignore storage failures
+    }
+    void syncChatStoreFromServer().then((synced) => {
+      if (!synced) return;
+      // Refresh catalog only — never jump onto another device's shared active chat.
+      if (!activeChatId && !getDeviceActiveChatId()) {
+        applyActiveChatFromStore({ preferNewChat: true });
+      } else {
+        renderRecentChats();
+      }
+    });
+  }
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    void refreshChatStoreFromServerIfIdle();
+  }
+});

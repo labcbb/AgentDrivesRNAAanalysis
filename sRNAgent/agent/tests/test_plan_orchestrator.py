@@ -1,0 +1,2145 @@
+"""Tests for plan prerequisite expansion."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+
+from sRNAgent.agent.plan_orchestrator import (  # noqa: E402
+    _apply_analysis_policy,
+    _apply_skill_plan_contracts,
+    _apply_deliverables_policy,
+    _bind_execution_skill_from_registry,
+    _apply_modality_boundaries,
+    _build_executor_system_prompt,
+    _build_approval_request,
+    _build_plan_review_system_prompt,
+    _approval_value_from_context,
+    _format_confirmed_approvals,
+    approval_response_is_actionable,
+    _approval_response_requests_followup,
+    _build_planner_system_prompt,
+    _context_has_counts_for_modality,
+    _derive_requested_scope,
+    _enforce_workflow_contracts,
+    _ensure_group_metadata_preflight,
+    _enforce_requested_scope,
+    _expand_plan_prerequisites,
+    _user_explicitly_requests_feature_count,
+    _load_planning_skill_guidance,
+    _load_skill_plan_contracts,
+    _order_de_workflow_steps,
+    _parse_plan_json,
+    _resolve_analysis_policy,
+    _resolve_deliverables_policy,
+    _resolve_requirements_policy,
+    _is_conversational_query,
+    _is_read_only_query,
+    _strip_unrequested_html_report,
+)
+
+
+def test_plan_json_parser_reports_a_controlled_error_for_malformed_output():
+    from sRNAgent.agent.plan_orchestrator import PlanJsonParseError
+
+    try:
+        _parse_plan_json('{"goal": "broken", "steps": [{"title": "x"}]')
+    except PlanJsonParseError as exc:
+        assert "invalid JSON" in str(exc)
+        assert exc.raw.startswith('{"goal"')
+    else:
+        raise AssertionError("malformed planner output should not parse")
+
+
+def test_plan_progress_event_keeps_a_running_step_snapshot():
+    """Queued plan events must not be changed by later lifecycle transitions."""
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    received = []
+
+    class Agent:
+        def _emit_progress(self, callback, event_type, **payload):
+            callback({"type": event_type, **payload})
+
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = Agent()
+    plan = {"steps": [{"id": "1", "status": "running"}]}
+    orchestrator._emit(received.append, "plan_step_start", plan=plan)
+    plan["steps"][0]["status"] = "done"
+
+    assert received[0]["plan"]["steps"][0]["status"] == "running"
+
+
+def test_plan_lifecycle_persists_only_completed_artifact_outputs():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "trim", "status": "done", "outputs": ["trimmed_fastq"]},
+            {"id": "align", "status": "pending", "outputs": ["genome_bam"]},
+        ]
+    }
+
+    PlanOrchestrator._normalize_plan_lifecycle(plan)
+
+    assert plan["artifactState"] == {
+        "schema": "srnagent.artifacts/v1",
+        "available": ["trimmed_fastq"],
+        "provenance": {"trimmed_fastq": "trim"},
+    }
+
+
+def test_plan_json_completion_repairs_one_malformed_llm_response():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    class Completion:
+        def __init__(self, content):
+            self.content = content
+
+    class Agent:
+        skill_registry = None
+
+        def __init__(self):
+            self.responses = ['{"goal":"broken", "steps":[{"title":"x"}]', '{"goal":"ok","steps":[]}']
+
+        def _llm_complete_cancellable(self, *args, **kwargs):
+            return Completion(self.responses.pop(0))
+
+        def _emit_progress(self, *args, **kwargs):
+            return None
+
+    orchestrator = PlanOrchestrator(Agent())
+    parsed = orchestrator._complete_plan_json(
+        [{"role": "user", "content": "task"}],
+        on_progress=None,
+        cancel_event=None,
+    )
+
+    assert parsed["goal"] == "ok"
+
+
+def test_tool_backend_question_is_direct_conversation_not_a_plan_request():
+    assert _is_conversational_query("enrichr为什么需要在线API，我不是用的本地的吗")
+    assert _is_conversational_query("这个工具是否使用本地注释数据库？")
+    assert _is_conversational_query("这个isomir的序列，是真实的不同于miRNA的mature序列的吧")
+    assert not _is_conversational_query("下载参考基因组并运行 miRNA 定量")
+
+
+def test_requested_scope_drops_unsolicited_fragmentomics_and_pirna_steps():
+    query = "完成 miRNA 和 tRNA 定量、差异分析、miRNA 靶标网络和报告"
+    scope = _derive_requested_scope(query)
+    goal, steps = _enforce_requested_scope(
+        "miRNA、piRNA、tRNA 与片段组学分析",
+        [
+            {"id": "1", "title": "miRNA 定量", "goal": "运行 miRDeep2", "skill": "mirdeep2-mirna"},
+            {"id": "2", "title": "tRNA 定量", "goal": "运行 tRAX", "skill": "trax_quantification"},
+            {"id": "3", "title": "piRNA 定量", "goal": "运行 idxstats", "skill": "samtools_idxstats"},
+            {"id": "4", "title": "片段组学", "goal": "全基因组 Bowtie 比对后提取 FSD", "skill": "fragment-analysis"},
+        ],
+        scope=scope,
+        fallback_goal=query,
+    )
+
+    assert scope["requested_assays"] == ["mirna", "trna"]
+    assert [step["skill"] for step in steps] == ["mirdeep2-mirna", "trax_quantification"]
+    assert "片段组学" not in goal
+    assert "piRNA" not in goal
+
+
+def test_scope_contract_is_injected_and_enforced_after_llm_review():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    class Completion:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeAgent:
+        system_prompt = "system"
+        skill_registry = None
+
+        def __init__(self):
+            self.messages = []
+            response = (
+                '{"goal":"miRNA、piRNA 和片段组学分析","steps":['
+                '{"id":"1","title":"miRNA 定量","goal":"miRDeep2","skill":"mirdeep2-mirna"},'
+                '{"id":"2","title":"piRNA 定量","goal":"idxstats","skill":"samtools_idxstats"},'
+                '{"id":"3","title":"片段组学","goal":"全基因组比对","skill":"fragment-analysis"}]}'
+            )
+            self.responses = [Completion(response), Completion(response)]
+
+        def _llm_complete_cancellable(self, messages, **kwargs):
+            self.messages.append(messages)
+            return self.responses.pop(0)
+
+    agent = FakeAgent()
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = agent
+    orchestrator.skill_overview = ""
+    query = "完成 miRNA 和 tRNA 定量"
+    plan = orchestrator._create_plan(query, "历史产物中有 fragmentomics 特征")
+
+    assert plan["analysis"]["requested_assays"] == ["mirna", "trna"]
+    assert [step["skill"] for step in plan["steps"]] == ["mirdeep2-mirna"]
+    assert "fragmentomics" not in plan["goal"].lower()
+    assert "requested assays: [mirna, trna]" in agent.messages[0][1]["content"]
+
+
+def test_mirna_trna_and_fragmentomics_are_two_modalities():
+    steps = [
+        {"id": "1", "title": "miRNA 定量", "goal": "运行 miRDeep2", "skill": "mirdeep2-mirna"},
+        {"id": "2", "title": "tRNA 定量", "goal": "运行 tRAX", "skill": "trax_quantification"},
+        {"id": "3", "title": "片段组学定量", "goal": "运行 fragment-analysis", "skill": "fragment-analysis"},
+    ]
+    query = "基于 trimmed FASTQ 完成 miRNA 和 tRNA 定量、片段组学定量"
+    goal, bounded = _apply_modality_boundaries(
+        "完成 miRNA、tRNA 与片段组学三模态定量", steps, user_query=query,
+    )
+    analysis = _resolve_analysis_policy(query, "", bounded)
+
+    assert "两种模态" in goal
+    assert "三模态" not in goal
+    assert analysis["modalities"] == ["srna", "fragmentomics"]
+    assert all("srna AnnData" in step["goal"] for step in bounded[:2])
+    assert "fragmentomics AnnData" in bounded[2]["goal"]
+
+
+def test_mirna_pirna_and_trna_share_one_srna_modality():
+    steps = [
+        {"id": "1", "title": "miRNA 定量", "goal": "运行 miRDeep2", "skill": "mirdeep2-mirna"},
+        {"id": "2", "title": "piRNA 定量", "goal": "运行 idxstats", "skill": "samtools_idxstats"},
+        {"id": "3", "title": "tRNA 定量", "goal": "运行 tRAX", "skill": "trax_quantification"},
+        {"id": "4", "title": "片段组学定量", "goal": "提取 fragmentomics 特征", "skill": "fragment-analysis"},
+    ]
+    query = "完成 miRNA、piRNA、tRNA 定量和片段组学定量"
+    goal, bounded = _apply_modality_boundaries(
+        "完成 miRNA、piRNA、tRNA 与片段组学四模态定量", steps, user_query=query,
+    )
+    analysis = _resolve_analysis_policy(query, "", bounded)
+
+    assert analysis["modalities"] == ["srna", "fragmentomics"]
+    assert all("srna AnnData" in step["goal"] for step in bounded[:3])
+    assert "四模态" not in goal
+
+
+def test_execution_binds_mirna_default_from_skill_metadata_not_plan_method():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    step = {
+        "title": "miRNA 定量（samtools idxstats）",
+        "goal": "运行 samtools idxstats",
+        "skill": "samtools_idxstats",
+    }
+
+    _bind_execution_skill_from_registry(
+        step,
+        registry,
+        [{"role": "user", "content": "完成 miRNA/piRNA/tRNA 定量"}],
+    )
+
+    assert step["skill"] == "mirdeep2-mirna"
+    assert "miRDeep2" in step["title"]
+    assert step["skillBoundAtExecution"] == "mirdeep2-mirna"
+
+
+def test_llm_plan_reviewer_corrects_dependency_order_before_execution():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    class Completion:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeAgent:
+        system_prompt = "system"
+        skill_registry = None
+
+        def __init__(self):
+            self.responses = [
+                Completion(
+                    '{"goal":"analysis","steps":[{"id":"1","title":"quantify","goal":"make counts","skill":""},{"id":"2","title":"report","goal":"summarize DE","skill":""},{"id":"3","title":"DE","goal":"run differential analysis","skill":"differential-analysis"}]}'
+                ),
+                Completion(
+                    '{"goal":"analysis","steps":[{"id":"1","title":"quantify","goal":"make counts","skill":""},{"id":"2","title":"DE","goal":"run differential analysis","skill":"differential-analysis"},{"id":"3","title":"report","goal":"summarize DE","skill":""}]}'
+                ),
+            ]
+
+        def _llm_complete_cancellable(self, *args, **kwargs):
+            return self.responses.pop(0)
+
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = FakeAgent()
+    orchestrator.skill_overview = ""
+    plan = orchestrator._create_plan("quantify, run DE, and write a report", "")
+
+    assert [step["title"] for step in plan["steps"]][-1] == "report"
+
+
+def test_planner_and_reviewer_describe_user_decisions_as_blocking_approvals():
+    planner = _build_planner_system_prompt("skills")
+    reviewer = _build_plan_review_system_prompt()
+
+    assert "blocking state" in planner
+    assert "review.fields" in planner
+    assert "MUST carry an `approval`" in reviewer
+    assert "review.fields" in reviewer
+
+
+def test_plain_approval_cannot_close_a_group_gate_with_unknown_configuration():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "2",
+            "title": "确认差异分析样本分组",
+            "status": "awaiting_approval",
+            "approval": {"id": "confirm-groups-before-de", "reviewed": {}},
+        }]
+    }
+
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以")
+
+    assert restored["steps"][0]["status"] == "awaiting_approval"
+    assert restored["steps"][0]["approval"]["lastResponse"] == "可以"
+
+
+def test_unknown_group_approval_gets_read_only_metadata_preflight_first():
+    plan = {
+        "steps": [
+            {
+                "id": "1",
+                "title": "确认差异分析样本分组与统计设计",
+                "status": "awaiting_approval",
+                "approval": {
+                    "id": "confirm-group-from-metadata",
+                    "review": {"fields": [
+                        {"source": "group_column", "unknown": "未记录"},
+                        {"source": "group_counts", "unknown": "未记录"},
+                        {"source": "control_group", "unknown": "未记录"},
+                        {"source": "analysis_design", "value": "unpaired"},
+                    ]},
+                },
+            },
+            {"id": "2", "title": "差异分析", "status": "pending", "depends_on": ["1"]},
+        ]
+    }
+
+    assert _ensure_group_metadata_preflight(plan) is True
+
+    preflight, gate, de_step = plan["steps"]
+    assert preflight["id"] == "1-group-preflight"
+    assert preflight["status"] == "pending"
+    assert "fastq-dl" in preflight["goal"]
+    assert gate["status"] == "awaiting_approval"
+    assert gate["approval"]["id"] == "confirm-groups-before-de"
+    assert gate["depends_on"] == ["1-group-preflight"]
+    assert de_step["depends_on"] == ["1"]
+
+
+def test_legacy_group_gate_cannot_consume_bare_approval_before_preflight():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认差异分析样本分组与统计设计",
+            "status": "awaiting_approval",
+            "approval": {
+                "id": "confirm-group-from-metadata",
+                "review": {"fields": [
+                    {"source": "group_column", "unknown": "未记录"},
+                    {"source": "group_counts", "unknown": "未记录"},
+                    {"source": "control_group", "unknown": "未记录"},
+                    {"source": "analysis_design", "value": "unpaired"},
+                ]},
+            },
+        }]
+    }
+    _ensure_group_metadata_preflight(plan)
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以")
+
+    assert restored["steps"][1]["status"] == "awaiting_approval"
+    assert restored["steps"][1]["approval"]["lastResponse"] == "可以"
+
+
+def test_group_gate_hydrates_preflight_values_and_accepts_natural_confirmation():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {
+                "id": "1",
+                "title": "读取差异分析分组与设计",
+                "status": "done",
+                "result": "GROUP_COLUMN: group\nGROUP_COUNTS: Tumor=15, Normal=15\nCONTROL_GROUP: Normal\nDESIGN: unpaired",
+            },
+            {
+                "id": "2",
+                "title": "确认差异分析样本分组",
+                "status": "awaiting_approval",
+                "approval": {"id": "confirm-groups-before-de", "reviewed": {}},
+            },
+        ]
+    }
+
+    restored = PlanOrchestrator._prepare_restored_plan(
+        plan, approval_response="可以根据这个分组来，normal是对照组",
+    )
+
+    approval = restored["steps"][1]["approval"]
+    assert restored["steps"][1]["status"] == "done"
+    assert approval["reviewed"] == {
+        "group_column": "group",
+        "group_counts": "Tumor=15, Normal=15",
+        "control_group": "Normal",
+        "analysis_design": "unpaired",
+    }
+
+
+def test_isomir_parallel_rebuild_is_preserved_as_a_hard_requirement():
+    query = "我已清空 mirtop 内容，从 hairpin 比对开始重建 isomiR；剩余样本八个同时运行。"
+    requirements = _resolve_requirements_policy(query, "")
+
+    assert requirements["isomir_rebuild_from_alignment"] is True
+    assert requirements["isomir_parallel_workers"] == 8
+    prompt = _build_executor_system_prompt(
+        "base system",
+        step={"title": "并行 isomiR 定量", "goal": "完成 mirtop", "skill": "isomir-quantification"},
+        step_index=1,
+        step_total=1,
+        plan_goal="重建 isomiR",
+        requirements=requirements,
+    )
+    assert "Do not call `sa.quant.mirtop` once over all BAMs" in prompt
+    assert "progress: N / TOTAL <sample>" in prompt
+    assert "8" in prompt
+
+
+def test_isomir_trimmed_fastq_rebuild_inserts_collapse_before_alignment():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    query = "基于已有的 trimmed FASTQ 重建 hairpin 比对并完成 isomiR 定量（30 样本，jobs=8）"
+    steps = [
+        {
+            "id": "1",
+            "title": "重建 hairpin 比对并完成 isomiR 定量",
+            "goal": "从 trimmed FASTQ 完成 hairpin 比对和 mirtop 定量",
+            "skill": "isomir-quantification",
+        }
+    ]
+
+    expanded = _expand_plan_prerequisites(
+        steps, extra_context="ref/hairpin_hsa.fa", user_query=query,
+    )
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _apply_skill_plan_contracts(
+        expanded,
+        _load_skill_plan_contracts(registry, query, step_skills=["isomir-quantification"]),
+        user_query=query,
+        extra_context="ref/hairpin_hsa.fa",
+        available_artifacts=["trimmed_fastq"],
+    )
+    requirements = _resolve_requirements_policy(query, "")
+    prompt = _build_executor_system_prompt(
+        "base system",
+        step=planned[0],
+        step_index=1,
+        step_total=len(planned),
+        plan_goal=query,
+        requirements=requirements,
+    )
+
+    assert planned[0]["title"] == "折叠 trimmed FASTQ 供 isomiR hairpin 比对"
+    assert "seqcluster_collapse" in planned[0]["goal"]
+    assert requirements["isomir_parallel_workers"] == 8
+    assert "Do not call `sa.quant.mirtop` once over all BAMs" in prompt
+
+
+def test_isomir_raw_fastq_plan_forces_trim_then_collapse_then_analysis():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [{"id": "1", "title": "运行 mirtop", "goal": "完成 isomiR 定量", "skill": "isomir-quantification"}],
+        skill_registry=registry,
+        user_query="对原始 FASTQ 做 isomiR 分析",
+        extra_context="adata.obs['fastq_path'] = 'raw/S1.fastq.gz'",
+        available_artifacts=["raw/S1.fastq.gz"],
+    )
+
+    titles = [step["title"] for step in planned]
+    assert titles == [
+        "读取现有 FASTQ 修剪配置",
+        "确认 sRNA-seq 3' adapter",
+        "完成 isomiR 前的 FASTQ 质控与接头修剪",
+        "折叠 trimmed FASTQ 供 isomiR hairpin 比对",
+        "运行 mirtop",
+    ]
+    assert "approval" in planned[1]
+
+
+def test_isomir_target_prediction_does_not_add_quantification_or_adapter_gate():
+    """A biological isomiR keyword must not import an upstream FASTQ workflow."""
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [{
+            "id": "1",
+            "title": "预测 top 5 isomiR 靶标",
+            "goal": "运行 miRanda 与 3' UTR seed 验证",
+            "skill": "mirna-target-prediction",
+        }],
+        skill_registry=registry,
+        user_query="用 miRanda 预测 top 5 isomiR 靶标",
+        # Raw FASTQ is deliberately present: it must not affect a target-only
+        # plan that operates on an already quantified isomiR AnnData.
+        extra_context="adata.obs['fastq_path'] = 'raw/S1.fastq.gz'",
+    )
+
+    assert {step["title"] for step in planned} == {
+        "从差异结果确定靶标分析候选小 RNA",
+        "确认靶标预测候选集",
+        "预测 top 5 isomiR 靶标",
+    }
+    assert all(step["skill"] != "fastq-qc" for step in planned)
+    assert all(step["workflowContract"] != "trim-before-isomir-collapse" for step in planned if "workflowContract" in step)
+
+
+def test_target_contract_compiles_candidate_confirmation_then_prediction_without_duplicates():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [
+            {
+                "id": "select", "title": "Select isomiR target-prediction candidates",
+                "goal": "select candidates", "skill": "mirna-target-prediction",
+            },
+            {
+                "id": "predict", "title": "Predict isomiR targets with miRanda + seed-site validation",
+                "goal": "run miRanda", "skill": "mirna-target-prediction",
+            },
+            {
+                "id": "persist", "title": "Persist isomir_adata with target artifacts",
+                "goal": "write target results", "skill": "mirna-target-prediction",
+            },
+        ],
+        skill_registry=registry,
+        user_query="预测 isomiR 靶标",
+        extra_context="",
+    )
+
+    assert [step["title"] for step in planned] == [
+        "从差异结果确定靶标分析候选小 RNA",
+        "确认靶标预测候选集",
+        "Predict isomiR targets with miRanda + seed-site validation",
+    ]
+    prediction = planned[-1]
+    assert prediction["inputs"] == [
+        "target_candidates_confirmed", "three_prime_utr_fasta", "mirna_sequence_metadata",
+    ]
+    assert prediction["depends_on"] == ["workflow:confirm-target-candidates-before-prediction"]
+    assert prediction["executionContracts"][0]["id"] == "target-prediction-execution-contract"
+
+
+def test_target_contract_repairs_a_persisted_out_of_order_target_plan():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [
+            {
+                "id": "confirm", "title": "确认靶标预测候选集", "skill": "mirna-target-prediction",
+                "status": "pending", "workflowContract": "confirm-target-candidates-before-prediction",
+                "inputs": ["target_candidates"], "outputs": ["target_candidates_confirmed"],
+            },
+            {
+                "id": "predict", "title": "Predict isomiR targets with miRanda",
+                "skill": "mirna-target-prediction", "status": "done",
+            },
+            {
+                "id": "persist", "title": "Persist isomir_adata with target artifacts",
+                "skill": "mirna-target-prediction", "status": "pending",
+            },
+            {
+                "id": "select-contract", "title": "从差异结果确定靶标分析候选小 RNA",
+                "skill": "mirna-target-prediction", "status": "pending",
+                "workflowContract": "select-target-candidates-before-prediction",
+                "outputs": ["target_candidates"],
+            },
+            {
+                "id": "select-llm", "title": "Select isomiR target-prediction candidates",
+                "skill": "mirna-target-prediction", "status": "pending",
+            },
+        ],
+        skill_registry=registry,
+        user_query="预测 isomiR 靶标",
+        extra_context="",
+    )
+
+    assert [step["id"] for step in planned] == ["select-contract", "confirm", "predict"]
+    assert planned[-1]["status"] == "done"
+    assert planned[-1]["depends_on"] == ["confirm"]
+
+
+def test_target_contract_removes_duplicate_gate_and_wires_parent_comparison():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [
+            {"id": "gate", "title": "确认靶标预测候选集", "skill": "mirna-target-prediction"},
+            {"id": "iso", "title": "预测 isomiR 靶标（miRanda）", "skill": "mirna-target-prediction"},
+            {"id": "parent", "title": "预测父 miRNA 靶标", "skill": "mirna-target-prediction"},
+            {"id": "compare", "title": "比较 isomiR 与父 miRNA 靶标差异", "skill": "mirna-target-prediction"},
+        ],
+        skill_registry=registry,
+        user_query="比较 isomiR 和父 miRNA 的靶标差异",
+        extra_context="",
+    )
+
+    assert [step["id"] for step in planned] == [
+        "workflow:select-target-candidates-before-prediction",
+        "workflow:confirm-target-candidates-before-prediction",
+        "iso", "parent", "compare",
+    ]
+    by_id = {step["id"]: step for step in planned}
+    assert by_id["iso"]["depends_on"] == ["workflow:confirm-target-candidates-before-prediction"]
+    assert by_id["parent"]["depends_on"] == [
+        "workflow:confirm-target-candidates-before-prediction", "iso",
+    ]
+    assert by_id["compare"]["depends_on"] == ["iso", "parent"]
+    assert all(
+        dependency in by_id
+        for step in planned
+        for dependency in step.get("depends_on") or []
+    )
+
+
+def test_target_only_scope_drops_de_and_raw_count_planner_prerequisites():
+    scope = _derive_requested_scope("基于现有 isomiR 数据比较 isomiR 和 miRNA 靶标差异")
+    _goal, planned = _enforce_requested_scope(
+        "比较 isomiR 和 miRNA 靶标差异",
+        [
+            {"id": "counts", "title": "核查现有 raw counts 矩阵", "skill": ""},
+            {"id": "groups", "title": "确认差异分析样本分组", "skill": "differential-analysis"},
+            {"id": "de", "title": "运行 sRNA 差异分析", "skill": "differential-analysis"},
+            {"id": "target", "title": "预测 isomiR 靶标", "skill": "mirna-target-prediction"},
+        ],
+        scope=scope,
+        fallback_goal="基于现有 isomiR 数据比较 isomiR 和 miRNA 靶标差异",
+    )
+
+    assert [step["id"] for step in planned] == ["target"]
+
+
+def test_target_only_scope_removes_hallucinated_isomir_upstream_workflow():
+    scope = _derive_requested_scope("用 miRanda 预测 top 5 isomiR 靶标")
+    _goal, planned = _enforce_requested_scope(
+        "预测 isomiR 靶标",
+        [
+            {"id": "1", "title": "确认 3' adapter", "skill": "fastq-qc"},
+            {"id": "2", "title": "运行 mirtop 定量", "skill": "isomir-quantification"},
+            {"id": "3", "title": "miRanda 靶标预测", "skill": "mirna-target-prediction"},
+        ],
+        scope=scope,
+        fallback_goal="用 miRanda 预测 top 5 isomiR 靶标",
+    )
+
+    assert scope["target_prediction_only"] is True
+    assert [step["skill"] for step in planned] == ["mirna-target-prediction"]
+
+
+def test_isomir_collapse_is_moved_before_hairpin_bowtie_when_planner_orders_it_late():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    query = "基于已有 trimmed FASTQ 重建 hairpin 比对并完成 isomiR 定量"
+    steps = [
+        {"id": "1", "title": "修复 cutadapt 缺失样本", "goal": "补齐 trimmed FASTQ", "skill": "fastq-qc"},
+        {"id": "2", "title": "hairpin Bowtie 比对重建", "goal": "生成 hairpin BAM", "skill": "alignment-srna"},
+        {"id": "3", "title": "运行 mirtop", "goal": "isomiR 定量", "skill": "isomir-quantification"},
+        {"id": "4", "title": "折叠 trimmed FASTQ", "goal": "seqcluster collapse", "skill": "isomir-quantification"},
+    ]
+
+    expanded = _expand_plan_prerequisites(
+        steps, extra_context="ref/hairpin_hsa.fa", user_query=query,
+    )
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _apply_skill_plan_contracts(
+        expanded,
+        _load_skill_plan_contracts(registry, query, step_skills=["isomir-quantification"]),
+        user_query=query,
+        extra_context="ref/hairpin_hsa.fa",
+        available_artifacts=["trimmed_fastq"],
+    )
+    titles = [step["title"] for step in planned]
+
+    assert titles == [
+        "修复 cutadapt 缺失样本",
+        "折叠 trimmed FASTQ 供 isomiR hairpin 比对",
+        "hairpin Bowtie 比对重建",
+        "运行 mirtop",
+    ]
+    by_title = {step["title"]: step for step in planned}
+    assert by_title["hairpin Bowtie 比对重建"]["inputs"] == ["collapsed_fastq"]
+    assert by_title["运行 mirtop"]["inputs"] == ["hairpin_bam", "mirtop_reference"]
+    assert by_title["运行 mirtop"]["depends_on"] == ["2"]
+
+
+def test_isomir_skill_contract_places_collapse_before_hairpin_bowtie():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    query = "基于已有 trimmed FASTQ 重建 hairpin 比对并完成 isomiR 定量"
+    contracts = _load_skill_plan_contracts(registry, query)
+    planned = _apply_skill_plan_contracts(
+        [
+            {"id": "1", "title": "hairpin Bowtie 比对重建", "goal": "生成 BAM", "skill": "alignment-srna"},
+            {"id": "2", "title": "运行 mirtop", "goal": "isomiR 定量", "skill": "isomir-quantification"},
+        ],
+        contracts,
+        user_query=query,
+        extra_context="",
+        available_artifacts=["trimmed_fastq"],
+    )
+
+    assert contracts
+    assert [step["title"] for step in planned] == [
+        "折叠 trimmed FASTQ 供 isomiR hairpin 比对",
+        "hairpin Bowtie 比对重建",
+        "运行 mirtop",
+    ]
+
+
+def test_fragment_skill_contract_adds_genome_bam_preflight():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    query = "运行片段组学分析"
+    contracts = _load_skill_plan_contracts(registry, query, step_skills=["fragment-analysis"])
+    planned = _apply_skill_plan_contracts(
+        [{"id": "1", "title": "运行片段组学分析", "goal": "提取 FSD", "skill": "fragment-analysis"}],
+        contracts,
+        user_query=query,
+        extra_context="",
+    )
+
+    assert [step["title"] for step in planned] == [
+        "核验 fragmentomics 全基因组 BAM 与参考 FASTA",
+        "运行片段组学分析",
+    ]
+
+
+def test_fragmentomics_preparation_precedes_genome_alignment():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    expanded = _expand_plan_prerequisites(
+        [{"id": "1", "title": "运行片段组学分析", "goal": "提取 FSD", "skill": "fragment-analysis"}],
+        extra_context="",
+        user_query="运行片段组学分析",
+    )
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _apply_skill_plan_contracts(
+        expanded,
+        _load_skill_plan_contracts(registry, "运行片段组学分析", step_skills=["fragment-analysis"]),
+        user_query="运行片段组学分析",
+        extra_context="",
+    )
+    titles = [step["title"] for step in planned]
+
+    assert titles.index("准备参考基因组 FASTA") < titles.index("完成参考基因组比对")
+
+
+def test_trax_skill_contract_adds_trimming_for_raw_fastq_only():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    query = "用 tRAX 做 tRNA 定量"
+    contracts = _load_skill_plan_contracts(registry, query, step_skills=["trax_quantification"])
+    planned = _apply_skill_plan_contracts(
+        [{"id": "1", "title": "运行 tRAX 定量", "goal": "计数 tRF", "skill": "trax_quantification"}],
+        contracts,
+        user_query=query,
+        extra_context="adata.obs['fastq_path'] = 'raw/S1.fastq.gz'",
+        available_artifacts=["raw/S1.fastq.gz"],
+    )
+
+    assert [step["title"] for step in planned] == [
+        "完成 tRAX 前的 FASTQ 质控与修剪",
+        "运行 tRAX 定量",
+    ]
+
+
+def test_raw_trax_workflow_keeps_trim_after_adapter_approval_is_inserted():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [{"id": "1", "title": "运行 tRAX 定量", "goal": "计数 tRF", "skill": "trax_quantification"}],
+        skill_registry=registry,
+        user_query="用原始 FASTQ 做 tRAX tRNA 定量",
+        extra_context="adata.obs['fastq_path'] = 'raw/S1.fastq.gz'",
+        available_artifacts=["raw/S1.fastq.gz"],
+    )
+
+    assert [step["title"] for step in planned] == [
+        "读取现有 FASTQ 修剪配置",
+        "确认 sRNA-seq 3' adapter",
+        "完成 tRAX 前的 FASTQ 质控与修剪",
+        "运行 tRAX 定量",
+    ]
+
+
+def test_de_group_preflight_precedes_its_approval_gate():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [{"id": "1", "title": "差异分析", "goal": "DE", "skill": "differential-analysis"}],
+        skill_registry=registry,
+        user_query="做差异分析",
+        extra_context='adata.layers["counts"]',
+    )
+
+    assert [step["title"] for step in planned] == [
+        "读取差异分析分组与设计",
+        "确认差异分析样本分组",
+        "差异分析",
+    ]
+
+
+def test_de_contract_replaces_planner_group_steps_and_lifecycle_keeps_one_gate():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    planned = _enforce_workflow_contracts(
+        [
+            {
+                "id": "1",
+                "title": "读取差异分析分组与设计（preflight 证据收集）",
+                "goal": "检查 condition",
+                "skill": "differential-analysis",
+            },
+            {
+                "id": "2",
+                "title": "确认差异分析样本分组（阻塞门）",
+                "goal": "等待确认",
+                "skill": "differential-analysis",
+            },
+            {"id": "3", "title": "miRNA 差异分析", "goal": "DE", "skill": "differential-analysis"},
+        ],
+        skill_registry=registry,
+        user_query="做 miRNA 差异分析",
+        extra_context='adata.layers["counts"]',
+    )
+    plan = {"steps": planned}
+    PlanOrchestrator._normalize_plan_lifecycle(plan)
+
+    assert [step["title"] for step in plan["steps"]] == [
+        "读取差异分析分组与设计",
+        "确认差异分析样本分组",
+        "miRNA 差异分析",
+    ]
+    gate = plan["steps"][1]
+    assert gate["workflowContract"] == "confirm-groups-before-de"
+    assert gate["depends_on"] == ["workflow:confirm-groups-before-de:preflight"]
+
+
+def test_approval_contract_inserts_persisted_gate_before_feature_count():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    query = "运行 featureCounts 定量"
+    contracts = _load_skill_plan_contracts(registry, query, step_skills=["feature-count"])
+    planned = _apply_skill_plan_contracts(
+        [{"id": "1", "title": "运行 featureCounts", "goal": "生成表达矩阵", "skill": "feature-count"}],
+        contracts,
+        user_query=query,
+        extra_context="",
+    )
+
+    assert [step["title"] for step in planned[:2]] == [
+        "读取 featureCounts 已知配置",
+        "确认 featureCounts 链特异性",
+    ]
+    assert "不得运行 featureCounts" in planned[0]["goal"]
+    assert "approval" in planned[1]
+    assert "链特异性" in planned[1]["approval"]["prompt"]
+
+
+def test_execution_contract_is_bound_to_mirtop_executor_prompt():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    query = "运行 mirtop 做 isomiR 定量"
+    contracts = _load_skill_plan_contracts(registry, query, step_skills=["isomir-quantification"])
+    planned = _apply_skill_plan_contracts(
+        [{"id": "1", "title": "运行 mirtop", "goal": "isomiR 定量", "skill": "isomir-quantification"}],
+        contracts,
+        user_query=query,
+        extra_context="",
+    )
+    prompt = _build_executor_system_prompt(
+        "base", step=planned[0], step_index=1, step_total=1, plan_goal=query,
+    )
+
+    assert planned[0]["executionContracts"]
+    assert "Bound execution contract" in prompt
+    assert "独立 staging 输出目录" in prompt
+
+
+def test_approval_response_unblocks_only_the_waiting_plan_step():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "1", "title": "确认 adapter", "status": "awaiting_approval", "approval": {"id": "adapter"}},
+            {"id": "2", "title": "运行 cutadapt", "status": "pending"},
+        ]
+    }
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="adapter=TGGA")
+
+    assert restored["steps"][0]["status"] == "done"
+    assert restored["steps"][0]["approval"]["response"] == "adapter=TGGA"
+    assert restored["steps"][1]["status"] == "pending"
+
+
+def test_restore_repairs_impossible_completed_dependent_behind_approval_gate():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "1", "title": "读取靶标", "status": "done"},
+            {
+                "id": "2", "title": "确认 starBase 参数", "status": "awaiting_approval",
+                "approval": {"id": "starbase_params"}, "depends_on": ["1"],
+            },
+            {
+                "id": "3", "title": "下载 starBase 靶标", "status": "done",
+                "depends_on": ["2"],
+            },
+        ]
+    }
+
+    restored = PlanOrchestrator._prepare_restored_plan(plan)
+
+    gate = restored["steps"][1]
+    assert gate["status"] == "done"
+    assert gate["approval"]["response"] == "recovered_from_completed_dependent"
+    assert "系统恢复" in gate["result"]
+
+
+def test_plain_chinese_affirmation_confirms_an_explicitly_presented_configuration():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认 GEO 预后字段抓取范围",
+            "status": "awaiting_approval",
+            "approval": {
+                "id": "geo-prognosis",
+                "review": {"fields": [{"key": "fetch_scope", "value": "当前 16 个样本"}]},
+            },
+        }]
+    }
+
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以的")
+
+    assert approval_response_is_actionable("可以的") is True
+    assert restored["steps"][0]["status"] == "done"
+    assert restored["steps"][0]["approval"]["response"] == "可以的"
+
+
+def test_downstream_step_cannot_bypass_an_unconfirmed_adapter_gate():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "1", "title": "下载 FASTQ", "status": "done"},
+            {
+                "id": "2",
+                "title": "确认 3' adapter",
+                "status": "awaiting_approval",
+                "approval": {"id": "confirm-adapter-before-trimming"},
+                "depends_on": ["1"],
+            },
+            {
+                "id": "3",
+                "title": "FastQC + MultiQC",
+                "status": "pending",
+                "depends_on": ["2"],
+            },
+        ]
+    }
+
+    assert PlanOrchestrator._next_pending_step(plan) is None
+
+    plan["steps"][1]["status"] = "done"
+    assert PlanOrchestrator._next_pending_step(plan) is plan["steps"][2]
+
+
+def test_adapter_gate_executes_any_user_requested_prerequisite_before_confirmation():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "trim",
+            "title": "确认 adapter",
+            "skill": "fastq-qc",
+            "status": "awaiting_approval",
+            "approval": {"id": "confirm-adapter-before-trimming", "followupRequest": "先找到对应的 GSM 编号"},
+        }]
+    }
+
+    assert _approval_response_requests_followup("你要先找到对应的GSM编号，然后GSM的信息里面有") is True
+    assert _approval_response_requests_followup("我还不确定，先解释这个字段的影响") is True
+    assert PlanOrchestrator._materialize_approval_followup(plan) is True
+    followup = plan["steps"][0]
+    assert followup["status"] == "pending"
+    assert followup["title"] == "响应用户的前置核查请求"
+    assert followup["skill"] == ""
+    assert "先找到对应的 GSM 编号" in followup["goal"]
+    assert "推断用户要先核对的对象、来源和交付内容" in followup["goal"]
+    assert followup["executionContracts"][0]["id"] == "approval-followup-read-only"
+    assert "禁止运行 cutadapt" in followup["goal"]
+    assert plan["steps"][1]["status"] == "awaiting_approval"
+
+    followup["status"] = "done"
+    plan["steps"][1]["approval"]["followupRequest"] = "先核对文献中报告的建库试剂盒"
+    assert PlanOrchestrator._materialize_approval_followup(plan) is True
+    assert plan["steps"][1]["id"] == "trim-clarify-2"
+
+
+def test_resume_discards_corrupted_approval_values_before_execution():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认 adapter",
+            "status": "awaiting_approval",
+            "approval": {
+                "id": "confirm-adapter-before-trimming",
+                "reviewed": {"min_length": "corrupted " * 100},
+            },
+        }]
+    }
+
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="先解释参数")
+
+    assert "min_length" not in restored["steps"][0]["approval"]["reviewed"]
+
+
+def test_non_confirmation_keeps_approval_gate_closed():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "1", "title": "确认 adapter", "status": "awaiting_approval", "approval": {"id": "adapter"}},
+            {"id": "2", "title": "运行 cutadapt", "status": "pending"},
+        ]
+    }
+    restored = PlanOrchestrator._prepare_restored_plan(plan, approval_response="不可以，先解释 adapter 的来源")
+
+    assert restored["steps"][0]["status"] == "awaiting_approval"
+    assert restored["steps"][0]["approval"]["lastResponse"] == "不可以，先解释 adapter 的来源"
+    assert restored["steps"][1]["status"] == "pending"
+    assert approval_response_is_actionable("可以") is True
+    assert approval_response_is_actionable("adapter_3=ACGTACGTACGT") is True
+    assert approval_response_is_actionable("不可以，先解释") is False
+
+
+def test_approval_request_prints_known_values_and_edit_instructions():
+    approved_step = {
+        "id": "1",
+        "title": "核查既有 cutadapt 配置",
+        "status": "done",
+        "result": "Existing adapter_3=TGGAATTCTCGGGTGCCAAGG; 30 FASTQ files found.",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 sRNA-seq 3' adapter",
+        "status": "awaiting_approval",
+        "approval": {
+            "prompt": "需要确认 3' adapter。",
+            "review": {
+                "fields": [
+                    {"label": "3' adapter", "source": "adapter", "unknown": "未记录"},
+                    {"label": "长度范围", "value": "18-40 nt"},
+                ],
+                "edit_hint": "回复 adapter_3=新序列 可更改。",
+            },
+        },
+    }
+    plan = {"steps": [approved_step, gate]}
+
+    message = _build_approval_request(plan, gate, history=[], extra_context="")
+
+    assert "当前已知信息" in message
+    assert "TGGAATTCTCGGGTGCCAAGG" in message
+    assert "18-40 nt" in message
+    assert "adapter_3=新序列" in message
+    assert gate["approval"]["reviewed"]["adapter"] == "TGGAATTCTCGGGTGCCAAGG"
+
+
+def test_group_approval_renders_actual_group_counts_and_control():
+    preflight = {
+        "id": "1",
+        "title": "读取差异分析分组与设计",
+        "status": "done",
+        "result": "GROUP_COLUMN: group\nGROUP_COUNTS: CRC=15, Normal=15\nCONTROL_GROUP: Normal\nDESIGN: unpaired",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认差异分析样本分组",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-groups-before-de",
+            "review": {
+                "fields": [
+                    {"label": "目前分组列", "source": "group_column", "unknown": "未记录"},
+                    {"label": "目前各组样本数", "source": "group_counts", "unknown": "未记录"},
+                    {"label": "拟使用对照组", "source": "control_group", "unknown": "未记录"},
+                    {"label": "统计设计", "source": "analysis_design", "unknown": "未记录"},
+                ]
+            }
+        },
+    }
+    plan = {"analysis": {"design": "unpaired"}, "steps": [preflight, gate]}
+
+    message = _build_approval_request(plan, gate, history=[], extra_context="")
+
+    assert "目前分组列: group" in message
+    assert "目前各组样本数: CRC=15, Normal=15" in message
+    assert "拟使用对照组: Normal" in message
+    assert "统计设计: unpaired" in message
+    assert "摘要：目前分组列为 `group`（CRC=15, Normal=15）；拟使用 `Normal` 作为对照组，统计设计为 `unpaired`。" in message
+
+
+def test_group_approval_reads_legacy_group_summary_from_completed_check():
+    context = 'SAMPLE_COUNT: 30（adata.obs_names: SRR1–SRR30；group: 15 Tumor / 15 Normal）'
+
+    assert _approval_value_from_context("group_column", context, {}) == "group"
+    assert _approval_value_from_context("group_counts", context, {}) == "15 Tumor / 15 Normal"
+
+
+def test_adapter_approval_renders_actual_input_adapter_and_length_values():
+    preflight = {
+        "id": "1",
+        "title": "读取现有 FASTQ 修剪配置",
+        "status": "done",
+        "result": "INPUT_FASTQ: adata.obs['fastq_path']\nSAMPLE_COUNT: 30\nADAPTER_3: TGGAATTCTCGGGTGCCAAGG\nADAPTER_EVIDENCE: 既有 cutadapt 配置\nMIN_LENGTH: 18\nMAX_LENGTH: 40",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 sRNA-seq 3' adapter",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-adapter-before-trimming",
+            "review": {
+                "fields": [
+                    {"label": "输入", "source": "input_fastq", "unknown": "未记录"},
+                    {"label": "样本数", "source": "sample_count", "unknown": "未记录"},
+                    {"label": "adapter", "source": "adapter_3", "unknown": "未记录"},
+                    {"label": "最小长度", "source": "min_length", "unknown": "未记录"},
+                    {"label": "最大长度", "source": "max_length", "unknown": "未记录"},
+                ]
+            },
+        },
+    }
+    plan = {"steps": [preflight, gate]}
+
+    message = _build_approval_request(plan, gate, history=[], extra_context="")
+
+    assert "摘要：对 `adata.obs['fastq_path']` 中的 30 个样本，基于 `既有 cutadapt 配置` 建议使用 3' adapter `TGGAATTCTCGGGTGCCAAGG`，长度过滤为 `18`-40 nt。" in message
+
+
+def test_adapter_approval_requires_evidence_when_no_prior_trim_is_recorded():
+    preflight = {
+        "id": "1",
+        "title": "读取现有 FASTQ 修剪配置",
+        "status": "done",
+        "result": "INPUT_FASTQ: adata.obs['fastq_path']\nSAMPLE_COUNT: 12\nADAPTER_3: 未记录\nMAX_LENGTH: 未记录",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 sRNA-seq 3' adapter",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-adapter-before-trimming",
+            "review": {
+                "fields": [
+                    {"label": "adapter（须有证据）", "source": "adapter_3", "unknown": "未记录，不能据此执行"},
+                    {"label": "adapter 依据", "source": "adapter_evidence", "unknown": "未记录，不能据此执行"},
+                    {"label": "最小长度", "source": "min_length", "value": "18", "unknown": "未记录"},
+                    {"label": "最大长度", "source": "max_length", "value": "36", "unknown": "未记录"},
+                    {"label": "质量阈值", "source": "quality_cutoff", "value": "20", "unknown": "未记录"},
+                    {"label": "错误率", "source": "error_rate", "value": "0.1", "unknown": "未记录"},
+                    {"label": "最小重叠", "source": "min_overlap", "value": "3", "unknown": "未记录"},
+                    {"label": "输出", "source": "output_dir", "value": "trimmed", "unknown": "未记录"},
+                    {"label": "JSON 报告", "source": "json_report", "value": "true", "unknown": "未记录"},
+                ]
+            },
+        },
+    }
+
+    message = _build_approval_request({"steps": [preflight, gate]}, gate, history=[], extra_context="")
+
+    assert "adapter（须有证据）: 未记录，不能据此执行" in message
+    assert "adapter 依据: 未记录，不能据此执行" in message
+    assert "TGGAATTCTCGGGTGCCAAGG" not in message
+    assert "最小长度: 18" in message
+    assert "最大长度: 36" in message
+    assert "质量阈值: 20" in message
+    assert "错误率: 0.1" in message
+    assert "最小重叠: 3" in message
+    assert "输出: trimmed" in message
+    assert "JSON 报告: true" in message
+
+
+def test_adapter_approval_accepts_extended_trim_parameter_overrides():
+    assert approval_response_is_actionable("quality_cutoff=25, error_rate=0.05, trim_n=true") is True
+
+
+def test_unknown_adapter_gate_rejects_bare_approval_but_accepts_explicit_sequence():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认 sRNA-seq 3' adapter",
+            "status": "awaiting_approval",
+            "approval": {
+                "id": "confirm-adapter-before-trimming",
+                "review": {"fields": [
+                    {"source": "adapter_3", "unknown": "未记录"},
+                    {"source": "adapter_evidence", "unknown": "未记录"},
+                ]},
+            },
+        }]
+    }
+
+    waiting = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以")
+    assert waiting["steps"][0]["status"] == "awaiting_approval"
+
+    approved = PlanOrchestrator._prepare_restored_plan(
+        plan,
+        approval_response="adapter_3=AGATCGGAAGAGCACACGTCTGAACTC",
+    )
+    assert approved["steps"][0]["status"] == "done"
+    assert approved["steps"][0]["approval"]["reviewed"] == {
+        "adapter_3": "AGATCGGAAGAGCACACGTCTGAACTC",
+        "adapter_evidence": "用户指定",
+    }
+
+
+def test_nebnext_metadata_produces_a_persisted_adapter_recommendation():
+    preflight = {
+        "id": "1",
+        "title": "读取现有 FASTQ 修剪配置",
+        "status": "done",
+        "result": "INPUT_FASTQ: raw/S1.fastq.gz\nSAMPLE_COUNT: 1\nLIBRARY_KIT: NEBNext Small RNA",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 sRNA-seq 3' adapter",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-adapter-before-trimming",
+            "review": {"fields": [
+                {"label": "试剂盒", "source": "library_kit", "unknown": "未记录"},
+                {"label": "adapter", "source": "adapter_3", "unknown": "未记录"},
+                {"label": "依据", "source": "adapter_evidence", "unknown": "未记录"},
+            ]},
+        },
+    }
+
+    message = _build_approval_request({"steps": [preflight, gate]}, gate, history=[], extra_context="")
+
+    assert "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC" in message
+    assert "建库元数据匹配 NEBNext Small RNA" in message
+    assert gate["approval"]["reviewed"]["adapter_3"] == "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
+    assert gate["approval"]["reviewed"]["adapter_evidence"] == "建库元数据匹配 NEBNext Small RNA"
+
+
+def test_feature_count_gate_recommends_strandedness_from_library_metadata():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    preflight = {
+        "id": "1",
+        "title": "读取 featureCounts 已知配置",
+        "status": "done",
+        "result": "SAMPLE_COUNT: 8\nLIBRARY_KIT: NEBNext Small RNA",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 featureCounts 链特异性",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-strandedness-before-feature-count",
+            "review": {"fields": [
+                {"label": "试剂盒", "source": "library_kit", "unknown": "未记录"},
+                {"label": "链特异性", "source": "strandedness", "unknown": "未记录"},
+                {"label": "依据", "source": "strandedness_evidence", "unknown": "未记录"},
+            ]},
+        },
+    }
+    plan = {"steps": [preflight, gate]}
+
+    message = _build_approval_request(plan, gate, history=[], extra_context="")
+
+    assert "链特异性: reverse" in message
+    assert "建库元数据匹配 NEBNext Small RNA" in message
+    approved = PlanOrchestrator._prepare_restored_plan(plan, approval_response="可以")
+    assert approved["steps"][1]["status"] == "done"
+    assert approved["steps"][1]["approval"]["reviewed"]["strandedness"] == "reverse"
+
+
+def test_adapter_approval_does_not_echo_session_memory_into_config_fields():
+    preflight = {
+        "id": "1",
+        "title": "读取现有 FASTQ 修剪配置",
+        "status": "done",
+        "result": "INPUT_FASTQ: adata.obs['fastq_path']\nSAMPLE_COUNT: 20\nADAPTER_3: TGGAATTCTCGGGTGCCAAGG\nMIN_LENGTH: 18\nMAX_LENGTH: 36",
+    }
+    gate = {
+        "id": "2",
+        "title": "确认 sRNA-seq 3' adapter",
+        "status": "awaiting_approval",
+        "approval": {
+            "id": "confirm-adapter-before-trimming",
+            "reviewed": {"min_length": "stale value"},
+            "review": {
+                "fields": [
+                    {"label": "输入", "source": "input_fastq", "unknown": "未记录"},
+                    {"label": "最小长度", "source": "min_length", "unknown": "未记录"},
+                    {"label": "最大长度", "source": "max_length", "unknown": "未记录"},
+                ]
+            },
+        },
+    }
+    noisy_memory = "MIN_LENGTH: " + ("session-memory-noise " * 1000)
+
+    message = _build_approval_request(
+        {"steps": [preflight, gate]}, gate, history=[], extra_context=noisy_memory,
+    )
+
+    assert "最小长度: 18" in message
+    assert "session-memory-noise" not in message
+    assert gate["approval"]["reviewed"]["min_length"] == "18"
+
+
+def test_confirmed_approval_context_is_bounded_for_legacy_corruption():
+    plan = {
+        "steps": [{
+            "id": "1",
+            "title": "确认 adapter",
+            "status": "done",
+            "approval": {
+                "response": "可以",
+                "reviewed": {"min_length": "legacy-noise " * 1000},
+            },
+        }]
+    }
+
+    rendered = _format_confirmed_approvals(plan)
+
+    assert len(rendered) < 400
+
+
+def test_executor_receives_confirmed_approval_and_user_override_rule():
+    plan = {
+        "steps": [
+            {
+                "id": "1",
+                "title": "确认 3' adapter",
+                "status": "done",
+                "approval": {
+                    "response": "adapter_3=ACGTACGTACGT",
+                    "reviewed": {"adapter": "TGGAATTCTCGGGTGCCAAGG"},
+                },
+            }
+        ]
+    }
+    prompt = _build_executor_system_prompt(
+        "base",
+        step={"title": "运行 cutadapt", "goal": "修剪", "skill": "fastq-qc"},
+        step_index=1,
+        step_total=1,
+        plan_goal="QC",
+        confirmed_approvals=_format_confirmed_approvals(plan),
+    )
+
+    assert "adapter_3=ACGTACGTACGT" in prompt
+    assert "overrides any earlier detected value" in prompt
+
+
+def test_planner_receives_matched_skill_body_as_bound_guidance():
+    from sRNAgent.skill_registry import SkillDefinition, SkillMetadata
+
+    class Registry:
+        skill_metadata = {
+            "isomir-quantification": SkillMetadata(
+                name="isomiR", slug="isomir-quantification", description="isomiR mirtop", path=Path("."),
+            )
+        }
+
+        @staticmethod
+        def load_full_skill(_slug):
+            return SkillDefinition(
+                name="isomiR",
+                slug="isomir-quantification",
+                description="isomiR mirtop",
+                path=Path("."),
+                body="MUST collapse trimmed FASTQ before Bowtie.",
+            )
+
+    guidance = _load_planning_skill_guidance(Registry(), "从 trimmed FASTQ 做 isomiR 定量")
+    prompt = _build_planner_system_prompt("isomir-quantification", guidance)
+
+    assert "MUST collapse trimmed FASTQ before Bowtie" in prompt
+    assert "source of truth" in prompt
+
+
+def test_old_mudata_note_does_not_become_a_current_requirement():
+    analysis = _resolve_analysis_policy("完成 miRNA、tRNA 和片段组学定量", "", [])
+    requirements = _resolve_requirements_policy(
+        "完成 miRNA、tRNA 和片段组学定量",
+        "上一会话要求 MuData 并写出 h5mu",
+        analysis=analysis,
+        deliverables={"html_report_requested": False},
+    )
+    assert requirements["mudata_required"] is False
+    assert requirements["default_unpaired"] is False
+
+
+def test_fragmentomics_plan_drops_unrequested_mudata_packaging_step():
+    steps = [
+        {"id": "1", "title": "运行 fragmentomics 定量", "goal": "生成 FSD/FSC/RCD/EDM/BPM", "skill": "fragment-analysis"},
+        {"id": "2", "title": "封装 MuData 并最终核验交付", "goal": "写出 h5mu", "skill": ""},
+    ]
+    goal, bounded = _apply_modality_boundaries(
+        "完成片段组学定量 → MuData", steps, user_query="完成片段组学定量",
+    )
+
+    assert "MuData" not in goal
+    assert len(bounded) == 1
+    assert bounded[0]["skill"] == "fragment-analysis"
+    assert "fragmentomics AnnData" in bounded[0]["goal"]
+
+
+def test_existing_html_artifact_does_not_request_a_new_report():
+    steps = [
+        {"id": "1", "title": "miRNA 定量", "goal": "运行 miRDeep2", "skill": "mirdeep2-mirna"},
+        {"id": "2", "title": "生成 HTML 报告", "goal": "写 report.html", "skill": ""},
+    ]
+    deliverables = _resolve_deliverables_policy(
+        "基于 trimmed FASTQ 完成 miRNA 定量",
+        "已有产物：multiqc_out/multiqc_report.html",
+        steps,
+    )
+    filtered = _apply_deliverables_policy(steps, deliverables=deliverables)
+
+    assert deliverables["html_report_requested"] is False
+    assert [step["title"] for step in filtered] == ["miRNA 定量"]
+
+
+def test_unrequested_html_report_is_removed_from_plan_goal():
+    goal = _strip_unrequested_html_report(
+        "完成 isomiR 定量与差异分析（limma-voom），并生成 HTML 报告",
+        requested=False,
+    )
+
+    assert "HTML" not in goal
+    assert "isomiR 定量与差异分析" in goal
+
+
+def test_isomir_quantification_is_ordered_before_de_without_feature_count():
+    steps = [
+        {
+            "id": "1",
+            "title": "核查 isomiR 模态前置条件（hairpin BAM / 参考 / 分组）",
+            "goal": "核查 hairpin BAM、参考与分组",
+            "skill": "",
+        },
+        {
+            "id": "2",
+            "title": "isomiR 模态差异分析（unpaired limma-voom）",
+            "goal": "在独立 isomir AnnData 上运行差异分析",
+            "skill": "differential-analysis",
+        },
+        {
+            "id": "3",
+            "title": "用 mirtop 跑 isomiR 定量，独立 isomir_adata",
+            "goal": "运行 mirtop 并持久化独立 isomir AnnData",
+            "skill": "isomir-quantification",
+        },
+    ]
+
+    expanded = _expand_plan_prerequisites(steps, extra_context="")
+    ordered = _order_de_workflow_steps(expanded)
+    titles = [step["title"] for step in ordered]
+
+    assert not any(step.get("skill") == "feature-count" for step in expanded)
+    assert titles.index("用 mirtop 跑 isomiR 定量，独立 isomir_adata") < titles.index(
+        "isomiR 模态差异分析（unpaired limma-voom）"
+    )
+
+
+def test_counts_evidence_is_scoped_to_its_modality():
+    context = "srna_adata_miRNA.h5ad has adata.layers['counts'] for miRNA and tRNA."
+
+    assert _context_has_counts_for_modality(context, "srna") is True
+    assert _context_has_counts_for_modality(context, "fragmentomics") is False
+    assert _context_has_counts_for_modality(context, "isomir") is False
+
+
+def test_fragmentomics_quantification_precedes_its_count_validation_and_de():
+    steps = [
+        {
+            "id": "1",
+            "title": "fragmentomics 差异分析",
+            "goal": "运行 limma-voom 差异分析",
+            "skill": "differential-analysis",
+        },
+        {
+            "id": "2",
+            "title": "fragmentomics 定量",
+            "goal": "提取 FSD/FSC/RCD/EDM/BPM 特征",
+            "skill": "fragment-analysis",
+        },
+    ]
+
+    expanded = _expand_plan_prerequisites(steps, extra_context="")
+    ordered = _order_de_workflow_steps(expanded)
+    titles = [step["title"] for step in ordered]
+
+    assert titles.index("fragmentomics 定量") < titles.index("核查 fragmentomics 定量矩阵")
+    assert titles.index("核查 fragmentomics 定量矩阵") < titles.index("fragmentomics 差异分析")
+
+
+def test_replan_matches_completed_steps_by_identity_not_shifted_id():
+    class Completion:
+        content = '{"goal":"new plan","steps":[{"id":"1","title":"isomiR 定量","goal":"run mirtop","skill":"isomir-quantification"},{"id":"2","title":"miRNA 定量","goal":"run miRDeep2","skill":"mirdeep2-mirna"}]}'
+
+    class FakeAgent:
+        system_prompt = "system"
+
+        def _emit_progress(self, callback, event_type, **payload):
+            return None
+
+        def _llm_complete_cancellable(self, *args, **kwargs):
+            return Completion()
+
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = FakeAgent()
+    orchestrator.skill_overview = ""
+    old_plan = {
+        "goal": "old plan",
+        "version": 1,
+        "steps": [
+            {
+                "id": "1",
+                "title": "miRNA 定量",
+                "goal": "run miRDeep2",
+                "skill": "mirdeep2-mirna",
+                "status": "done",
+                "result": "old completed result",
+            }
+        ],
+    }
+
+    revised = orchestrator._replan(
+        old_plan,
+        user_query="完成 miRNA 和 isomiR 定量",
+        extra_context="",
+    )
+    by_title = {step["title"]: step for step in revised["steps"]}
+
+    assert by_title["miRNA 定量"]["status"] == "done"
+    assert by_title["miRNA 定量"]["result"] == "old completed result"
+    assert by_title["isomiR 定量"]["status"] == "pending"
+
+
+def test_successful_steps_advance_the_persisted_plan_without_replanning():
+    class FakeAgent:
+        system_prompt = "system"
+        skill_registry = None
+
+        def __init__(self):
+            self.events = []
+            self.executed = []
+
+        def _emit_progress(self, callback, event_type, **payload):
+            self.events.append(event_type)
+
+        def _persist_checkpoint(self, payload, chat_id):
+            return None
+
+        def _clear_run_checkpoint(self, chat_id):
+            return None
+
+        def _check_cancelled(self, cancel_event):
+            return None
+
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    agent = FakeAgent()
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = agent
+    orchestrator.chat_id = "chat-evidence-replan"
+    orchestrator._save_plan = lambda chat_id, plan: None
+    orchestrator._load_plan = None
+    orchestrator.max_replan_attempts = 0
+    orchestrator.skill_overview = ""
+    orchestrator._create_plan = lambda *args, **kwargs: {
+        "goal": "检查并完成 miRNA 定量",
+        "steps": [
+            {"id": "1", "title": "核对现有参考", "goal": "inspect reference", "status": "pending"},
+            {"id": "2", "title": "miRNA 定量", "goal": "quantify miRNA", "status": "pending"},
+        ],
+    }
+    orchestrator._execute_step = lambda step, **kwargs: agent.executed.append(step["id"]) or f"步骤 {step['id']} 完成"
+    orchestrator._replan = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("successful steps must not replan")
+    )
+    orchestrator._ensure_user_facing_reply = lambda user_query, text, **kwargs: text
+
+    result = orchestrator.run([{"role": "user", "content": "检查并完成 miRNA 定量"}])
+
+    assert "步骤 2 完成" in result
+    assert agent.executed == ["1", "2"]
+    assert "plan_revised" not in agent.events
+    assert "plan_revising" not in agent.events
+
+
+def test_lifecycle_normalization_keeps_report_after_differential_analysis():
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "report", "title": "生成 HTML 报告", "goal": "report.html", "status": "pending"},
+            {"id": "de", "title": "miRNA 差异分析", "goal": "limma-voom", "skill": "differential-analysis", "status": "pending"},
+        ]
+    }
+
+    PlanOrchestrator._normalize_plan_lifecycle(plan)
+
+    assert [step["id"] for step in plan["steps"]] == ["de", "report"]
+
+
+def test_existing_result_summary_is_read_only_and_skips_new_pipeline():
+    assert _is_read_only_query("总结下片段组学的不同类型特征的数目分布") is True
+    assert _is_read_only_query("重新运行片段组学并总结不同类型特征") is False
+
+
+def test_english_rewrite_html_request_is_a_required_deliverable():
+    query = "Re-style, re-write the HTML, and finalize the fragmentomics artifacts"
+    deliverables = _resolve_deliverables_policy(query, "", [])
+    planned = _apply_deliverables_policy([], deliverables=deliverables)
+
+    assert deliverables["html_report_requested"] is True
+    assert len(planned) == 1
+    assert "HTML" in planned[0]["title"]
+
+
+def test_empty_plan_is_rejected_instead_of_reported_complete():
+    class FakeAgent:
+        system_prompt = "system"
+
+        def __init__(self):
+            self.events = []
+
+        def _emit_progress(self, callback, event_type, **payload):
+            self.events.append(event_type)
+
+        def _persist_checkpoint(self, payload, chat_id):
+            return None
+
+        def _check_cancelled(self, cancel_event):
+            return None
+
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    agent = FakeAgent()
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = agent
+    orchestrator.chat_id = "chat-empty-plan"
+    orchestrator._save_plan = lambda chat_id, plan: None
+    orchestrator._load_plan = None
+    orchestrator.max_replan_attempts = 0
+    orchestrator.skill_overview = ""
+    orchestrator._create_plan = lambda *args, **kwargs: {"goal": "写 HTML", "steps": []}
+
+    try:
+        orchestrator.run([{"role": "user", "content": "重写 HTML 报告"}])
+        raise AssertionError("expected an empty plan error")
+    except ValueError as exc:
+        assert "未生成任何可执行步骤" in str(exc)
+
+    assert "plan_failed" in agent.events
+    assert "plan_complete" not in agent.events
+
+
+def test_step_exception_is_persisted_as_failed_not_left_running():
+    class FakeAgent:
+        system_prompt = "system"
+
+        def __init__(self):
+            self.events = []
+
+        def _emit_progress(self, callback, event_type, **payload):
+            self.events.append(event_type)
+
+        def _persist_checkpoint(self, payload, chat_id):
+            return None
+
+        def _clear_run_checkpoint(self, chat_id):
+            return None
+
+        def _check_cancelled(self, cancel_event):
+            return None
+
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    agent = FakeAgent()
+    saved = []
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = agent
+    orchestrator.chat_id = "chat-step-error"
+    orchestrator._save_plan = lambda chat_id, plan: saved.append(plan)
+    orchestrator._load_plan = None
+    orchestrator.max_replan_attempts = 0
+    orchestrator.skill_overview = ""
+    orchestrator._create_plan = lambda *args, **kwargs: {
+        "goal": "重写 HTML",
+        "steps": [{"id": "1", "title": "写报告", "goal": "写 report.html", "status": "pending"}],
+    }
+    orchestrator._execute_step = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("writer crashed")
+    )
+    orchestrator._ensure_user_facing_reply = lambda user_query, text, **kwargs: text
+
+    result = orchestrator.run([{"role": "user", "content": "重写 HTML 报告"}])
+
+    assert "任务未完成" in result
+    assert saved[-1]["steps"][0]["status"] == "failed"
+    assert "plan_incomplete" in agent.events
+    assert "plan_complete" not in agent.events
+
+
+def test_read_only_summary_bypasses_planner():
+    class FakeAgent:
+        system_prompt = "system"
+
+        def __init__(self):
+            self.events = []
+
+        def _emit_progress(self, callback, event_type, **payload):
+            self.events.append(event_type)
+            if callback:
+                callback({"type": event_type, **payload})
+
+        def run_with_history(self, history, **kwargs):
+            return "已有结果"
+
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    agent = FakeAgent()
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = agent
+    orchestrator.chat_id = ""
+    result = orchestrator.run([
+        {"role": "user", "content": "总结下片段组学的不同类型特征的数目分布"},
+    ])
+
+    assert result == "已有结果"
+    assert "plan_created" not in agent.events
+
+
+def test_resume_uses_persisted_plan_when_checkpoint_was_lost():
+    """A crash must not turn a bare "continue" into a fresh one-step plan."""
+    class FakeAgent:
+        system_prompt = "system"
+
+        def __init__(self):
+            self.events = []
+            self.executed_steps = []
+
+        def _emit_progress(self, callback, event_type, **payload):
+            self.events.append(event_type)
+            if callback:
+                callback({"type": event_type, **payload})
+
+        def _load_run_checkpoint(self, chat_id):
+            return None
+
+        def _persist_checkpoint(self, payload, chat_id):
+            return None
+
+        def _clear_run_checkpoint(self, chat_id):
+            return None
+
+        def _check_cancelled(self, cancel_event):
+            return None
+
+        def _tool_loop(self, messages, **kwargs):
+            self.executed_steps.append(messages[-1]["content"])
+            return "HTML report written"
+
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    stored_plan = {
+        "goal": "对 fragmentomics 做差异分析并生成 HTML 报告",
+        "analysis": {"design": "unpaired", "modalities": ["fragmentomics"]},
+        "deliverables": {"html_report_requested": True, "has_report_step": True},
+        "requirements": {"html_report_requested": True},
+        "steps": [
+            {
+                "id": "1",
+                "title": "fragmentomics 差异分析（limma-voom）",
+                "goal": "运行 unpaired limma-voom",
+                "skill": "differential-analysis",
+                "status": "done",
+                "result": "DE 已完成",
+            },
+            {
+                "id": "2",
+                "title": "汇总差异结果并生成 HTML 报告",
+                "goal": "写出 fragmentomics_DE_report.html",
+                "skill": "",
+                "status": "running",
+                "result": "",
+            },
+        ],
+    }
+    saved = []
+    agent = FakeAgent()
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = agent
+    orchestrator.chat_id = "chat-resume"
+    orchestrator._save_plan = lambda chat_id, plan: saved.append(plan)
+    orchestrator._load_plan = lambda chat_id: stored_plan
+    orchestrator.max_replan_attempts = 0
+    orchestrator.skill_overview = ""
+    orchestrator._create_plan = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("resume must not create a new plan")
+    )
+
+    result = orchestrator.run(
+        [{"role": "user", "content": "继续"}],
+        resume=True,
+    )
+
+    assert result.startswith("HTML report written")
+    assert "plan_restored" in agent.events
+    assert len(agent.executed_steps) == 1
+    assert "fragmentomics_DE_report.html" in agent.executed_steps[0]
+    assert saved[-1]["steps"][0]["status"] == "done"
+    assert saved[-1]["steps"][1]["status"] == "done"
+
+
+def test_fragment_analysis_plan_expands_missing_prerequisites():
+    steps = [
+        {
+            "id": "1",
+            "title": "做片段组学分析",
+            "goal": "运行 fragment-analysis 提取片段特征",
+            "skill": "fragment-analysis",
+            "status": "pending",
+            "result": "",
+        }
+    ]
+    context = """
+    ### 已知产物路径
+    - srna_fastq/SRR100.fastq.gz
+    """
+
+    expanded = _expand_plan_prerequisites(steps, extra_context=context)
+
+    assert [step["skill"] for step in expanded] == [
+        "fastq-qc",
+        "alignment-srna",
+        "reference-download",
+        "fragment-analysis",
+    ]
+    assert expanded[-1]["title"] == "做片段组学分析"
+
+
+def test_fragment_analysis_plan_skips_known_completed_inputs():
+    steps = [
+        {
+            "id": "1",
+            "title": "做片段组学分析",
+            "goal": "运行 fragment-analysis 提取片段特征",
+            "skill": "fragment-analysis",
+            "status": "pending",
+            "result": "",
+        }
+    ]
+    context = """
+    ### 已知产物路径
+    - trimmed/SRR100.trimmed.fastq.gz
+    - aligned/SRR100.sorted.bam
+    - ref/GRCh38.primary_assembly.genome.fa
+    ### 已完成步骤
+    - 已完成 fastq 质控
+    - 已完成比对
+    """
+
+    expanded = _expand_plan_prerequisites(steps, extra_context=context)
+
+    assert len(expanded) == 1
+    assert expanded[0]["skill"] == "fragment-analysis"
+
+
+def test_fragment_analysis_plan_preserves_non_fragment_steps():
+    steps = [
+        {
+            "id": "1",
+            "title": "检查结果",
+            "goal": "查看已有结果",
+            "skill": "",
+            "status": "pending",
+            "result": "",
+        },
+        {
+            "id": "2",
+            "title": "做片段组学分析",
+            "goal": "运行 fragment-analysis 提取片段特征",
+            "skill": "fragment-analysis",
+            "status": "pending",
+            "result": "",
+        },
+    ]
+
+    expanded = _expand_plan_prerequisites(steps, extra_context="")
+
+    assert expanded[0]["title"] == "检查结果"
+    assert expanded[-1]["skill"] == "fragment-analysis"
+
+
+def test_feature_count_plan_expands_alignment_prerequisites():
+    steps = [
+        {
+            "id": "1",
+            "title": "对已知特征做计数",
+            "goal": "运行 feature-count 生成表达矩阵",
+            "skill": "feature-count",
+            "status": "pending",
+            "result": "",
+        }
+    ]
+    context = """
+    ### 已知产物路径
+    - srna_fastq/SRR100.fastq.gz
+    """
+
+    expanded = _expand_plan_prerequisites(steps, extra_context=context)
+
+    assert [step["skill"] for step in expanded] == [
+        "fastq-qc",
+        "reference-download",
+        "alignment-srna",
+        "feature-count",
+    ]
+
+
+def test_differential_analysis_plan_expands_counts_and_group_confirmation():
+    steps = [
+        {
+            "id": "1",
+            "title": "做差异分析",
+            "goal": "运行 differential-analysis 得到 DE 结果",
+            "skill": "differential-analysis",
+            "status": "pending",
+            "result": "",
+        }
+    ]
+    context = """
+    ### 已知产物路径
+    - trimmed/SRR100.trimmed.fastq.gz
+    - aligned/SRR100.sorted.bam
+    """
+
+    expanded = _expand_plan_prerequisites(steps, extra_context=context)
+
+    # The typed differential workflow owns its evidence preflight and approval
+    # gate, so prerequisite expansion must not add an untyped duplicate.
+    assert [step["skill"] for step in expanded] == ["", "differential-analysis"]
+    assert expanded[0]["title"] == "核查现有 raw counts 矩阵"
+
+
+def test_mirna_de_uses_mirdeep2_provider_instead_of_feature_count():
+    steps = [{
+        "id": "1",
+        "title": "miRNA 差异分析",
+        "goal": "对 miRNA 运行 limma-voom",
+        "skill": "differential-analysis",
+    }]
+
+    expanded = _expand_plan_prerequisites(steps, extra_context="")
+
+    assert [step["skill"] for step in expanded] == [
+        "mirdeep2-mirna",
+        "differential-analysis",
+    ]
+    assert not any(step["skill"] == "feature-count" for step in expanded)
+
+
+def test_feature_count_selection_requires_affirmative_method_request():
+    assert _user_explicitly_requests_feature_count("使用 featureCounts 做基因计数") is True
+    assert _user_explicitly_requests_feature_count("miRNA 和 isomiR 默认不用 featureCounts") is False
+    assert _user_explicitly_requests_feature_count("featureCounts 不适用于 miRNA") is False
+
+
+def test_isomir_scope_removes_hallucinated_feature_count_steps():
+    steps = [
+        {"id": "1", "title": "isomiR 定量", "goal": "mirtop counts", "skill": "isomir-quantification"},
+        {"id": "2", "title": "生成小 RNA 定量矩阵", "goal": "featureCounts", "skill": "feature-count", "autoInserted": True},
+        {"id": "3", "title": "isomiR 差异分析", "goal": "limma-voom", "skill": "differential-analysis"},
+    ]
+
+    _goal, bounded = _enforce_requested_scope(
+        "isomiR 分析",
+        steps,
+        scope={"requested_assays": ["isomir"], "requested_modalities": ["isomir"], "restricted": True},
+        fallback_goal="基于现有文件完成 isomiR 定量及差异分析",
+    )
+
+    assert not any(step["skill"] == "feature-count" for step in bounded)
+
+
+def test_differential_analysis_defaults_to_unpaired_when_user_unspecified():
+    steps = [
+        {
+            "id": "1",
+            "title": "做差异分析",
+            "goal": "运行 differential-analysis 得到 DE 结果",
+            "skill": "differential-analysis",
+            "status": "pending",
+            "result": "",
+        }
+    ]
+    analysis = _resolve_analysis_policy("做 miRNA 差异分析", "", steps)
+    filtered = _apply_analysis_policy(steps, analysis=analysis)
+
+    assert analysis["design"] == "unpaired"
+    assert filtered[0]["goal"]
+    assert "unpaired" in filtered[0]["goal"].lower() or "非配对" in filtered[0]["goal"]
+
+
+def test_differential_analysis_drops_conflicting_paired_step_when_unpaired_confirmed():
+    steps = [
+        {
+            "id": "1",
+            "title": "做 miRNA 配对差异分析",
+            "goal": "对 miRNA 做 paired differential-analysis，并使用 patient blocking",
+            "skill": "differential-analysis",
+            "status": "pending",
+            "result": "",
+        },
+        {
+            "id": "2",
+            "title": "做 miRNA 非配对差异分析",
+            "goal": "对 miRNA 做 unpaired differential-analysis",
+            "skill": "differential-analysis",
+            "status": "pending",
+            "result": "",
+        },
+    ]
+    analysis = _resolve_analysis_policy("做非配对差异分析", "", steps)
+    filtered = _apply_analysis_policy(steps, analysis=analysis)
+
+    assert len(filtered) == 1
+    assert "非配对" in filtered[0]["title"] or "unpaired" in filtered[0]["title"].lower()
+    assert "patient blocking" not in filtered[0]["goal"].lower()
+
+
+def test_differential_analysis_requires_confirmation_when_paired_infeasible():
+    steps = [
+        {
+            "id": "1",
+            "title": "做 miRNA 配对差异分析",
+            "goal": "运行 paired differential-analysis",
+            "skill": "differential-analysis",
+            "status": "pending",
+            "result": "",
+        }
+    ]
+    context = "paired_feasible=false"
+    analysis = _resolve_analysis_policy("做配对差异分析", context, steps)
+    filtered = _apply_analysis_policy(steps, analysis=analysis)
+
+    assert analysis["design"] == "needs_confirmation"
+    assert filtered[0]["id"] == "analysis-confirmation"
+    assert "paired" in filtered[0]["goal"]
+
+
+def test_html_report_request_appends_report_step_when_missing():
+    steps = [
+        {
+            "id": "1",
+            "title": "过滤低表达特征并跑 limma-voom DE",
+            "goal": "完成 fragmentomics 差异分析",
+            "skill": "differential-analysis",
+            "status": "pending",
+            "result": "",
+        }
+    ]
+    deliverables = _resolve_deliverables_policy(
+        "在两组间做片段组学差异分析并生成 HTML 报告",
+        "",
+        steps,
+    )
+    filtered = _apply_deliverables_policy(steps, deliverables=deliverables)
+
+    assert deliverables["html_report_requested"] is True
+    assert filtered[-1]["title"] == "汇总差异结果并生成 HTML 报告"
+    assert "report.html" in filtered[-1]["goal"] or ".html" in filtered[-1]["goal"]
+
+
+def test_requirements_policy_keeps_high_priority_user_requirements():
+    analysis = {
+        "design": "unpaired",
+    }
+    deliverables = {
+        "html_report_requested": True,
+    }
+    requirements = _resolve_requirements_policy(
+        "如果已经有小RNA定量，片段组学要放在MuData下面，并且最后生成HTML报告",
+        "片段组学需要 whole-genome BAM",
+        analysis=analysis,
+        deliverables=deliverables,
+    )
+
+    assert requirements["default_unpaired"] is True
+    assert requirements["html_report_requested"] is True
+    assert requirements["mudata_required"] is True
+    assert requirements["whole_genome_bam_required"] is True
+    items = requirements["items"]
+    assert any("MuData" in item or "mudata" in item.lower() for item in items)
+    assert any("HTML" in item or ".html" in item for item in items)

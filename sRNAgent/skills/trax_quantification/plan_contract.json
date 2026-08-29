@@ -1,0 +1,19 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "trim-raw-fastq-before-trax",
+      "kind": "stage",
+      "activation": {"requires": ["raw_fastq"], "missing": ["trimmed_fastq"]},
+      "placement": {"before_skills": ["trax_quantification"]},
+      "step": {
+        "title": "完成 tRAX 前的 FASTQ 质控与修剪",
+        "goal": "先运行 sa.fastq.cutadapt，生成 clean_fastq_path / trimmed_path；确认 adapter 与长度过滤后，再将 clean FASTQ 交给 tRAX。",
+        "skill": "fastq-qc",
+        "inputs": ["trim_config_confirmed"],
+        "outputs": ["trimmed_fastq"]
+      }
+    }
+  ]
+}

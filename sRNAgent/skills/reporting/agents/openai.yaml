@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analysis Reporting"
+  short_description: "Build traceable AnnData HTML reports"
+  default_prompt: "Use $reporting to assemble a traceable HTML analysis report from existing AnnData results and plots."

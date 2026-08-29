@@ -1,0 +1,2020 @@
+"""sRNAgent — tool-loop agent wired to function + skill registries."""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+
+from .agent_config import ExecutionConfig, SandboxFallbackPolicy
+from .bootstrap import initialize_agent_runtime, initialize_registries
+from .checkpoint import clear_checkpoint, load_checkpoint, save_checkpoint
+from .context import (
+    bounded_tool_result,
+    compact_messages,
+    messages_tokens,
+    normalize_text_payload,
+    should_compact,
+)
+from .execution import ExecutionBackend, initialize_execution_backend
+from .llm_client import ChatClient, LLMConfig
+from .plan_orchestrator import PlanOrchestrator
+from .task_supervisor import TaskProgressSupervisor
+from .tools import (
+    AGENT_TOOL_SCHEMAS,
+    execute_code,
+    list_available_skills,
+    manage_visualization,
+    search_functions,
+    search_skills,
+)
+
+logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[Dict[str, Any]], None]
+CodeApprovalCallback = Callable[[str, str, str], bool]
+StreamCallback = Callable[[str, str], None]
+
+_CODE_PROGRESS_INTERVALS = (1, 1, 1, 1, 1, 1, 1, 1)
+_SSE_PROGRESS_HEARTBEAT_SEC = 3
+_PROGRESS_MARKER = "__SRNAGENT_DL__"
+_ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+# A malformed CSI sequence must contain at least one parameter. The previous
+# optional quantifier also matched ordinary log prefixes such as "[fragomics]"
+# and removed their first two characters.
+_BROKEN_ESCAPE_RE = re.compile(r"\[(?:\[[0-9;]*[A-Za-z]|[0-9;]+[A-Za-z])")
+_OSC_HYPERLINK_RE = re.compile(r"\]8;[^;\n]*;[^\n\\]*\\?")
+_ACCESSION_RE = re.compile(r"\b(SRR|ERR|DRR|SRS|SRP|ERP|DRP|GSE|GSM)\d+\b")
+_RUN_ID_RE = re.compile(r"\b(SRR|ERR|DRR)\d+\b")
+_SIZE_RE = re.compile(
+    r"\b(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)\b|\b(\d+)\s*/\s*(\d+)\b|(\d+(?:\.\d+)?%)",
+    re.IGNORECASE,
+)
+_DOWNLOAD_CMD_RE = re.compile(r"\b(curl|wget|urllib|requests\.get|fastq[\-_]?dl)\b", re.IGNORECASE)
+_CURL_OUT_RE = re.compile(r"""[-]o\s+['"]?([^\s'"]+)['"]?""", re.IGNORECASE)
+_OUT_PATH_RE = re.compile(r"\bOut:\s*(\S+)", re.IGNORECASE)
+_ELAPSED_REPLY_RE = re.compile(r"(?:\n\s*)*⏱️?\s*本次回答耗时[^\n]*", re.IGNORECASE)
+_FILE_PATH_RE = re.compile(
+    r"[\w./-]+\.(?:fastq(?:\.gz)?|fa(?:\.gz)?|fasta(?:\.gz)?|gtf(?:\.gz)?|sra|bam|fq(?:\.gz)?)",
+    re.IGNORECASE,
+)
+_SIZE_BYTES_RE = re.compile(r"size:\s*(\d+)\s*bytes", re.IGNORECASE)
+_DOWNLOAD_LOG_RE = re.compile(r"\[download\]\s+(\S+)(?:\s+\(([^)]+)\))?", re.IGNORECASE)
+_REFERENCE_DL_RE = re.compile(
+    r"download_(?:genome|gtf|ncrna)|reference\.download|resumable_download",
+    re.IGNORECASE,
+)
+_OUTDIR_RE = re.compile(r"""output_dir\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+_SAMPLE_PROGRESS_RE = re.compile(r"\bprogress:\s*\d+\s*/\s*\d+", re.IGNORECASE)
+_INTERNAL_REPORT_RE = re.compile(
+    r"已向用户|已向用户发送|已向.*发送|等待.{0,8}下一步|等待用户|"
+    r"task completed|step (is )?done|waiting for (the )?user|"
+    r"回复用户|向用户回复|发送问候",
+    re.I,
+)
+_ANALYSIS_DESIGN_RE = re.compile(r"analysis\.design\s*=\s*([a-z_]+)", re.I)
+_ANALYSIS_PAIRED_FEASIBLE_RE = re.compile(r"analysis\.paired_feasible\s*=\s*(true|false|none|null)", re.I)
+_HTML_REPORT_REQUESTED_RE = re.compile(r"deliverables\.html_report_requested\s*=\s*(true|false)", re.I)
+_REQUIREMENTS_FLAG_RE = re.compile(
+    r"requirements\.(default_unpaired|html_report_requested|mudata_required|whole_genome_bam_required)\s*=\s*(true|false)",
+    re.I,
+)
+_REQUIREMENT_ITEM_RE = re.compile(r"^-\s*requirement:\s*(.+)$", re.M)
+_DE_CODE_RE = re.compile(r"sa\.diff\.de_analysis|de_analysis\(|limma|differential", re.I)
+_PAIRED_CODE_RE = re.compile(r"(?<!un)\bpaired\b|(?<!非)配对", re.I)
+_PATIENT_BLOCKING_CODE_RE = re.compile(
+    r"patient[_\s-]*blocking|patient[_\s-]*block|donor[_\s-]*block|"
+    r"group\s*\+\s*patient(?:_id)?|patient_id",
+    re.I,
+)
+_CURRENT_STEP_TITLE_RE = re.compile(r"Title:\s*(.+)")
+_CURRENT_STEP_GOAL_RE = re.compile(r"Goal:\s*(.+)")
+_REPORT_STEP_RE = re.compile(r"html\s*报告|html report|report\.html|生成.*html|报告", re.I)
+_HTML_OUTPUT_RE = re.compile(r"\.html\b|write_html\(|<html", re.I)
+_FRAGOMICS_CODE_RE = re.compile(r"sa\.fragment\.fragomics\(", re.I)
+_FRAG_RESULT_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*.*sa\.fragment\.fragomics\(", re.M)
+_FOREIGN_WORKSPACE_RE = re.compile(r"/(?:prodapp-output|webapp-tasks)(?:/|\b)", re.I)
+_WRITE_OPEN_RE = re.compile(r"\bopen\(\s*[\"'][^\"']+[\"']\s*,\s*[\"'][wax+]+", re.I)
+_PID_LIVENESS_LOOP_RE = re.compile(
+    r"while\s+(?:True|1)\s*:.*?os\.kill\s*\([^\n]+,\s*0\)",
+    re.I | re.S,
+)
+
+
+class AgentCancelledError(Exception):
+    """Raised when the agent run is cancelled by the user."""
+
+
+def _summarize_tool_call(name: str, arguments: Dict[str, Any]) -> str:
+    if name == "search_functions":
+        return f"search_functions({arguments.get('query', '')!r})"
+    if name == "search_skills":
+        return f"search_skills({arguments.get('query', '')!r})"
+    if name == "manage_visualization":
+        action = arguments.get("action", "")
+        paths = arguments.get("paths") or []
+        preview = ", ".join(str(item) for item in paths[:3])
+        more = "…" if len(paths) > 3 else ""
+        return f"manage_visualization({action!r}, paths=[{preview}{more}])"
+    if name == "execute_code":
+        desc = str(arguments.get("description") or "").strip()
+        code = str(arguments.get("code") or "").strip()
+        if desc:
+            return f"execute_code — {desc}"
+        preview = code.split("\n", 1)[0][:80]
+        return f"execute_code — {preview}{'…' if len(code) > 80 else ''}"
+    if name == "finish":
+        msg = normalize_text_payload(arguments.get("message"))
+        preview = msg[:120] + ("…" if len(msg) > 120 else "")
+        return f"finish — {preview}"
+    return name
+
+
+def _truncate_result(text: str, limit: int = 600) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _extract_analysis_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    safe_messages = (item for item in messages if isinstance(item, dict))
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in safe_messages
+        if item.get("content")
+    )
+    design_match = _ANALYSIS_DESIGN_RE.search(text)
+    feasible_match = _ANALYSIS_PAIRED_FEASIBLE_RE.search(text)
+    design = str(design_match.group(1) if design_match else "").strip().lower()
+    feasible_text = str(feasible_match.group(1) if feasible_match else "").strip().lower()
+    paired_feasible: Optional[bool] = None
+    if feasible_text == "true":
+        paired_feasible = True
+    elif feasible_text == "false":
+        paired_feasible = False
+    return {
+        "design": design,
+        "paired_feasible": paired_feasible,
+    }
+
+
+def _extract_deliverables_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    safe_messages = (item for item in messages if isinstance(item, dict))
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in safe_messages
+        if item.get("content")
+    )
+    html_match = _HTML_REPORT_REQUESTED_RE.search(text)
+    html_requested = str(html_match.group(1) if html_match else "").strip().lower() == "true"
+    return {
+        "html_report_requested": html_requested,
+    }
+
+
+def _extract_requirements_policy(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    safe_messages = (item for item in messages if isinstance(item, dict))
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in safe_messages
+        if item.get("content")
+    )
+    flags: Dict[str, Any] = {"items": []}
+    for key, value in _REQUIREMENTS_FLAG_RE.findall(text):
+        flags[str(key).strip()] = str(value).strip().lower() == "true"
+    items = [str(item).strip() for item in _REQUIREMENT_ITEM_RE.findall(text) if str(item).strip()]
+    if items:
+        flags["items"] = items[:10]
+    return flags
+
+
+def _extract_current_subtask(messages: List[Dict[str, Any]]) -> Dict[str, str]:
+    safe_messages = (item for item in messages if isinstance(item, dict))
+    text = "\n".join(
+        str(item.get("content") or "")
+        for item in safe_messages
+        if item.get("content")
+    )
+    title_matches = _CURRENT_STEP_TITLE_RE.findall(text)
+    goal_matches = _CURRENT_STEP_GOAL_RE.findall(text)
+    title = str(title_matches[-1] if title_matches else "").strip()
+    goal = str(goal_matches[-1] if goal_matches else "").strip()
+    return {"title": title, "goal": goal}
+
+
+def _audit_execute_code_policy(
+    messages: List[Dict[str, Any]],
+    arguments: Dict[str, Any],
+) -> str:
+    policy = _extract_analysis_policy(messages)
+    deliverables = _extract_deliverables_policy(messages)
+    requirements = _extract_requirements_policy(messages)
+    subtask = _extract_current_subtask(messages)
+    design = str(policy.get("design") or "").strip().lower()
+    paired_feasible = policy.get("paired_feasible")
+    code = str(arguments.get("code") or "")
+    description = str(arguments.get("description") or "")
+    combined = f"{description}\n{code}"
+    if _FOREIGN_WORKSPACE_RE.search(code):
+        return (
+            "POLICY_VIOLATION: 代码引用了不属于当前执行环境的 /prodapp-output 或 /webapp-tasks 路径。"
+            "请使用当前工作区中的相对路径，或先用 Path.cwd() 解析实际工作目录；不得猜测前端容器路径。"
+        )
+    if _WRITE_OPEN_RE.search(code) and ".parent.mkdir(" not in code and "os.makedirs(" not in code:
+        return (
+            "POLICY_VIOLATION: 写文件前必须先创建目标父目录。请用 "
+            "Path(output_path).parent.mkdir(parents=True, exist_ok=True)，再打开文件写入。"
+        )
+    if _PID_LIVENESS_LOOP_RE.search(code):
+        return (
+            "POLICY_VIOLATION: 禁止用 `while ... os.kill(pid, 0)` 监控后台进程。"
+            "子进程退出后可能保持 zombie 状态，导致该循环无限等待。请使用注册的 sa 工具"
+            "（它会等待并流式输出）；若必须保留同一 Popen 对象，使用 `proc.wait()` 或 `proc.poll()`，"
+            "并在完成后验证所需输出文件。"
+        )
+    is_de_code = bool(_DE_CODE_RE.search(combined))
+    report_requested = bool(deliverables.get("html_report_requested"))
+    if requirements.get("html_report_requested") is not None:
+        report_requested = report_requested or bool(requirements.get("html_report_requested"))
+    current_step_text = " ".join([subtask.get("title") or "", subtask.get("goal") or "", description])
+    if report_requested and _REPORT_STEP_RE.search(current_step_text) and not _HTML_OUTPUT_RE.search(combined):
+        return (
+            "POLICY_VIOLATION: 当前任务明确要求生成真实 HTML 报告，但代码没有写出任何 .html 产物。\n"
+            "请生成真实的 HTML 文件（如 report.html），并输出/登记该文件路径；"
+            "不要只返回纯文本总结或仅依赖 session run_report。"
+        )
+
+    if _FRAGOMICS_CODE_RE.search(code):
+        assign_match = _FRAG_RESULT_ASSIGN_RE.search(code)
+        if not assign_match:
+            return (
+                "POLICY_VIOLATION: 调用 sa.fragment.fragomics(...) 时必须接收返回值，"
+                "并将独立的 fragmentomics AnnData 保存为 .h5ad。"
+            )
+
+    if not is_de_code:
+        return ""
+
+    if design == "needs_confirmation":
+        return (
+            "POLICY_VIOLATION: 当前差异分析设计仍需用户确认，禁止直接执行 DE 代码。\n"
+            "原因：用户请求的设计与数据可行性冲突（如 paired 不可行）。\n"
+            "请先向用户确认是否改为 unpaired，或要求用户提供真实配对信息；"
+            "不要执行 sa.diff.de_analysis(...)。"
+        )
+
+    uses_paired = bool(_PAIRED_CODE_RE.search(combined) or _PATIENT_BLOCKING_CODE_RE.search(combined))
+    default_unpaired = bool(requirements.get("default_unpaired"))
+    if (design == "unpaired" or default_unpaired) and uses_paired:
+        return (
+            "POLICY_VIOLATION: 当前结构化意图要求 unpaired，但代码仍包含 paired / patient blocking 设计。\n"
+            "请重写为非配对差异分析：\n"
+            "- 不要使用 paired / 配对\n"
+            "- 不要使用 patient blocking / donor blocking / patient_id\n"
+            "- 不要使用 group + patient_id 设计矩阵\n"
+            "- 默认按 unpaired 重新生成 sa.diff.de_analysis(...) 代码"
+        )
+    if paired_feasible is False and uses_paired:
+        return (
+            "POLICY_VIOLATION: 当前上下文明确显示 paired 不可行，但代码仍在尝试 paired / patient blocking。\n"
+            "请停止 paired 路线，并改为 unpaired；若必须 paired，先向用户确认并要求提供真实配对关系。"
+        )
+    return ""
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total} 秒"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes} 分 {secs} 秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} 小时 {minutes} 分"
+
+
+def _strip_terminal_noise(text: str) -> str:
+    cleaned = (text or "").replace("\r", "\n")
+    cleaned = _OSC_HYPERLINK_RE.sub("", cleaned)
+    cleaned = _ANSI_ESCAPE_RE.sub("", cleaned)
+    cleaned = _BROKEN_ESCAPE_RE.sub("", cleaned)
+    cleaned = cleaned.replace("\x07", "").replace("\x1b", "")
+    cleaned = re.sub(r"\\+/", " ", cleaned)
+    cleaned = re.sub(r"\b(INFO|WARNING|ERROR|DEBUG)\b", r"\n\1", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _shorten_paths(text: str) -> str:
+    return re.sub(
+        r"(?<![\w./-])/(?:[^/\s]+/){2,}([^/\s]+(?:\.[A-Za-z0-9]+)?)",
+        r".../\1",
+        text,
+    )
+
+
+def _clean_log_line(line: str) -> str:
+    line = _shorten_paths(line.strip())
+    line = re.sub(r"^(INFO|WARNING|ERROR|DEBUG)\s+", "", line, flags=re.IGNORECASE)
+    line = re.sub(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]?\d*\s*", "", line)
+    line = re.sub(r"[./\\]+$", "", line)
+    line = re.sub(r"\.{3,}$", "", line)
+    return line.strip(" -•|")
+
+
+def _line_quality(line: str) -> float:
+    if not line:
+        return 0.0
+    printable = sum(1 for ch in line if ch.isprintable() or ch.isspace())
+    return printable / max(len(line), 1)
+
+
+_TQDM_BAR_RE = re.compile(r"\d+%\|[\s█▏▎▍▌▋▊▉]+\|")
+
+
+def _is_download_progress_line(line: str) -> bool:
+    if _PROGRESS_MARKER in line:
+        return True
+    if _TQDM_BAR_RE.search(line):
+        return True
+    lowered = line.lower()
+    if "overallpct" in lowered and "bytestotal" in lowered:
+        return True
+    if re.search(r"\[\d{2}:\d{2}<\d{2}:\d{2},\s*\d+[kMG]?B/s\]", line):
+        return True
+    return False
+
+
+def _is_noise_line(line: str) -> bool:
+    if _is_download_progress_line(line):
+        return True
+    if not line or len(line) < 2:
+        return True
+    if _line_quality(line) < 0.85:
+        return True
+    lowered = line.lower()
+    if "site-packages" in lowered and ".py" in lowered:
+        return True
+    if lowered.startswith("file ") and lowered.endswith(".py"):
+        return True
+    if len(line) > 180 and not _ACCESSION_RE.search(line) and not _SIZE_RE.search(line):
+        return True
+    return False
+
+
+def _infer_progress_stage(lines: List[str]) -> str:
+    for line in reversed(lines):
+        match = _ACCESSION_RE.search(line)
+        if match and re.search(r"work|download|fetch|process|run|sample", line, re.IGNORECASE):
+            return f"正在处理 {match.group(0)}"
+        if match and re.search(r"complete|done|finish|success", line, re.IGNORECASE):
+            return f"已完成 {match.group(0)}"
+    for line in reversed(lines):
+        match = _ACCESSION_RE.search(line)
+        if match:
+            return f"正在处理 {match.group(0)}"
+    if lines:
+        return "任务进行中"
+    return "等待输出"
+
+
+def _progress_summary(parsed: Dict[str, Any], fallback: str) -> str:
+    stage = str(parsed.get("stage") or "").strip()
+    progress_label = str(parsed.get("progressLabel") or "").strip()
+    highlights = parsed.get("highlights") or []
+    text = "\n".join(
+        [
+            stage,
+            progress_label,
+            *[str(item).strip() for item in highlights if str(item).strip()],
+        ]
+    )
+    lower = text.lower()
+    if ("pirna" in lower) and any(token in lower for token in ("quant", "count")):
+        return "execute_code — 当前任务：piRNA 定量"
+    if ("mirdeep2" in lower or "mirdeep" in lower) or (
+        "mirna" in lower and any(token in lower for token in ("quant", "count", "novel"))
+    ):
+        return "execute_code — 当前任务：miRNA 定量 / miRDeep2"
+    if ("trax" in lower or "trna" in lower) and any(token in lower for token in ("quant", "count")):
+        return "execute_code — 当前任务：tRNA 定量"
+    if any(token in lower for token in ("bowtie", "align", "alignment")):
+        return "execute_code — 当前任务：序列比对"
+    # seqcluster consumes trimmed FASTQ, so its descriptions often contain
+    # "trim". Classify the active operation before the generic trim fallback.
+    if any(token in lower for token in ("seqcluster", "collapse", "序列折叠", "去重")):
+        return "execute_code — 当前任务：序列折叠 / 去重"
+    if any(token in lower for token in ("cutadapt", "trim")):
+        return "execute_code — 当前任务：接头修剪"
+    if any(token in lower for token in ("fastqc", "multiqc", " qc ")):
+        return "execute_code — 当前任务：质控"
+    if "download" in lower:
+        return "execute_code — 当前任务：下载数据"
+    if stage:
+        return f"execute_code — {stage}"
+    if progress_label:
+        return f"execute_code — {progress_label}"
+    return fallback
+
+
+def _parse_download_progress_marker(text: str) -> Dict[str, Any]:
+    if _PROGRESS_MARKER not in text:
+        return {}
+    for raw in reversed(text.splitlines()):
+        line = raw.strip()
+        if _PROGRESS_MARKER not in line:
+            continue
+        payload_raw = line.split(_PROGRESS_MARKER, 1)[-1].strip()
+        if not payload_raw:
+            continue
+        try:
+            payload = json.loads(payload_raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        result: Dict[str, Any] = {}
+        if payload.get("overallPct") is not None:
+            result["progressOverallPct"] = float(payload["overallPct"])
+        if payload.get("filePct") is not None:
+            result["progressFilePct"] = float(payload["filePct"])
+        if payload.get("run"):
+            result["progressRun"] = str(payload["run"])
+        if payload.get("fileIndex") is not None:
+            result["progressFileIndex"] = int(payload["fileIndex"])
+        if payload.get("fileTotal") is not None:
+            result["progressFileTotal"] = int(payload["fileTotal"])
+        bytes_total = int(payload.get("bytesTotal") or 0)
+        bytes_done = int(payload.get("bytes") or 0)
+        if bytes_total > 0:
+            result["progressBytesTotal"] = bytes_total
+            result["progressBytes"] = bytes_done
+            # Prefer bytes-based filePct when available — more trustworthy than emit side effects.
+            file_pct = min(100.0, bytes_done / bytes_total * 100.0)
+            result["progressFilePct"] = file_pct
+        if result:
+            run = result.get("progressRun") or "FASTQ"
+            file_i = result.get("progressFileIndex")
+            file_n = result.get("progressFileTotal")
+            file_pct = result.get("progressFilePct")
+            # Recompute overall from (completed files + current fraction), never use bare index/total.
+            if file_i and file_n and file_pct is not None:
+                overall = ((int(file_i) - 1) + float(file_pct) / 100.0) / max(int(file_n), 1) * 100.0
+                result["progressOverallPct"] = round(overall, 1)
+            overall = result.get("progressOverallPct")
+            if file_i and file_n and overall is not None and file_pct is not None:
+                result["progressLabel"] = (
+                    f"{run} · 本文件 {float(file_pct):.1f}% · 整体 {float(overall):.1f}% "
+                    f"({int(file_i)}/{int(file_n)})"
+                )
+            elif file_i and file_n and overall is not None:
+                result["progressLabel"] = f"{run} · 整体 {float(overall):.1f}% ({int(file_i)}/{int(file_n)})"
+            elif overall is not None:
+                result["progressLabel"] = f"{run} · 总进度 {float(overall):.1f}%"
+        return result
+    return {}
+
+
+def _format_bytes(num: int) -> str:
+    value = float(max(0, num))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{int(num)} B"
+
+
+def _looks_like_download(text: str) -> bool:
+    combined = text or ""
+    return bool(_DOWNLOAD_CMD_RE.search(combined))
+
+
+def _parse_human_size(text: str) -> int:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)", text, re.IGNORECASE)
+    if not match:
+        return 0
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+    return int(value * mult.get(unit, 1))
+
+
+def _output_dirs_from_code(code: str) -> List[str]:
+    dirs = [""]
+    for match in _OUTDIR_RE.finditer(code or ""):
+        dirs.append(match.group(1).strip())
+    return dirs
+
+
+def _download_bytes_on_disk(path: Path) -> int:
+    total = 0
+    if path.exists():
+        try:
+            total += path.stat().st_size
+        except OSError:
+            pass
+    for part in path.parent.glob(f"{path.name}.part.*"):
+        try:
+            total += part.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _code_is_download_task(code: str) -> bool:
+    if not code:
+        return False
+    if _DOWNLOAD_CMD_RE.search(code):
+        return True
+    if _REFERENCE_DL_RE.search(code):
+        return True
+    return bool(re.search(r"fastq_dl|download_ena|urllib\.request\.urlretrieve", code, re.I))
+
+
+def _lookup_fastq_bytes(workspace: Path, run_id: str) -> int:
+    if not run_id or not workspace.is_dir():
+        return 0
+    import csv
+
+    for tsv_path in sorted(workspace.rglob("*run-info*.tsv")):
+        try:
+            with tsv_path.open(encoding="utf-8") as handle:
+                reader = csv.DictReader(handle, delimiter="\t")
+                for row in reader:
+                    if str(row.get("run_accession") or "").strip() != run_id:
+                        continue
+                    raw = str(row.get("fastq_bytes") or row.get("sra_bytes") or "0").strip()
+                    if raw.isdigit():
+                        return int(raw)
+        except OSError:
+            continue
+    return 0
+
+
+def _expected_download_total(
+    workspace: Path,
+    run_id: str,
+    text: str,
+    code: str,
+    *,
+    filename: str = "",
+) -> int:
+    if filename:
+        escaped = re.escape(filename)
+        for match in re.finditer(rf"\[download\]\s+{escaped}\s+\(([^)]+)\)", text, re.I):
+            size = _parse_human_size(match.group(1))
+            if size > 0:
+                return size
+    expected = _lookup_fastq_bytes(workspace, run_id)
+    if expected > 0:
+        return expected
+    for match in _SIZE_BYTES_RE.finditer(text):
+        expected = max(expected, int(match.group(1)))
+    combined = f"{text}\n{code}"
+    url_match = re.search(
+        r"https?://[^\s'\"]+\.(?:fastq|fq|fa|fasta|gtf)(?:\.gz)?",
+        combined,
+        re.I,
+    )
+    if url_match:
+        try:
+            import urllib.request
+
+            request = urllib.request.Request(url_match.group(0), method="HEAD")
+            with urllib.request.urlopen(request, timeout=8) as response:
+                length = int(response.headers.get("Content-Length") or 0)
+                if length > 0:
+                    return length
+        except Exception:
+            pass
+    return expected
+
+
+def _collect_download_paths(text: str, code: str = "") -> List[str]:
+    combined = f"{text}\n{code or ''}"
+    paths: set[str] = set()
+    for match in _CURL_OUT_RE.finditer(combined):
+        paths.add(match.group(1).strip().strip("'").strip('"'))
+    for match in _OUT_PATH_RE.finditer(combined):
+        paths.add(match.group(1).strip())
+    for match in _FILE_PATH_RE.finditer(combined):
+        paths.add(match.group(0).strip())
+    for match in _DOWNLOAD_LOG_RE.finditer(combined):
+        fname = match.group(1).strip()
+        paths.add(fname)
+        for outdir in _output_dirs_from_code(code):
+            if outdir:
+                paths.add(str(Path(outdir) / fname))
+    for match in _ACCESSION_RE.finditer(combined):
+        accession = match.group(0)
+        paths.add(f"srna_fastq/{accession}.fastq.gz")
+        paths.add(f"{accession}.fastq.gz")
+    return sorted(paths)
+
+
+def _resolve_workspace_path(workspace: Path, rel_path: str) -> Optional[Path]:
+    raw = rel_path.strip().strip("'").strip('"')
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return candidate if candidate.exists() else None
+    direct = workspace / candidate
+    if direct.exists():
+        return direct
+    by_name = workspace / candidate.name
+    if by_name.exists():
+        return by_name
+    search_dirs = [workspace]
+    if workspace.is_dir():
+        search_dirs.extend(item for item in workspace.iterdir() if item.is_dir())
+    for parent in search_dirs:
+        nested = parent / candidate.name
+        if nested.exists():
+            return nested
+    pending = workspace / candidate
+    return pending
+
+
+def _active_run_from_stream(text: str) -> Optional[str]:
+    for raw in reversed((text or "").splitlines()):
+        line = raw.strip()
+        if not re.search(r"正在处理|processing|download|fetch", line, re.IGNORECASE):
+            continue
+        match = _RUN_ID_RE.search(line)
+        if match:
+            return match.group(0)
+    return None
+
+
+def _ordered_download_targets(
+    workspace: Path,
+    text: str,
+    code: str,
+) -> List[tuple[str, Path]]:
+    seen: set[str] = set()
+    ordered: List[tuple[str, Path]] = []
+
+    def add_run(acc: str) -> None:
+        if acc in seen:
+            return
+        # Prefer the output directory from the code being executed.  The
+        # generic legacy locations below are usually absent for agent runs,
+        # whose FASTQs live under e.g. data/raw/fastq/.  Looking there first
+        # lets filesystem telemetry reflect the bytes actually being written.
+        candidates = [
+            str(Path(output_dir) / f"{acc}.fastq.gz")
+            for output_dir in _output_dirs_from_code(code)
+            if output_dir
+        ]
+        candidates.extend((f"srna_fastq/{acc}.fastq.gz", f"{acc}.fastq.gz"))
+        for rel in candidates:
+            resolved = _resolve_workspace_path(workspace, rel)
+            if resolved is not None:
+                seen.add(acc)
+                ordered.append((acc, resolved))
+                return
+
+    for match in _RUN_ID_RE.finditer(code or ""):
+        add_run(match.group(0))
+
+    if not ordered:
+        for rel in _collect_download_paths(text, code):
+            match = _RUN_ID_RE.search(Path(rel).name)
+            if match:
+                add_run(match.group(0))
+
+    return ordered
+
+
+def _progress_for_single_target(
+    workspace: Path,
+    path: Path,
+    run: str,
+    text: str,
+    code: str,
+) -> Dict[str, Any]:
+    size = _download_bytes_on_disk(path)
+    expected_total = _expected_download_total(
+        workspace,
+        run,
+        text,
+        code,
+        filename=path.name,
+    )
+    result: Dict[str, Any] = {
+        "isDownloadTask": True,
+        "progressRun": run,
+        "progressBytes": size,
+    }
+    if expected_total > 0:
+        pct = min(100.0, size / expected_total * 100.0)
+        result["progressOverallPct"] = pct
+        result["progressFilePct"] = pct
+        result["progressBytesTotal"] = expected_total
+        result["progressLabel"] = (
+            f"{run} · {pct:.1f}% · {_format_bytes(size)} / {_format_bytes(expected_total)}"
+        )
+    elif size > 0:
+        result["progressIndeterminate"] = True
+        result["progressLabel"] = f"{run} · 已下载 {_format_bytes(size)}"
+    else:
+        result["progressOverallPct"] = 0.0
+        result["progressLabel"] = f"{run} · 等待下载数据…"
+    return result
+
+
+def _infer_file_download_progress(
+    workspace: Optional[Path],
+    text: str,
+    code: str = "",
+) -> Dict[str, Any]:
+    if workspace is None or not _code_is_download_task(code):
+        return {}
+
+    targets = _ordered_download_targets(workspace, text, code)
+    if len(targets) == 1:
+        acc, path = targets[0]
+        return _progress_for_single_target(workspace, path, acc, text, code)
+
+    if len(targets) > 1:
+        stage_run = _active_run_from_stream(text)
+        active_acc: Optional[str] = None
+        active_path: Optional[Path] = None
+
+        if stage_run:
+            for acc, path in targets:
+                if acc == stage_run:
+                    active_acc, active_path = acc, path
+                    break
+
+        if active_path is None:
+            for acc, path in targets:
+                expected = _expected_download_total(
+                    workspace, acc, text, code, filename=path.name,
+                )
+                got = _download_bytes_on_disk(path)
+                if expected <= 0 or got < expected:
+                    active_acc, active_path = acc, path
+                    break
+
+        if active_path is None:
+            active_acc, active_path = targets[-1]
+
+        active_expected = _expected_download_total(
+            workspace,
+            active_acc,
+            text,
+            code,
+            filename=active_path.name,
+        )
+        active_got = _download_bytes_on_disk(active_path)
+        file_index = next(i for i, (acc, _) in enumerate(targets, start=1) if acc == active_acc)
+        file_total = len(targets)
+
+        total_expected = 0
+        total_bytes = 0
+        unknown_incomplete = False
+        for acc, path in targets:
+            expected = _expected_download_total(
+                workspace, acc, text, code, filename=path.name,
+            )
+            got = _download_bytes_on_disk(path)
+            if expected > 0:
+                total_expected += expected
+                total_bytes += min(got, expected)
+                if got < expected * 0.98 and acc == active_acc:
+                    pass  # still in progress; counted above
+            else:
+                # Unknown size: never fold partial bytes into a byte-ratio overall,
+                # otherwise finished siblings alone can make overall look like 100%.
+                if acc == active_acc and got > 0:
+                    unknown_incomplete = True
+                elif got <= 0:
+                    unknown_incomplete = True
+
+        result: Dict[str, Any] = {
+            "isDownloadTask": True,
+            "progressRun": active_acc,
+            "progressFileIndex": file_index,
+            "progressFileTotal": file_total,
+            "progressBytes": active_got,
+        }
+        completed_files = sum(
+            1
+            for acc, path in targets
+            if (
+                (expected := _expected_download_total(workspace, acc, text, code, filename=path.name)) > 0
+                and _download_bytes_on_disk(path) >= expected * 0.98
+            )
+        )
+        result["progressCompletedFiles"] = completed_files
+        result["progressStage"] = (
+            f"下载文件已落盘 {completed_files}/{file_total} · 进行中: {active_acc}"
+        )
+
+        file_pct: Optional[float] = None
+        if active_expected > 0:
+            file_pct = min(100.0, active_got / active_expected * 100.0)
+            result["progressFilePct"] = file_pct
+            result["progressBytesTotal"] = active_expected
+
+        weighted_overall: Optional[float] = None
+        if file_pct is not None:
+            weighted_overall = (
+                ((file_index - 1) + float(file_pct) / 100.0) / max(file_total, 1) * 100.0
+            )
+
+        overall_pct: Optional[float] = None
+        if total_expected > 0 and not unknown_incomplete:
+            overall_pct = min(100.0, total_bytes / total_expected * 100.0)
+            # Guard: byte-ratio near 100% while current file clearly unfinished.
+            if file_pct is not None and overall_pct >= 99.5 and file_pct < 95.0:
+                overall_pct = weighted_overall
+        elif weighted_overall is not None:
+            overall_pct = weighted_overall
+        elif unknown_incomplete:
+            # Known-size siblings only — cap below 100% while an unknown file is active.
+            if total_expected > 0:
+                sibling_pct = min(99.0, total_bytes / total_expected * 100.0)
+                overall_pct = min(
+                    sibling_pct,
+                    (file_index - 1) / max(file_total, 1) * 100.0,
+                )
+            else:
+                overall_pct = (file_index - 1) / max(file_total, 1) * 100.0
+
+        if overall_pct is not None:
+            overall_pct = round(float(overall_pct), 1)
+            result["progressOverallPct"] = overall_pct
+            if file_pct is not None:
+                result["progressLabel"] = (
+                    f"{active_acc} · 本文件 {file_pct:.1f}% · 整体 {overall_pct:.1f}% "
+                    f"({file_index}/{file_total})"
+                )
+            else:
+                result["progressLabel"] = (
+                    f"{active_acc} · 整体 {overall_pct:.1f}% ({file_index}/{file_total})"
+                )
+        elif active_got > 0:
+            result["progressIndeterminate"] = True
+            result["progressLabel"] = (
+                f"{active_acc} · 已下载 {_format_bytes(active_got)} ({file_index}/{file_total})"
+            )
+        else:
+            result["progressOverallPct"] = 0.0
+            result["progressLabel"] = f"{active_acc} · 等待下载数据… ({file_index}/{file_total})"
+        return result
+
+    best_path: Optional[Path] = None
+    best_size = -1
+    pending_path: Optional[Path] = None
+    pending_run: Optional[str] = None
+
+    for rel in _collect_download_paths(text, code):
+        resolved = _resolve_workspace_path(workspace, rel)
+        if resolved is None:
+            continue
+        if not resolved.exists() and _download_bytes_on_disk(resolved) <= 0:
+            if pending_path is None:
+                pending_path = resolved
+                match = _ACCESSION_RE.search(resolved.name)
+                pending_run = match.group(0) if match else resolved.stem
+            continue
+        size = _download_bytes_on_disk(resolved)
+        if size > best_size:
+            best_size = size
+            best_path = resolved
+
+    if best_path is None:
+        if pending_path is None:
+            return {}
+        run = pending_run or pending_path.stem
+        return {
+            "isDownloadTask": True,
+            "progressRun": run,
+            "progressBytes": 0,
+            "progressOverallPct": 0.0,
+            "progressLabel": f"{run} · 等待下载数据…",
+        }
+
+    run_match = _ACCESSION_RE.search(best_path.name)
+    run = run_match.group(0) if run_match else best_path.stem
+    return _progress_for_single_target(workspace, best_path, run, text, code)
+
+
+def _has_download_progress_fields(parsed: Dict[str, Any]) -> bool:
+    if not parsed.get("isDownloadTask"):
+        return False
+    if parsed.get("progressOverallPct") is not None:
+        return True
+    if int(parsed.get("progressBytes") or 0) > 0:
+        return True
+    return bool(parsed.get("progressRun"))
+
+
+def _merge_execution_progress(
+    parsed: Dict[str, Any],
+    workspace: Optional[Path],
+    text: str,
+    code: str = "",
+) -> Dict[str, Any]:
+    merged = dict(parsed)
+    if _parse_download_progress_marker(text):
+        merged["isDownloadTask"] = True
+    elif _code_is_download_task(code):
+        merged["isDownloadTask"] = True
+    elif _DOWNLOAD_LOG_RE.search(text):
+        merged["isDownloadTask"] = True
+    else:
+        merged.pop("isDownloadTask", None)
+        for key in (
+            "progressOverallPct",
+            "progressFilePct",
+            "progressRun",
+            "progressFileIndex",
+            "progressFileTotal",
+            "progressBytes",
+            "progressBytesTotal",
+            "progressLabel",
+            "progressIndeterminate",
+            "progressCompletedFiles",
+            "progressStage",
+        ):
+            merged.pop(key, None)
+        return merged
+
+    file_progress = _infer_file_download_progress(workspace, text, code)
+    marker = _parse_download_progress_marker(text)
+
+    # Prefer realtime __SRNAGENT_DL__ marker for UI progress; disk inference only fills gaps.
+    if marker:
+        merged["isDownloadTask"] = True
+        merged.update({k: v for k, v in marker.items() if v is not None})
+        if file_progress:
+            for key in (
+                "progressRun",
+                "progressFileIndex",
+                "progressFileTotal",
+                "progressLabel",
+                "progressCompletedFiles",
+                "progressStage",
+            ):
+                if merged.get(key) in (None, "", 0) and file_progress.get(key) not in (None, ""):
+                    merged[key] = file_progress[key]
+    elif file_progress:
+        merged.update({k: v for k, v in file_progress.items() if v is not None})
+
+    if merged.get("isDownloadTask"):
+        merged["highlights"] = []
+        if merged.get("progressLabel"):
+            merged["detail"] = str(merged["progressLabel"])
+    return merged
+
+
+def _parse_progress_output(text: str, *, workspace: Optional[Path] = None, code: str = "") -> Dict[str, Any]:
+    cleaned = _strip_terminal_noise(text)
+    if not cleaned:
+        base = {"stage": "等待输出", "highlights": [], "detail": ""}
+        return _merge_execution_progress(base, workspace, text, code)
+
+    candidates: List[str] = []
+    seen_keys: set[str] = set()
+    for raw in cleaned.splitlines():
+        line = _clean_log_line(raw)
+        if _is_noise_line(line):
+            continue
+        key = re.sub(r"[^\w]+", "", line.lower())
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        candidates.append(line)
+
+    highlights: List[str] = []
+    for line in candidates:
+        score = 0
+        if _ACCESSION_RE.search(line):
+            score += 3
+        if _SIZE_RE.search(line):
+            score += 2
+        if re.search(r"download|working|fetch|complete|success|error|warning|retry", line, re.IGNORECASE):
+            score += 2
+        if score > 0 or len(highlights) < 3:
+            highlights.append(line)
+
+    highlights = highlights[-4:]
+    stage = _infer_progress_stage(highlights or candidates)
+    detail = _truncate_result("\n".join(highlights or candidates[-2:]), 180)
+    # Any tool may emit a cumulative ``progress: N/M`` marker. Display it
+    # as sample progress without coupling the UI to a specific tool.
+    progress_match = re.search(r"progress:\s*(\d+)\s*/\s*(\d+)", cleaned)
+    if progress_match:
+        done_n, total_n = int(progress_match.group(1)), int(progress_match.group(2))
+        stage = f"已完成 {done_n}/{total_n} 样本"
+    # run_threads 的 inflight: SRR1,SRR2,... → 把"正在并发"的样本名拼到 stage
+    # 让 UI 显示"已完成 N/M · 进行中: SRR1, SRR2, ..."（这就是当前并行跑的样本）
+    inflight_match = re.search(r"inflight:\s*(.+)", cleaned)
+    if inflight_match:
+        names = [s.strip() for s in inflight_match.group(1).split(",") if s.strip()]
+        if names:
+            joined = ", ".join(names[:8]) + (" …" if len(names) > 8 else "")
+            stage = f"{stage} · 进行中: {joined}"
+    base = {
+        "stage": stage,
+        "highlights": highlights,
+        "detail": detail,
+        **_parse_download_progress_marker(text),
+    }
+    return _merge_execution_progress(base, workspace, text, code)
+
+
+def _progress_snippet(text: str, limit: int = 240) -> str:
+    parsed = _parse_progress_output(text)
+    if parsed["highlights"]:
+        return _truncate_result("\n".join(parsed["highlights"]), limit)
+    return parsed["detail"]
+
+
+def _next_progress_wait(index: int) -> int:
+    if index < len(_CODE_PROGRESS_INTERVALS):
+        return _CODE_PROGRESS_INTERVALS[index]
+    return _CODE_PROGRESS_INTERVALS[-1]
+
+
+def _resolve_answer_text(completion: Any) -> str:
+    """Prefer visible content; fall back when the model only returns thinking blocks."""
+    content = str(getattr(completion, "content", "") or "").strip()
+    thinking = str(getattr(completion, "thinking", "") or "").strip()
+    if content:
+        return content
+    return thinking
+
+
+def _extract_last_user_query(messages: List[Dict[str, Any]]) -> str:
+    for item in reversed(messages):
+        if item.get("role") == "user":
+            content = str(item.get("content") or "").strip()
+            if content:
+                return content
+    return ""
+
+
+def _looks_like_internal_report(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    return bool(_INTERNAL_REPORT_RE.search(value))
+
+
+def _package_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _project_root() -> Path:
+    return _package_root().parent
+
+
+def _load_agent_constitution() -> str:
+    """Load sRNAgent/AGENT.md — project hard rules injected into every agent system prompt."""
+    path = _package_root() / "AGENT.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        logger.debug("AGENT.md not found at %s", path)
+        return ""
+    return text
+
+
+def _build_system_prompt(skill_overview: str, extra_system: str = "") -> str:
+    skills_block = skill_overview or "(no skills loaded)"
+    base = (
+        "You are sRNAgent, an assistant for small RNA-seq (sRNA-seq) analysis.\n\n"
+        "## Workflow\n"
+        "1. For multi-step tasks, call `search_skills` first to load workflow guidance.\n"
+        "2. Before writing code, call `search_functions` to discover exact API signatures.\n"
+        "3. Use `execute_code` to run Python. The namespace already includes "
+        "`import sRNAgent as sa` as variable `sa`.\n"
+        "4. Prefer `sa.fastq.fastq_dl(...)` and other registered sRNAgent APIs.\n"
+        "5. When listing skills, ONLY mention skills from the Registered skills section below.\n"
+        "6. Read-only questions about existing results (e.g. 'miRNA-21 的差异分析结果'): "
+        "check adata.uns / result manifests / past sessions FIRST — never re-run "
+        "expensive analysis (DE, quantification, alignment) to answer a lookup.\n"
+        "7. After running analysis, PERSIST results: save the adata (with uns results) "
+        "back to the h5ad and register result file paths in the workspace.\n"
+        "8. For follow-up requests (e.g. '继续', '在此基础上', '刚才的结果'), "
+        "first inspect the current kernel variables and persisted adata/manifest/output files. "
+        "Treat completed work as reusable state; do not rerun QC, alignment, quantification, "
+        "or other expensive steps unless the user explicitly asks to rerun or the required "
+        "result is genuinely missing.\n"
+        "9. Questions about why or whether a named tool uses an online service, local files, or a cache "
+        "are factual Q&A, not an analysis request or a request to approve a plan. Inspect the registered "
+        "tool or skill source when needed, then answer directly. Clearly distinguish a local Python wrapper, "
+        "a local result cache, and the actual data-service backend. Do not ask the user to choose a backend "
+        "unless they ask to change it.\n"
+        "10. For filesystem code, use workspace-relative paths or resolve from `Path.cwd()`; never guess paths "
+        "from another web/container runtime. Before any file write, create the parent directory with "
+        "`Path(path).parent.mkdir(parents=True, exist_ok=True)`. Inspect the type of an AnnData `.uns` value "
+        "before indexing it. For long external commands, prefer the registered `sa` tool that owns the command "
+        "and waits for it. Do not detach a `subprocess.Popen` process and never monitor a PID with "
+        "`os.kill(pid, 0)`: exited children can remain zombies and make the task wait forever.\n"
+        "11. When the user asks to show/hide plots on the right-hand Visualization panel, call "
+        "`manage_visualization` (action=show|hide|list|clear_hidden) with workspace plot paths "
+        "under `results/plots/`. Do not rerun analysis just to redisplay an existing figure.\n"
+        "12. Call `finish` with a concise summary when done.\n\n"
+        "## Registered skills\n"
+        f"{skills_block}\n"
+    )
+    constitution = _load_agent_constitution()
+    if constitution:
+        base = (
+            f"{base}\n"
+            "## Agent constitution (always follow; from sRNAgent/AGENT.md)\n"
+            "These are hard project rules for sRNAgent analysis code. "
+            "Obey them whenever you write or call pipeline APIs "
+            "(especially AnnData / adata mutate-and-return patterns).\n\n"
+            f"{constitution}\n"
+        )
+    extra = (extra_system or "").strip()
+    if extra:
+        return f"{base}\n## Additional instructions\n{extra}\n"
+    return base
+
+
+class SRNAgent:
+    """Minimal agent runtime with search_functions / search_skills / execute_code."""
+
+    def __init__(
+        self,
+        llm_config: Optional[LLMConfig] = None,
+        cwd: Optional[Path] = None,
+        max_turns: int = 100,
+        extra_system_prompt: str = "",
+        execution_config: Optional[ExecutionConfig] = None,
+        execution_backend: Optional[ExecutionBackend] = None,
+    ):
+        self.project_root = _project_root()
+        self.cwd = cwd or Path.cwd()
+        self.max_turns = max_turns
+        self.llm = ChatClient(llm_config or LLMConfig.from_env())
+
+        exec_cfg = execution_config or ExecutionConfig(
+            use_notebook=True,
+            strict_kernel_validation=False,
+            strict_env_validation=False,
+            sandbox_fallback_policy=SandboxFallbackPolicy.WARN_AND_FALLBACK,
+        )
+
+        if execution_backend is not None:
+            self.function_registry, self.skill_registry, skill_overview = initialize_registries(
+                cwd=self.cwd,
+            )
+            self.execution = execution_backend
+        else:
+            self.function_registry, self.skill_registry, skill_overview, self.execution = (
+                initialize_agent_runtime(
+                    project_root=self.project_root,
+                    cwd=self.cwd,
+                    execution_config=exec_cfg,
+                )
+            )
+        self.system_prompt = _build_system_prompt(skill_overview, extra_system_prompt)
+
+        self.max_context_tokens = int(getattr(exec_cfg, "max_context_tokens", 48000))
+        self.keep_recent_messages = int(getattr(exec_cfg, "keep_recent_messages", 12))
+        self.max_tool_result_chars = int(getattr(exec_cfg, "max_tool_result_chars", 8000))
+        self._code_no_output_timeout_sec = int(
+            getattr(exec_cfg, "code_no_output_timeout_sec", 120)
+        )
+        self.enable_checkpoint = bool(getattr(exec_cfg, "enable_checkpoint", True))
+        self.checkpoint_dir = getattr(exec_cfg, "checkpoint_dir", None)
+        self.active_chat_id = ""
+
+        env_name = self.execution.runtime.conda_env or "unknown"
+        mode = "notebook" if self.execution.use_notebook else "in-process"
+        logger.info(
+            "SRNAgent ready: %d skills, execution=%s, conda=%s, kernel=%s",
+            len(self.skill_registry.skill_metadata),
+            mode,
+            env_name,
+            self.execution.runtime.kernel_name,
+        )
+
+    def dispatch_tool(
+        self,
+        name: str,
+        arguments: Dict[str, Any],
+        *,
+        on_stream: Optional[StreamCallback] = None,
+        supervisor: Optional[TaskProgressSupervisor] = None,
+    ) -> str:
+        if name == "search_functions":
+            return search_functions(self.function_registry, arguments.get("query", ""))
+        if name == "search_skills":
+            return search_skills(self.skill_registry, arguments.get("query", ""))
+        if name == "manage_visualization":
+            paths = arguments.get("paths") or []
+            if isinstance(paths, str):
+                paths = [paths]
+            return manage_visualization(
+                str(arguments.get("action") or ""),
+                paths if isinstance(paths, list) else [],
+                chat_id=str(getattr(self, "active_chat_id", "") or ""),
+            )
+        if name == "execute_code":
+            return execute_code(
+                arguments.get("code", ""),
+                self.project_root,
+                execution_backend=self.execution,
+                on_stream=on_stream,
+                supervisor=supervisor,
+            )
+        if name == "finish":
+            return arguments.get("message", "Done.")
+        return f"Unknown tool: {name}"
+
+    def _check_cancelled(self, cancel_event: Optional[Any]) -> None:
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            raise AgentCancelledError("Agent run cancelled.")
+
+    def _llm_complete_cancellable(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        cancel_event: Optional[Any] = None,
+        on_progress: Optional[ProgressCallback] = None,
+        enable_thinking: Optional[bool] = None,
+    ):
+        if cancel_event is None:
+            return self.llm.complete(messages, tools=tools, enable_thinking=enable_thinking)
+
+        result_box: Dict[str, Any] = {"value": None, "error": None}
+        started_at = time.time()
+        last_heartbeat = started_at
+
+        def worker() -> None:
+            try:
+                result_box["value"] = self.llm.complete(
+                    messages,
+                    tools=tools,
+                    enable_thinking=enable_thinking,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result_box["error"] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        while thread.is_alive():
+            self._check_cancelled(cancel_event)
+            now = time.time()
+            if on_progress is not None and now - last_heartbeat >= 15:
+                elapsed = int(now - started_at)
+                self._emit_progress(
+                    on_progress,
+                    "status",
+                    message=f"正在请求 LLM…（已等待 {elapsed}s）",
+                )
+                last_heartbeat = now
+            thread.join(timeout=0.3)
+        if result_box["error"] is not None:
+            raise result_box["error"]
+        return result_box["value"]
+
+    def _interrupt_running_code(self) -> None:
+        try:
+            self.execution.interrupt()
+        except Exception:
+            pass
+
+    def _emit_progress(
+        self,
+        on_progress: Optional[ProgressCallback],
+        event_type: str,
+        **payload: Any,
+    ) -> None:
+        if on_progress:
+            on_progress({"type": event_type, **payload})
+
+    def _execution_workspace(self) -> Optional[Path]:
+        executor = getattr(self.execution, "notebook_executor", None)
+        if executor is not None:
+            workspace = getattr(executor, "workspace_dir", None)
+            if workspace:
+                return Path(workspace)
+        try:
+            return Path(self.cwd)
+        except Exception:
+            return None
+
+    def _checkpoint_base_dir(self) -> Optional[Path]:
+        """Directory for run checkpoints; None when checkpointing is disabled."""
+        if not self.enable_checkpoint:
+            return None
+        if self.checkpoint_dir is not None:
+            return Path(self.checkpoint_dir)
+        return Path(self.cwd) / ".srnagent" / "checkpoints"
+
+    def _persist_checkpoint(self, payload: Dict[str, Any], chat_id: str) -> None:
+        """Persist an arbitrary checkpoint payload for ``chat_id`` (best-effort)."""
+        if not chat_id:
+            return
+        base = self._checkpoint_base_dir()
+        if base is None:
+            return
+        try:
+            save_checkpoint(base, chat_id, payload)
+        except Exception:  # noqa: BLE001 — checkpointing must never break the run
+            logger.debug("checkpoint save failed", exc_info=True)
+
+    def _save_run_checkpoint(
+        self,
+        messages: List[Dict[str, Any]],
+        chat_id: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {"messages": messages}
+        if extra:
+            payload.update(extra)
+        self._persist_checkpoint(payload, chat_id)
+
+    def _load_run_checkpoint(
+        self,
+        chat_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not chat_id:
+            return None
+        base = self._checkpoint_base_dir()
+        if base is None:
+            return None
+        return load_checkpoint(base, chat_id)
+
+    def _clear_run_checkpoint(self, chat_id: str) -> None:
+        """Remove resumable state once a run has reached a terminal success."""
+        if not chat_id:
+            return
+        base = self._checkpoint_base_dir()
+        if base is None:
+            return
+        try:
+            clear_checkpoint(base, chat_id)
+        except Exception:  # noqa: BLE001 - cleanup must never mask a reply
+            logger.debug("checkpoint cleanup failed", exc_info=True)
+
+    def _compact_context(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        on_progress: Optional[ProgressCallback],
+    ) -> List[Dict[str, Any]]:
+        """Compress old turns when the transcript exceeds the context budget."""
+        if not should_compact(messages, self.max_context_tokens):
+            return messages
+        before = messages_tokens(messages)
+        messages = compact_messages(
+            messages,
+            llm=self.llm,
+            max_tokens=self.max_context_tokens,
+            keep_recent=self.keep_recent_messages,
+            on_compact=lambda summary: self._emit_progress(
+                on_progress,
+                "context_compacted",
+                summary=summary or "(fallback: dropped oldest turns)",
+            ),
+        )
+        after = messages_tokens(messages)
+        logger.info(
+            "Context compacted: %d → %d est. tokens", before, after
+        )
+        return messages
+
+    def _ensure_user_facing_reply(
+        self,
+        messages: List[Dict[str, Any]],
+        text: str,
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+        cancel_event: Optional[Any] = None,
+    ) -> str:
+        value = str(text or "").strip()
+        if not _looks_like_internal_report(value):
+            return value
+        user_query = _extract_last_user_query(messages)
+        self._emit_progress(on_progress, "status", message="正在整理回复…")
+        completion = self._llm_complete_cancellable(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are sRNAgent. Rewrite the draft into the final user-facing chat reply. "
+                        "Use the same language as the user. Reply directly in second person. "
+                        "Never mention internal workflow status such as '已向用户', '等待下一步', "
+                        "'Task completed', or 'Step done'. Output only the final reply."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Original user request:\n{user_query or '(unknown)'}\n\n"
+                        f"Draft reply:\n{value}"
+                    ),
+                },
+            ],
+            tools=None,
+            cancel_event=cancel_event,
+            on_progress=on_progress,
+            enable_thinking=False,
+        )
+        rewritten = str(getattr(completion, "content", "") or "").strip()
+        return rewritten or value
+
+    @staticmethod
+    def _progress_payload_from_parsed(parsed: Dict[str, Any]) -> Dict[str, Any]:
+        payload = {
+            "isDownloadTask": bool(parsed.get("isDownloadTask")),
+            "progressOverallPct": parsed.get("progressOverallPct"),
+            "progressFilePct": parsed.get("progressFilePct"),
+            "progressRun": parsed.get("progressRun"),
+            "progressFileIndex": parsed.get("progressFileIndex"),
+            "progressFileTotal": parsed.get("progressFileTotal"),
+            "progressBytes": parsed.get("progressBytes"),
+            "progressBytesTotal": parsed.get("progressBytesTotal"),
+            "progressLabel": parsed.get("progressLabel"),
+            "progressIndeterminate": parsed.get("progressIndeterminate"),
+            "progressCompletedFiles": parsed.get("progressCompletedFiles"),
+            "progressStage": parsed.get("progressStage"),
+        }
+        if not payload["isDownloadTask"]:
+            for key in list(payload.keys()):
+                if key != "isDownloadTask":
+                    payload[key] = None
+        return payload
+
+    def _run_execute_code_with_progress(
+        self,
+        arguments: Dict[str, Any],
+        *,
+        on_progress: Optional[ProgressCallback],
+        cancel_event: Optional[Any],
+        turn: int,
+        summary: str,
+        description: str,
+        tool_call_id: str,
+    ) -> str:
+        stream_state = {"stdout": "", "stderr": ""}
+        result_box: Dict[str, Any] = {"value": None, "error": None}
+        last_stream_progress = [0.0]
+        start_box: List[Optional[float]] = [None]
+        code_text = str(arguments.get("code") or "")
+        workspace = self._execution_workspace()
+        supervisor = TaskProgressSupervisor(
+            workspace=workspace,
+            code=code_text,
+            namespace_provider=lambda: self.execution.in_process_ns,
+        )
+
+        def supervised_progress(raw_stream: str) -> Dict[str, Any]:
+            parsed = _parse_progress_output(raw_stream, workspace=workspace, code=code_text)
+            observed = supervisor.snapshot()
+            # Use the tool's N/M counter only when filesystem telemetry cannot
+            # identify the downloaded FASTQ files.  A worker can write a large
+            # file long before its subprocess returns, leaving an old 0/N
+            # marker in the stream indefinitely.
+            if parsed.get("progressStage"):
+                parsed["stage"] = parsed["progressStage"]
+            elif observed.get("hasEvidence") and not _SAMPLE_PROGRESS_RE.search(raw_stream):
+                parsed["stage"] = observed["stage"]
+                parsed["detail"] = observed["detail"]
+                parsed["highlights"] = observed["highlights"]
+            return parsed
+
+        def on_stream(kind: str, text: str) -> None:
+            key = "stderr" if kind == "stderr" else "stdout"
+            stream_state[key] += text or ""
+            if not on_progress:
+                return
+            now = time.monotonic()
+            if start_box[0] is None:
+                start_box[0] = now
+            if now - last_stream_progress[0] < 0.2:
+                return
+            combined = stream_state["stdout"] or stream_state["stderr"]
+            parsed = supervised_progress(combined)
+            if not (
+                _has_download_progress_fields(parsed)
+                or _SAMPLE_PROGRESS_RE.search(combined)
+            ):
+                return
+            last_stream_progress[0] = now
+            elapsed = now - start_box[0]
+            progress_summary = _progress_summary(parsed, summary)
+            self._emit_progress(
+                on_progress,
+                "code_execution_progress",
+                turn=turn,
+                toolCallId=tool_call_id,
+                summary=progress_summary,
+                description=description,
+                elapsedSec=int(elapsed),
+                elapsedLabel=_format_elapsed(elapsed),
+                stage=parsed.get("stage") or "下载中",
+                highlights=parsed.get("highlights") or [],
+                snippet=parsed.get("detail") or "",
+                nextUpdateSec=1,
+                **self._progress_payload_from_parsed(parsed),
+            )
+
+        def worker() -> None:
+            try:
+                result_box["value"] = self.dispatch_tool(
+                    "execute_code",
+                    arguments,
+                    on_stream=on_stream,
+                    supervisor=supervisor,
+                )
+            except Exception as exc:  # noqa: BLE001
+                result_box["error"] = exc
+
+        self._emit_progress(
+            on_progress,
+            "code_execution_started",
+            turn=turn,
+            toolCallId=tool_call_id,
+            summary=summary,
+            description=description,
+            code=str(arguments.get("code") or ""),
+            elapsedSec=0,
+            elapsedLabel="0 秒",
+            stage="已开始",
+            nextUpdateSec=_next_progress_wait(0),
+        )
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        start = time.monotonic()
+        start_box[0] = start
+        next_fire = start + _next_progress_wait(0)
+        progress_index = 0
+        last_sse_heartbeat = start
+        # 内核无响应检测：完全无输出超过阈值则中断内核并返回诊断，
+        # 避免 execute_code 无限等待（EXECUTION_TIMEOUT_SEC 达 10 小时）
+        no_output_timeout = self._code_no_output_timeout_sec
+        last_output_at = start
+        timed_out = False
+
+        while thread.is_alive():
+            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                supervisor.terminate_active_processes()
+                self._interrupt_running_code()
+                raise AgentCancelledError("Agent run cancelled.")
+            thread.join(timeout=1.0)
+            if not thread.is_alive():
+                break
+
+            now = time.monotonic()
+            raw_stream = stream_state["stdout"] or stream_state["stderr"]
+            telemetry = supervisor.snapshot()
+            if (
+                raw_stream
+                or telemetry.get("activeProcess")
+                or telemetry.get("recentArtifactChange")
+            ):
+                last_output_at = now
+            elif (
+                not timed_out
+                and no_output_timeout > 0
+                and now - last_output_at >= no_output_timeout
+            ):
+                timed_out = True
+                self._emit_progress(
+                    on_progress,
+                    "status",
+                    message=(
+                        f"execute_code 内核无响应超过 "
+                        f"{int(now - last_output_at)}s（无任何输出），正在中断内核…"
+                    ),
+                )
+                self._interrupt_running_code()
+
+            if on_progress and now - last_sse_heartbeat >= _SSE_PROGRESS_HEARTBEAT_SEC:
+                elapsed = now - start
+                raw_stream = stream_state["stdout"] or stream_state["stderr"]
+                parsed = supervised_progress(raw_stream)
+                progress_summary = _progress_summary(parsed, summary)
+                self._emit_progress(
+                    on_progress,
+                    "code_execution_progress",
+                    turn=turn,
+                    toolCallId=tool_call_id,
+                    summary=progress_summary,
+                    description=description,
+                    elapsedSec=int(elapsed),
+                    elapsedLabel=_format_elapsed(elapsed),
+                    stage=parsed["stage"] or "运行中",
+                    highlights=parsed["highlights"],
+                    snippet=parsed["detail"],
+                    nextUpdateSec=_SSE_PROGRESS_HEARTBEAT_SEC,
+                    **self._progress_payload_from_parsed(parsed),
+                )
+                last_sse_heartbeat = now
+
+            if now < next_fire:
+                continue
+
+            elapsed = now - start
+            raw_stream = stream_state["stdout"] or stream_state["stderr"]
+            parsed = supervised_progress(raw_stream)
+            progress_summary = _progress_summary(parsed, summary)
+            self._emit_progress(
+                on_progress,
+                "code_execution_progress",
+                turn=turn,
+                toolCallId=tool_call_id,
+                summary=progress_summary,
+                description=description,
+                elapsedSec=int(elapsed),
+                elapsedLabel=_format_elapsed(elapsed),
+                stage=parsed["stage"],
+                highlights=parsed["highlights"],
+                snippet=parsed["detail"],
+                nextUpdateSec=_next_progress_wait(progress_index + 1),
+                **self._progress_payload_from_parsed(parsed),
+            )
+            progress_index += 1
+            next_fire = now + _next_progress_wait(progress_index)
+
+        if timed_out:
+            tail = str(result_box["value"] or result_box["error"] or "")
+            self._emit_progress(
+                on_progress,
+                "status",
+                message=(
+                    f"execute_code 内核无响应，已中断内核"
+                    f"（耗时 {_format_elapsed(time.monotonic() - start)}）"
+                ),
+            )
+            return (
+                "⚠️ execute_code 内核无响应超过 "
+                f"{int(no_output_timeout)}s（期间无任何输出），已中断内核。\n"
+                "可能原因：内核被前一个长任务占用、或内核已卡死。\n"
+                "建议：确认所需产物已落盘；若是重试/合并场景，直接读取已有的结果文件"
+                "（如 *_counts.csv / -trnacounts.txt / de_results.csv），避免再次触发同样的阻塞；"
+                "必要时告知用户检查是否有残留进程。\n\n"
+                f"中断后返回：{_truncate_result(tail, 500)}"
+            )
+        if result_box["error"] is not None:
+            raise result_box["error"]
+        return str(result_box["value"] or "")
+
+    def _tool_loop(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+        cancel_event: Optional[Any] = None,
+        code_approval_callback: Optional[CodeApprovalCallback] = None,
+        chat_id: str = "",
+        checkpoint_extra: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        from .lc_tool_loop import lc_tool_loop_enabled, run_lc_tool_loop
+
+        if chat_id:
+            self.active_chat_id = chat_id
+
+        if lc_tool_loop_enabled():
+            return run_lc_tool_loop(
+                self,
+                messages,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                code_approval_callback=code_approval_callback,
+                chat_id=chat_id,
+                checkpoint_extra=checkpoint_extra,
+            )
+
+        for turn in range(self.max_turns):
+            self._check_cancelled(cancel_event)
+
+            messages = self._compact_context(messages, on_progress=on_progress)
+
+            self._emit_progress(on_progress, "status", message="正在请求 LLM…")
+            completion = self._llm_complete_cancellable(
+                messages,
+                tools=AGENT_TOOL_SCHEMAS,
+                cancel_event=cancel_event,
+                on_progress=on_progress,
+                enable_thinking=False,
+            )
+            self._check_cancelled(cancel_event)
+
+            if completion.tool_calls:
+                thinking = str(completion.thinking or "").strip()
+                visible = str(completion.content or "").strip()
+                if thinking and thinking != visible:
+                    self._emit_progress(
+                        on_progress,
+                        "thinking",
+                        turn=turn + 1,
+                        content=thinking,
+                    )
+
+                assistant_message: Dict[str, Any] = {
+                    "role": "assistant",
+                    "content": completion.content or None,
+                    "tool_calls": [
+                        {
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                            },
+                        }
+                        for call in completion.tool_calls
+                    ],
+                }
+                messages.append(assistant_message)
+
+                for call in completion.tool_calls:
+                    self._check_cancelled(cancel_event)
+                    summary = _summarize_tool_call(call.name, call.arguments)
+                    self._emit_progress(
+                        on_progress,
+                        "tool_call",
+                        turn=turn + 1,
+                        toolCallId=call.id,
+                        name=call.name,
+                        summary=summary,
+                        arguments=call.arguments,
+                    )
+
+                    if call.name == "finish":
+                        message = normalize_text_payload(call.arguments.get("message")) or "Task completed."
+                        message = self._ensure_user_facing_reply(
+                            messages,
+                            message,
+                            on_progress=on_progress,
+                            cancel_event=cancel_event,
+                        )
+                        self._save_run_checkpoint(
+                            messages, chat_id, checkpoint_extra
+                        )
+                        if checkpoint_extra is None:
+                            self._clear_run_checkpoint(chat_id)
+                        self._emit_progress(
+                            on_progress,
+                            "final",
+                            turn=turn + 1,
+                            content=message,
+                        )
+                        return message
+
+                    if call.name == "execute_code":
+                        raw_code = call.arguments.get("code")
+                        if isinstance(raw_code, dict):
+                            code = next(
+                                (
+                                    value for key in ("$text", "text")
+                                    if isinstance((value := raw_code.get(key)), str)
+                                ),
+                                "",
+                            )
+                        else:
+                            code = raw_code if isinstance(raw_code, str) else ""
+                        description = str(call.arguments.get("description") or "")
+                        tool_arguments = dict(call.arguments)
+                        if code:
+                            tool_arguments["code"] = code
+                        policy_violation = _audit_execute_code_policy(messages, tool_arguments)
+                        approved = True
+                        if not code:
+                            result = (
+                                "TOOL_INPUT_ERROR: execute_code.code must be a non-empty string. "
+                                "Call execute_code again with Python source in the code field."
+                            )
+                        elif policy_violation:
+                            result = policy_violation
+                        elif code_approval_callback is not None:
+                            request_id = str(uuid.uuid4())
+                            approved = code_approval_callback(request_id, code, description)
+                            if not approved:
+                                result = (
+                                    "User denied code execution. Explain what the code would do "
+                                    "and ask whether to try again."
+                                )
+                            elif on_progress is not None:
+                                result = self._run_execute_code_with_progress(
+                                    tool_arguments,
+                                    on_progress=on_progress,
+                                    cancel_event=cancel_event,
+                                    turn=turn + 1,
+                                    summary=summary,
+                                    description=description,
+                                    tool_call_id=call.id,
+                                )
+                            else:
+                                result = self.dispatch_tool(call.name, tool_arguments)
+                        elif not approved:
+                            result = (
+                                "User denied code execution. Explain what the code would do "
+                                "and ask whether to try again."
+                            )
+                        elif on_progress is not None:
+                            result = self._run_execute_code_with_progress(
+                                tool_arguments,
+                                on_progress=on_progress,
+                                cancel_event=cancel_event,
+                                turn=turn + 1,
+                                summary=summary,
+                                description=description,
+                                tool_call_id=call.id,
+                            )
+                        else:
+                            result = self.dispatch_tool(call.name, tool_arguments)
+                    else:
+                        result = self.dispatch_tool(call.name, call.arguments)
+
+                    result = bounded_tool_result(result, self.max_tool_result_chars)
+
+                    if call.name == "execute_code":
+                        self._emit_progress(
+                            on_progress,
+                            "tool_result",
+                            turn=turn + 1,
+                            toolCallId=call.id,
+                            name=call.name,
+                            summary=summary,
+                            content=_truncate_result(result),
+                            # 完整 head+tail 结果（bounded），供错误持久化用；
+                            # 避免 session_errors 只记录 600 字符的头部导致
+                            # traceback 关键行（尾部 NameError 等）丢失
+                            fullContent=result,
+                        )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": result,
+                        }
+                    )
+                self._save_run_checkpoint(messages, chat_id, checkpoint_extra)
+                continue
+
+            answer = _resolve_answer_text(completion)
+            if answer:
+                answer = self._ensure_user_facing_reply(
+                    messages,
+                    answer,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                )
+                self._save_run_checkpoint(messages, chat_id, checkpoint_extra)
+                if checkpoint_extra is None:
+                    self._clear_run_checkpoint(chat_id)
+                self._emit_progress(
+                    on_progress,
+                    "final",
+                    turn=turn + 1,
+                    content=answer,
+                )
+                return answer
+            return "Agent stopped without a final response."
+
+        message = "Agent reached max turns without calling finish."
+        self._emit_progress(on_progress, "final", content=message)
+        return message
+
+    @staticmethod
+    def _maybe_attach_elapsed(
+        answer: str,
+        started_at: float,
+        attach: bool = True,
+    ) -> str:
+        """Append the wall-clock duration of this Q&A to the final answer."""
+        if not attach or not answer:
+            return answer
+        elapsed = time.time() - started_at
+        # A retry/rewrite can carry an earlier duration line in its text.
+        # The user-facing response has exactly one elapsed-time footer.
+        answer = _ELAPSED_REPLY_RE.sub("", answer).rstrip()
+        return f"{answer}\n\n⏱️ 本次回答耗时 {_format_elapsed(elapsed)}"
+
+    def run(self, user_query: str) -> str:
+        started_at = time.time()
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_query},
+        ]
+        return self._maybe_attach_elapsed(self._tool_loop(messages), started_at)
+
+    def run_with_history(
+        self,
+        history: List[Dict[str, str]],
+        *,
+        on_progress: Optional[ProgressCallback] = None,
+        cancel_event: Optional[Any] = None,
+        code_approval_callback: Optional[CodeApprovalCallback] = None,
+        chat_id: str = "",
+        resume: bool = False,
+        extra_context: str = "",
+        _attach_elapsed: bool = True,
+    ) -> str:
+        started_at = time.time()
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        # 把会话级持久记忆（之前做过什么、产物在哪、用户决策）注入 system，
+        # 让普通对话模式（run_with_history）不再失忆 —— 之前只有 plan 模式有
+        if extra_context:
+            messages[0] = {
+                "role": "system",
+                "content": f"{self.system_prompt}\n\n## 之前的工作记忆\n{extra_context}",
+            }
+
+        if resume and chat_id:
+            checkpoint = self._load_run_checkpoint(chat_id)
+            if checkpoint and isinstance(checkpoint.get("messages"), list) and checkpoint["messages"]:
+                logger.info("Resuming session %s from checkpoint", chat_id)
+                return self._maybe_attach_elapsed(
+                    self._tool_loop(
+                        checkpoint["messages"],
+                        on_progress=on_progress,
+                        cancel_event=cancel_event,
+                        code_approval_callback=code_approval_callback,
+                        chat_id=chat_id,
+                    ),
+                    started_at,
+                    _attach_elapsed,
+                )
+
+        for item in history:
+            role = item.get("role")
+            content = str(item.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        if not any(m.get("role") == "user" for m in messages):
+            raise ValueError("No user message in history")
+        return self._maybe_attach_elapsed(
+            self._tool_loop(
+                messages,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                code_approval_callback=code_approval_callback,
+                chat_id=chat_id,
+            ),
+            started_at,
+            _attach_elapsed,
+        )
+
+    def run_planned(
+        self,
+        history: List[Dict[str, str]],
+        *,
+        extra_context: str = "",
+        available_artifacts: Optional[List[str]] = None,
+        chat_id: str = "",
+        save_plan: Optional[Any] = None,
+        load_plan: Optional[Any] = None,
+        resume: bool = False,
+        route_intent: str = "",
+        on_progress: Optional[ProgressCallback] = None,
+        cancel_event: Optional[Any] = None,
+        code_approval_callback: Optional[CodeApprovalCallback] = None,
+    ) -> str:
+        """Plan-and-Execute: planner splits work; each step gets its own tool-loop budget."""
+        started_at = time.time()
+        orchestrator = PlanOrchestrator(
+            self,
+            chat_id=chat_id,
+            save_plan=save_plan,
+            load_plan=load_plan,
+        )
+        return self._maybe_attach_elapsed(
+            orchestrator.run(
+                history,
+                extra_context=extra_context,
+                available_artifacts=available_artifacts,
+                resume=resume,
+                route_intent=route_intent,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                code_approval_callback=code_approval_callback,
+            ),
+            started_at,
+        )
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "skills": list(self.skill_registry.skill_metadata.keys()),
+            "skill_overview": list_available_skills(self.skill_registry),
+            "functions_sample": [
+                entry.get("full_name")
+                for entry in self.function_registry.find("fastq")[:5]
+            ],
+            "execution": self.execution.to_dict(),
+        }

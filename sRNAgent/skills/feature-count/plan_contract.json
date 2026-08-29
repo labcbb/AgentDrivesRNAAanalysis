@@ -1,0 +1,52 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "confirm-strandedness-before-feature-count",
+      "kind": "approval",
+      "activation": {},
+      "placement": {"before_skills": ["feature-count"]},
+      "step": {
+        "title": "确认 featureCounts 链特异性",
+        "goal": "先根据 BAM、已有配置与建库元数据判断 stranded 参数；元数据匹配已知建库时应给出有依据的建议，未知时保持未记录。用户确认前不得运行 featureCounts。",
+        "skill": "feature-count",
+        "inputs": ["strandedness_evidence"],
+        "outputs": ["strandedness_confirmed"]
+      },
+      "preflight": {
+        "title": "读取 featureCounts 已知配置",
+        "goal": "只读检查当前 AnnData、BAM/注释元数据和会话记录。finish 回复必须逐行输出 `SAMPLE_COUNT: <数量或未记录>`、`BAM_INPUT: <obs 列/路径或未记录>`、`ANNOTATION: <路径或未记录>`、`LIBRARY_KIT: <建库试剂盒或未记录>`、`STRANDEDNESS: <unstranded/forward/reverse/未记录>`、`STRANDEDNESS_EVIDENCE: <既有 featureCounts 配置/建库元数据/BAM 方向性检查/用户指定/未记录>`。若建库元数据明确为 TruSeq/NEXTflex/QIAseq 小 RNA，建议 forward；若明确为 NEBNext Small RNA，建议 reverse；其他情况不得猜测。不得运行 featureCounts、不得修改 adata 或文件。",
+        "skill": "feature-count",
+        "outputs": ["strandedness_evidence"]
+      },
+      "approval": {
+        "prompt": "上述值是下一步 featureCounts 将使用的链特异性配置。系统会先根据已有配置、BAM 和建库元数据给出可审计建议；无依据时保持未记录，不能仅凭默认值执行。",
+        "review": {
+          "fields": [
+            {
+              "label": "建库试剂盒来源",
+              "source": "library_kit",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "建议的 strandedness",
+              "source": "strandedness",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "strandedness 依据",
+              "source": "strandedness_evidence",
+              "unknown": "未记录，不能据此执行"
+            },
+            {
+              "label": "可用参数",
+              "value": "unstranded / forward / reverse"
+            }
+          ],
+          "edit_hint": "若已有证据支持建议，可回复“可以”采用；若未记录，请补充建库信息或直接回复 `strandedness=unstranded/forward/reverse`。"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.pyc
+*.cpython-*.pyc
+*.nfs000*
+.qwen/
+.agents/
+figures/
+
+# Local run artifacts / large data
+results/
+work/
+work_space/
+**/sessions/
+*.fastq
+*.fastq.gz
+*.bam
+*.bai
+*.sam
+*.h5ad
+*.pkl
+*.pt
+
+# Secrets / env
+.env
+.env.*
+*.pem
+credentials.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

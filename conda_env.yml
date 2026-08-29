@@ -1,0 +1,44 @@
+name: srnagent
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.13
+  - cutadapt
+  - fastqc
+  - jupyter
+  - ipykernel
+  - samtools
+  - viennarna=1.8.5
+  - mirdeep2
+  - subread
+  - pysam
+  - miranda
+  - scanpy
+  - scikit-learn
+  - statsmodels
+  - joblib
+  - matplotlib
+  - seaborn
+  - networkx
+  - jinja2
+  - bowtie2>=2.5
+  - biopython
+  - infernal>=1.1.4
+  - mirtop
+  - seqcluster
+  - pip:
+      - mudata
+      - anndata
+      - fastq-dl
+      - tqdm
+      - pylimma
+      - pytest
+      - gseapy
+      - xgboost
+      - langchain>=0.3
+      - langchain-core>=0.3
+      - langchain-openai>=0.2
+      - langgraph>=0.2
+      - setuptools<81

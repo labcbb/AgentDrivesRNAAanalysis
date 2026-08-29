@@ -1,0 +1,52 @@
+"""Agent execution configuration (aligned with omicverse agent_config)."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+
+class SandboxFallbackPolicy(Enum):
+    """What to do when notebook execution fails."""
+
+    RAISE = "raise"
+    WARN_AND_FALLBACK = "warn"
+    SILENT = "silent"
+
+
+# Jupyter / Agent code execution ceiling (large downloads, long pipelines).
+EXECUTION_TIMEOUT_SEC = 36000  # 10 hours
+# Abort when a download file stops growing for this long.
+DOWNLOAD_STALL_TIMEOUT_SEC = 180  # 3 minutes
+DOWNLOAD_STALL_POLL_SEC = 30
+# If an execute_code produces NO output at all for this long, the kernel is
+# likely busy/stuck (e.g. a previous long task still holds it) — interrupt it
+# and return a diagnostic instead of waiting up to EXECUTION_TIMEOUT_SEC.
+CODE_NO_OUTPUT_TIMEOUT_SEC = 120
+
+
+@dataclass
+class ExecutionConfig:
+    use_notebook: bool = True
+    max_prompts_per_session: int = 5
+    storage_dir: Optional[Path] = None
+    keep_notebooks: bool = True
+    timeout: int = EXECUTION_TIMEOUT_SEC
+    strict_kernel_validation: bool = False
+    strict_env_validation: bool = False
+    sandbox_fallback_policy: SandboxFallbackPolicy = SandboxFallbackPolicy.WARN_AND_FALLBACK
+    workspace_dir: Optional[Path] = None
+    # Long-session context management.
+    max_context_tokens: int = 48000
+    keep_recent_messages: int = 12
+    max_tool_result_chars: int = 8000
+    # Interruption-safe resume.
+    enable_checkpoint: bool = True
+    checkpoint_dir: Optional[Path] = None
+    # Interrupt + diagnose when execute_code emits nothing for this long.
+    code_no_output_timeout_sec: int = CODE_NO_OUTPUT_TIMEOUT_SEC
+
+
+class SandboxExecutionError(RuntimeError):
+    """Raised when notebook execution fails and fallback is disabled."""

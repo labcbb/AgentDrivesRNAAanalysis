@@ -1,0 +1,4 @@
+interface:
+  display_name: "Feature Selection and Modeling"
+  short_description: "Select features and fit Cox or classifiers"
+  default_prompt: "Use $modeling to prepare AnnData features and fit either a Cox or classification model."

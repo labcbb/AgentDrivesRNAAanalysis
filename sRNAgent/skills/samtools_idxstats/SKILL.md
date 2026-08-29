@@ -1,0 +1,248 @@
+---
+name: samtools_idxstats
+slug: samtools_idxstats
+title: Default piRNA quantification with samtools idxstats
+description: "Default method for piRNA quantification: count reads per piRNA FASTA reference sequence from BAM files using samtools idxstats, writing counts into AnnData."
+default_for: pirna_quantification
+---
+
+# Default piRNA Quantification with samtools idxstats
+
+## Overview
+
+Use `sa.quant.idxstats` to quantify reads mapped to small-RNA reference sequences in BAM files.
+
+**Default method rule:** for piRNA quantification, use this skill with a piRNA FASTA reference. Do not switch to `feature_count` unless the user explicitly requests featureCounts.
+
+> 模态边界：当前 skill 只操作 `srna` 模态的单个 AnnData。piRNA、miRNA 与 tRNA/tRF 定量共享同一个 `srna` AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
+
+This skill is for BAM files produced by aligning reads to a **small-RNA FASTA reference index** such as piRBase piRNA sequences, Ensembl ncRNA sequences, mature tRNAs, miRNAs, or other transcript-level sequences.
+
+It is **not** the right method for BAM files aligned to a whole reference genome. For whole-genome BAMs, use annotation-based counting such as `sa.quant.feature_count`.
+
+| Step | Tool | Function | Purpose |
+|------|------|----------|---------|
+| 1 | Bowtie | `sa.alignment.bowtie` | Align sRNA reads to a small-RNA FASTA index |
+| 2 | samtools idxstats | `sa.quant.idxstats` | Count reads mapped to each reference sequence |
+| 3 | AnnData writer | `sa.quant.idxstats` | Write counts to the shared `adata.layers["counts"]` |
+
+Typical workflow:
+
+```text
+small-RNA FASTA
+    |
+    v
+bowtie-build
+    |
+    v
+FASTQ -> bowtie -> BAM
+    |
+    v
+samtools idxstats -> adata.layers["counts"]
+```
+
+## Requirements
+
+- `adata.obs["bam_path"]` from `sa.alignment.bowtie`
+- BAM files aligned to a small-RNA FASTA reference, not a whole genome
+- `samtools` available in `PATH`
+
+The Bowtie index should be built from a FASTA where each sequence is a feature to quantify. Good examples include:
+
+```text
+>piR-hsa-1
+...
+>piR-hsa-2
+...
+```
+
+from piRBase, or:
+
+```text
+>ENST00000383977.1 gene_biotype:miRNA
+...
+>ENST00000607772.1 gene_biotype:snoRNA
+...
+```
+
+The first column of `samtools idxstats` then corresponds directly to quantifiable small-RNA feature IDs.
+
+## Instructions
+
+### 1. Build a small-RNA Bowtie index
+
+**Example A - piRBase FASTA**
+
+```python
+sa.alignment.bowtie_build(
+    "ref/piRBase_human.fa",
+    "ref/piRBase_human",
+    threads=4,
+)
+```
+
+**Example B - Ensembl ncRNA FASTA**
+
+```python
+sa.alignment.bowtie_build(
+    "ref/Homo_sapiens.GRCh38.ncrna.fa",
+    "ref/human_ncrna",
+    threads=4,
+)
+```
+
+Do not use a whole-genome FASTA if the goal is direct `idxstats` quantification of tRNA or other small-RNA features.
+
+### 2. Align reads to the small-RNA index
+
+```python
+adata = sa.alignment.bowtie(
+    adata,
+    index_basename="ref/piRBase_human",
+    output_dir="aligned_piRBase",
+    total_mismatches=0,
+    m=1,
+    best=True,
+    threads=4,
+)
+```
+
+`sa.alignment.bowtie` writes:
+
+```python
+adata.obs["bam_path"]
+```
+
+### 3. Quantify by idxstats
+
+```python
+adata = sa.quant.idxstats(
+    adata,
+    output_dir="idxstats_out",
+)
+```
+
+> ⚡ **批量样本时务必使用 `jobs=N` 并行**：`sa.quant.idxstats` 支持 `jobs` 参数控制同时处理的 BAM 数（多线程池，每个 BAM 一个 `samtools idxstats` 进程）。样本多时（比如 >3 个），设置 `jobs=4` 可显著缩短总耗时；内存吃紧时降低到 `jobs=2`。如果用户没指定并行数，**根据样本量主动选一个合理的 `jobs` 值**。内置并行会在每个 BAM 返回时输出统一的 `progress: N/M` 和 `inflight:` 事件；调用 API 时不要额外包线程池。
+
+## Outputs
+
+`samtools idxstats` returns four columns:
+
+| idxstats column | Meaning | AnnData destination |
+|-----------------|---------|---------------------|
+| 1 | Reference sequence name, e.g. a specific tRNA ID | `adata.var["reference_name"]` and `adata.var_names` |
+| 2 | Reference sequence nucleotide length | `adata.var["reference_length"]` |
+| 3 | Reads mapped to that reference | `adata.X`, `adata.layers["counts"]` |
+| 4 | Unmapped reads for that reference | ignored |
+
+Returned `AnnData` fields:
+
+```python
+adata.X
+adata.layers["counts"]
+adata.var["reference_name"]
+adata.var["reference_length"]
+adata.var["rna_type"]
+adata.obs["idxstats_bam"]
+adata.obs["idxstats_file"]
+adata.uns["idxstats_result"]
+```
+
+If `adata.layers["counts"]` already contains the same `rna_type`, that block is replaced. If it contains a different RNA type, the new features are appended.
+
+## Correct Usage
+
+**CORRECT - tRNA FASTA reference:**
+
+```python
+sa.alignment.bowtie_build("ref/mature_tRNAs.fa", "ref/mature_tRNAs")
+adata = sa.alignment.bowtie(adata, index_basename="ref/mature_tRNAs")
+adata = sa.quant.idxstats(adata, rna_type="tRNA")
+```
+
+**CORRECT - preserve existing expression and add idxstats separately:**
+
+```python
+# Existing adata.X/layers["counts"] contains miRNA or other counts
+adata = sa.quant.idxstats(adata, rna_type="piRNA")
+print(adata.layers["counts"].shape) # merged expression matrix
+print(adata.var["rna_type"].value_counts())
+```
+
+**CORRECT - piRBase FASTA reference:**
+
+```python
+sa.alignment.bowtie_build("ref/piRBase_human.fa", "ref/piRBase_human")
+adata = sa.alignment.bowtie(adata, index_basename="ref/piRBase_human")
+adata = sa.quant.idxstats(adata)
+```
+
+**CORRECT - Ensembl ncRNA FASTA reference:**
+
+```python
+sa.alignment.bowtie_build("ref/Homo_sapiens.GRCh38.ncrna.fa", "ref/human_ncrna")
+adata = sa.alignment.bowtie(adata, index_basename="ref/human_ncrna")
+adata = sa.quant.idxstats(adata)
+```
+
+**CORRECT - miRNA mature FASTA reference:**
+
+```python
+sa.alignment.bowtie_build("ref/mature_hsa.fa", "ref/mature_hsa")
+adata = sa.alignment.bowtie(adata, index_basename="ref/mature_hsa")
+adata = sa.quant.idxstats(adata)
+```
+
+**WRONG - whole-genome BAM:**
+
+```python
+# WRONG for direct small-RNA feature abundance:
+# adata = sa.alignment.bowtie(adata, index_basename="ref/grch38")
+# adata = sa.quant.idxstats(adata)
+```
+
+For whole-genome BAMs, `idxstats` counts reads per chromosome/contig, not per tRNA or miRNA feature. Use annotation-based counting instead.
+
+## Common Problems
+
+**No `bam_path` column**
+
+Run `sa.alignment.bowtie` first. If only `sam_path` exists, the wrapper will look for a `.bam` file with the same basename.
+
+**BAM index missing**
+
+`sa.quant.idxstats` creates a BAM index with `samtools index` by default when needed.
+
+**Unexpected feature names**
+
+Feature names come from the FASTA headers used to build the Bowtie index. Clean FASTA headers before building the index if you need stable IDs.
+
+## 结果持久化与查询纪律
+
+### 保存结果（必须，保证跨会话可查）
+
+idxstats 定量结果写入 adata 的 `X`（counts 矩阵）、`var`（feature 名称）、`uns["output_dir"]`，**必须保存 h5ad**，否则新会话无法查询：
+
+```python
+import anndata as ad
+
+# 定量完成后立即保存
+adata.write("idxstats_counts.h5ad")
+
+# 保存后 reload 验证
+reload = ad.read_h5ad("idxstats_counts.h5ad")
+print(reload.shape, list(reload.var.columns))
+```
+
+### 查询已有结果（只读查询，禁止重跑）
+
+用户问"XX piRNA/feature 的定量结果"时，**先查已有数据，绝不重跑 idxstats**：
+
+```python
+# 1) 加载已保存的 h5ad，直接查
+adata = ad.read_h5ad("idxstats_counts.h5ad")
+print(adata.var_names[:5])
+
+# 2) output_dir 下已有 *.idxstats.tsv 时重跑会被跳过（overwrite=False）
+# 3) 都没有 → 告知用户"现有结果不存在"，询问是否重新分析；不要偷偷重跑
+```

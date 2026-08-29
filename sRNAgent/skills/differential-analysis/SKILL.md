@@ -1,0 +1,315 @@
+---
+name: differential-analysis
+title: miRNA differential expression analysis (limma-voom)
+description: "Filter lowly expressed miRNAs and run limma-voom differential expression on AnnData. Default to unpaired design unless the user explicitly requests paired and the data truly support paired analysis."
+---
+
+# miRNA Differential Expression Analysis
+
+## Overview
+
+This skill covers differential expression analysis for miRNA-seq data using limma-voom (pylimma):
+
+> 模态边界：当前 skill 只操作传入的单个模态 AnnData；本阶段不创建 MuData，也不做跨模态联合分析。
+> 统计设计约束：**默认使用非配对（unpaired）设计**。只有当用户明确要求配对（paired），且数据确实存在可用配对关系时，才允许切换到配对设计。
+
+| Step | Tool | Function | Purpose |
+|------|------|----------|---------|
+| 1 | filter_low_expression | `sa.diff.filter_low_expression` | Remove miRNAs with mean count ≤ 1 |
+| 2 | de_analysis | `sa.diff.de_analysis` | limma-voom DE (voom → lmFit → contrasts → eBayes) |
+| 3 | — | `adata.uns["de_results"]` | Inspect results for specific miRNAs |
+
+```
+Raw counts (adata.layers["counts"] 或 adata.X)
+    │
+    ▼
+filter_low_expression(min_mean=1.0)
+    │  移除平均 count ≤ 1 的低表达 miRNA
+    │  原始完整矩阵备份到 adata.uns["raw_counts"]
+    ▼
+de_analysis(control_group="Normal")
+    │  voom → lmFit → contrasts_fit → eBayes
+    ▼
+adata.uns["de_results"]  ← 全部基因的差异分析结果
+adata.uns["de_params"]   ← 对比元信息
+```
+
+## Prerequisites
+
+- **AnnData object** with raw miRNA counts in `adata.layers["counts"]` (or `adata.X`)
+- **Group labels** in `adata.obs` — a column indicating which samples belong to which group (e.g., `"Tumor"` vs `"Normal"`, `"Treat"` vs `"Ctrl"`)
+
+> ⚠️ **Agent 行动要求：必须先让用户确认分组信息！**
+>
+> 在开始差异分析之前，必须执行以下步骤：
+> 1. 检查 `adata.obs` 中是否有分组列。常见列名：`group`、`Condition`、`treatment`、`Group` 等。
+> 2. **主动向用户展示当前的分组情况**，让用户确认是否正确。
+> 3. 如果用户尚未设置分组，询问用户希望如何分组。
+> 4. 如果用户不确定分组来源，可以询问用户是否有样本信息表（CSV/Excel），或从 SRA/GEO 元数据获取（参见附录）。
+> 5. **无需单独确认统计设计。用户未明确指定时，直接使用 `unpaired`；只有用户明确指定 `paired` 才能切换。**
+> 6. 如果发现当前数据并不支持 paired（例如 `paired_feasible=false`、没有真实一一对应配对关系），**必须终止 paired 路线**，不得自动切回 paired，也不得把 paired/unpaired 两套都跑一遍。
+> 7. 如果存在多个候选检验方案或设计冲突，**先 ask user**，不要默认两套都跑。
+
+## Instructions
+
+### 1. 检查分组信息
+
+首先检查 `adata.obs` 中是否有分组列。`de_analysis` 会自动检测常见列名（`group`、`Condition`、`treatment` 等），也可以通过 `group_col` 参数指定任意列名：
+
+```python
+import sRNAgent as sa
+import anndata as ad
+
+adata = ad.read_h5ad("quantified_mirna.h5ad")
+
+# 查看所有可用的 obs 列
+print("所有 obs 列:", adata.obs.columns.tolist())
+
+# 如果已知道分组列名，直接确认
+group_col = "group"  # 也可以是 "Condition"、"treatment" 等，由用户指定
+if group_col in adata.obs.columns:
+    print(f"\n分组列 '{group_col}' 的分布:")
+    print(adata.obs[group_col].value_counts())
+```
+
+**向用户展示分组情况并确认：**
+
+```python
+for sample, grp in zip(adata.obs_names, adata.obs[group_col]):
+    print(f"  {sample}: {grp}")
+```
+
+> ⚠️ **必须让用户确认分组无误后再继续。** 如果用户要使用不同的列，通过后续 `de_analysis` 的 `group_col` 参数指定即可。
+
+如果用户还没有设置分组，询问后写入：
+
+```python
+# 示例：用户提供了分组列表
+adata.obs["group"] = ["Tumor", "Normal", ...]  # 用户提供
+```
+
+**确认无误后再继续后续步骤。**
+
+### 2. 过滤低表达 miRNA
+
+```python
+# 备份原始 counts
+adata.layers["counts"] = adata.X.copy()
+
+# 过滤：保留平均 count > 1 的 miRNA
+sa.diff.filter_low_expression(adata, min_mean=1.0)
+```
+
+过滤后：
+- 原始完整矩阵保存在 `adata.uns["raw_counts"]`
+- `adata.X`、`adata.layers["counts"]`、`adata.layers["logcpm"]` 等所有 layer 同步过滤
+- 打印保留/去除的 miRNA 数量
+
+### 3. 差异分析
+
+```python
+# 自动检测 group 列，指定对照组
+# 默认按非配对设计；除非用户明确要求 paired，否则不要加入 patient blocking / pairing 因子
+sa.diff.de_analysis(adata, control_group="Normal")
+
+# 查看结果
+print(adata.uns["de_results"].head())
+print(adata.uns["de_params"])
+```
+
+**`de_analysis` 自动完成：**
+1. 从 `adata.layers["counts"]` 读取原始 counts，写入 `adata.X`
+2. 自动检测 `adata.obs` 中的分组列（`group` / `Condition` / `treatment` 等）
+3. 创建设计矩阵 + 对比矩阵
+4. `voom` → `lm_fit` → `contrasts_fit` → `e_bayes`
+5. 全部基因的结果存入 `adata.uns["de_results"]`
+6. 对比元信息存入 `adata.uns["de_params"]`
+
+**统计设计强约束：**
+
+1. 默认按 **unpaired** 设计执行差异分析。
+2. 只有用户明确说“做配对检验 / paired”，且数据存在真实配对关系时，才允许使用 paired 设计。
+3. 如果用户明确要求 **unpaired**，不得自动切回 paired，不得加入 `patient blocking`、`donor blocking`、`group + patient_id` 之类的设计矩阵。
+4. 如果系统或上下文提示 `paired_feasible=false`，必须停止 paired 路线，并先向用户确认是否改为 unpaired。
+5. 没有用户明确授权时，禁止同时运行 paired 和 unpaired 两套 DE。
+
+**参数说明：**
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `group_col` | 自动检测 | 指定分组列名 |
+| `control_group` | 字母序第一个 | 指定对照组，该组作为比较基线 |
+| `output_dir` | `None` | 把 DE 全表落盘为 `<output_dir>/de_results.csv` 并登记 `<output_dir>/de_results_manifest.json`，结果跨会话可查 |
+| `force` | `False` | 设为 `True` 强制重算（默认：`adata.uns` 已有相同对比的 `de_results` 时直接复用缓存，不重跑） |
+
+> ⚠️ **幂等**：`de_analysis` 检测到 `adata.uns` 中已有相同 group 列 + 相同 treatment/control 的结果时会**跳过重算**（打印 `Cached results found`）。数据或分组变了想重跑时传 `force=True`。
+> ⚠️ **默认设计**：如果用户没有明确指定统计设计，统一按 **unpaired** 处理。
+
+### 4. 查看特定 miRNA 的差异结果
+
+```python
+de = adata.uns["de_results"]
+
+# 查看 miR-21-5p
+if "hsa-miR-21-5p" in de.index:
+    row = de.loc["hsa-miR-21-5p"]
+    print(f"logFC:     {row['log_fc']:.2f}")
+    print(f"P.Value:   {row['p_value']:.2e}")
+    print(f"adj.P.Val: {row['adj_p_value']:.2e}")
+
+# 按 p 值排序查看 top DE miRNAs
+print(de[["log_fc", "p_value", "adj_p_value"]].head(20))
+
+# 筛选显著差异的 miRNA
+sig = de[de["adj_p_value"] < 0.05]
+up = sig[sig["log_fc"] > 0]
+down = sig[sig["log_fc"] < 0]
+print(f"显著差异: {len(sig)} (上调 {len(up)}, 下调 {len(down)})")
+```
+
+### 5. 保存结果（必须，保证跨会话可查）
+
+```python
+# 跑 DE 时直接落盘 CSV + manifest（推荐）
+sa.diff.de_analysis(adata, control_group="Normal", output_dir="de_results")
+
+# 同时把带结果的 adata 写回 h5ad（uns 含 de_results / de_params）
+adata.write("de_results.h5ad")
+
+# 保存后 reload 验证结果仍在，再回复用户
+reload = ad.read_h5ad("de_results.h5ad")
+assert "de_results" in reload.uns, "DE 结果未随 h5ad 保存！"
+print(reload.uns["de_results"].head())
+print(reload.uns["de_params"])
+```
+
+> ⚠️ **持久化契约**：只有把 `uns['de_results']` 存进 h5ad（或落盘 CSV），新会话/新提问才能直接查结果。**如果 h5ad 里没有 DE 结果，不要为了回答查询而偷偷重跑 DE** —— 先按下面的"查询已有结果"流程查找。
+
+### 6. 查询已有差异分析结果（只读查询，禁止重跑）
+
+用户问"XX 的差异分析结果"时，按顺序查找，找到即止，**绝不重跑 DE**：
+
+```python
+import anndata as ad
+import os, glob
+
+# 1) 先看 adata.uns 里有没有
+adata = ad.read_h5ad("de_results.h5ad")  # 或工作区里最近的 h5ad
+if "de_results" in adata.uns:
+    de = adata.uns["de_results"]
+    if "hsa-miR-21-5p" in de.index:
+        print(de.loc["hsa-miR-21-5p"])   # ✅ 切片输出，禁止 print(de) 整表
+    raise SystemExit  # 找到即止，直接回复用户
+
+# 2) 再看工作区里登记的结果文件
+for manifest in glob.glob("**/de_results_manifest.json", recursive=True):
+    print(open(manifest).read())
+if os.path.exists("de_results/de_results.csv"):
+    import pandas as pd
+    de = pd.read_csv("de_results/de_results.csv", index_col=0)
+    print(de.loc["hsa-miR-21-5p"])       # ✅ 只打印目标行
+    raise SystemExit
+
+# 3) 旧 session 记录（run_report.json / chat.json）
+# ... 都没有 → 才向用户说明"现有结果不存在"，询问是否需要重新分析
+```
+
+> ⚠️ **输出纪律**：查询时只用切片输出（`df.loc[...]` / `df.head(n)`），**禁止 `print(adata)` / `print(整张 DE 表)`** —— 大输出会触发 LLM 服务端内容过滤（`input new_sensitive`），导致任务被硬中断。
+> ⚠️ 只有全部找不到、且用户明确要求重跑时，才执行新的 DE；重跑前必须告知用户。
+
+## 附录：如何获取分组信息
+
+如果用户没有现成的分组信息，可以尝试以下方式：
+
+### 方式一：用户提供样本信息表
+
+用户可能有 CSV/Excel 文件包含样本名与分组的对应关系：
+
+```python
+import pandas as pd
+info = pd.read_csv("sample_info.csv")  # 用户提供
+adata.obs["group"] = info.set_index("sample_name").loc[adata.obs_names, "group"]
+```
+
+### 方式二：从 ENA / GEO 元数据获取
+
+如果样本是 SRA Run ID（如 SRR 开头），可以通过公共数据库查询分组：
+
+```python
+# 通过 ENA API 获取 SRR → sample_title 映射
+import urllib.request, urllib.parse
+params = {"accession": "SRP335685", "result": "read_run",
+          "fields": "run_accession,sample_title", "format": "tsv", "limit": "0"}
+url = "https://www.ebi.ac.uk/ena/portal/api/filereport?" + urllib.parse.urlencode(params)
+with urllib.request.urlopen(url, timeout=30) as resp:
+    data = resp.read().decode()
+srr_to_sample = {}
+for line in data.strip().split("\n")[1:]:
+    parts = line.split("\t")
+    if len(parts) >= 2:
+        srr_to_sample[parts[0]] = parts[1]
+
+# 再通过 GEO 查询每个 sample 的分组
+# ...（详见 reference.md）
+```
+
+## Critical API Reference
+
+### 完整差异分析流程
+
+```python
+import sRNAgent as sa
+import anndata as ad
+
+# ── 1. 加载数据 ──
+adata = ad.read_h5ad("quantified_mirna.h5ad")
+
+# ── 2. 确认分组 ──
+# 确保 adata.obs 中有分组列，并经用户确认
+# group_col 可以是 "group"、"Condition"、"treatment" 等任意列名
+group_col = "group"
+print(adata.obs[[group_col]].to_string())  # 向用户展示确认
+
+# ── 3. 过滤低表达 ──
+adata.layers["counts"] = adata.X.copy()
+sa.diff.filter_low_expression(adata, min_mean=1.0)
+
+# ── 4. 差异分析 ──
+sa.diff.de_analysis(adata, control_group="Normal")
+
+# ── 5. 查看结果 ──
+de = adata.uns["de_results"]
+print(f"差异基因: {(de['adj_p_value'] < 0.05).sum()} 个")
+
+# ── 6. 保存 ──
+adata.write("de_results.h5ad")
+```
+
+### 输出格式
+
+```python
+# adata.uns["de_results"] — DataFrame，index = miRNA 名称
+# 列:
+#   log_fc       — log2 差异倍数 (treatment vs control)
+#   ave_expr     — 平均表达量
+#   t            — t 统计量
+#   p_value      — P 值
+#   adj_p_value  — FDR (BH) 校正 P 值
+#   b            — 对数 odds 值
+
+# adata.uns["de_params"] — dict
+#   group_col           — 使用的分组列名
+#   groups              — 所有分组列表
+#   treatment           — 处理组名称
+#   control             — 对照组名称
+#   contrast_formula    — 对比公式
+#   n_samples           — 样本数
+#   n_features          — 检测的特征数
+
+# adata.uns["raw_counts"] — 过滤前的完整 count 矩阵 (numpy array)
+```
+
+## References
+
+- Copy-paste-ready code templates: [`reference.md`](reference.md)
+- pylimma: <https://pypi.org/project/pylimma/>

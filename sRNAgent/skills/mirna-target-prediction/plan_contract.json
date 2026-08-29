@@ -1,0 +1,112 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "select-target-candidates-before-prediction",
+      "kind": "stage",
+      "activation": {"requires_skills": ["mirna-target-prediction"]},
+      "placement": {"before_skills": ["mirna-target-prediction"]},
+      "replaces": {
+        "title_patterns": ["(?:select|选择).*(?:candidate|候选)"]
+      },
+      "step": {
+        "title": "从差异结果确定靶标分析候选小 RNA",
+        "goal": "调用 sa.target.select_target_candidates。未给出用户明确候选列表时，必须使用已确认差异分析的 FDR < 0.05、logFC > 1 和 counts 层计算的算术平均 CPM > 5，并按 FDR 后效应量排序后默认仅选择前 5 个 candidate；不得从 logCPM 反推平均 CPM。将 feature IDs、阈值和 top_n 写入 adata.uns['target_candidate_selection']，不得运行 starBase、miRanda 或 UTR seed 扫描。",
+        "skill": "mirna-target-prediction",
+        "inputs": ["differential_results", "raw_counts"],
+        "outputs": ["target_candidates"]
+      }
+    },
+    {
+      "id": "confirm-target-candidates-before-prediction",
+      "kind": "approval",
+      "activation": {"requires_skills": ["mirna-target-prediction"]},
+      "placement": {"after_contracts": ["select-target-candidates-before-prediction"]},
+      "replaces": {
+        "title_patterns": ["(?:confirm|确认).*(?:candidate|候选|靶标)"]
+      },
+      "step": {
+        "title": "确认靶标预测候选集",
+        "goal": "展示 target_candidate_selection 的候选数、候选 feature IDs、方向、筛选阈值和 top_n。未得到确认不得开始 starBase、miRanda 或全 UTR seed 扫描。",
+        "skill": "mirna-target-prediction",
+        "inputs": ["target_candidates"],
+        "outputs": ["target_candidates_confirmed"]
+      },
+      "approval": {
+        "prompt": "确认上述候选小 RNA 后才会运行靶标预测与 3'UTR seed 扫描；默认仅预测差异筛选后排名前 5 个 candidate。需要更多候选时请明确指定数量或列表。",
+        "review": {
+          "fields": [
+            {"label": "候选集", "source": "target_candidate_selection", "unknown": "尚未生成，不能运行靶标预测"},
+            {"label": "待确认项目", "value": "候选 feature IDs、方向、FDR/logFC/平均 CPM 阈值、top_n"}
+          ],
+          "edit_hint": "回复“可以”继续；或指定 top_n、更加严格的 FDR/logFC/平均 CPM 阈值，或直接提供候选 feature ID 列表。"
+        }
+      }
+    },
+    {
+      "id": "target-prediction-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["mirna-target-prediction"]},
+      "selector": {
+        "skills": ["mirna-target-prediction"],
+        "title_patterns": ["(?:miRanda|靶标预测|target.*(?:miRanda|predict))"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "replaces": {
+        "title_patterns": ["(?:persist|save|write|保存|持久化).*(?:target|靶标|isomir_adata)"]
+      },
+      "io": {
+        "inputs": ["target_candidates_confirmed", "three_prime_utr_fasta", "mirna_sequence_metadata"],
+        "outputs": ["isomir_target_predictions", "target_prediction_results", "seed_utr_evidence"]
+      }
+    },
+    {
+      "id": "target-prediction-execution-contract",
+      "kind": "execution",
+      "activation": {"requires_skills": ["mirna-target-prediction"]},
+      "selector": {
+        "skills": ["mirna-target-prediction"],
+        "title_patterns": ["(?:miRanda|靶标预测|target.*(?:miRanda|predict))"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "execution": {
+        "instructions": "Use only feature IDs from adata.uns['target_candidate_selection'] or an explicitly user-provided list. seed_utr_matches requires only the selected AnnData sequence values and the 3' UTR FASTA; never require or consume sample_mirtop_gff, merged_mirtop_gff, or hairpin_bam. The target tools reject unselected whole-matrix scans unless the user explicitly approved allow_all_features=True."
+      }
+    },
+    {
+      "id": "parent-mirna-target-prediction-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["mirna-target-prediction"]},
+      "selector": {
+        "skills": ["mirna-target-prediction"],
+        "title_patterns": ["(?:parent|父).*(?:miRNA|靶标|target)|(?:miRNA|靶标|target).*(?:parent|父)"],
+        "exclude_workflow_contracts": true,
+        "require_title_match": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["target_candidates_confirmed", "three_prime_utr_fasta", "mirna_sequence_metadata", "isomir_target_predictions"],
+        "outputs": ["parent_mirna_target_predictions"]
+      }
+    },
+    {
+      "id": "isomir-parent-target-comparison-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["mirna-target-prediction"]},
+      "selector": {
+        "skills": ["mirna-target-prediction"],
+        "title_patterns": ["(?:compare|比较).*(?:isomir|parent|miRNA|靶标)|(?:isomir|parent|miRNA|靶标).*(?:compare|比较)"],
+        "exclude_workflow_contracts": true,
+        "require_title_match": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["isomir_target_predictions", "parent_mirna_target_predictions", "seed_utr_evidence"],
+        "outputs": ["isomir_vs_parent_target_diff"]
+      }
+    }
+  ]
+}

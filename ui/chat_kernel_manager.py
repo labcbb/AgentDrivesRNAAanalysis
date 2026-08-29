@@ -1,0 +1,189 @@
+"""Per-chat Jupyter kernel lifecycle (persist under work_space/sessions/{chatId}/)."""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import threading
+from pathlib import Path
+from typing import Dict, Optional
+
+from sRNAgent.agent.agent_config import EXECUTION_TIMEOUT_SEC, ExecutionConfig, SandboxFallbackPolicy
+from sRNAgent.agent.execution import ExecutionBackend, initialize_execution_backend
+
+from session_store import delete_session, migrate_legacy_session, sanitize_chat_id, session_dir, sessions_root
+from work_space import get_work_space
+
+logger = logging.getLogger(__name__)
+
+_CHAT_EXECUTIONS: Dict[str, ExecutionBackend] = {}
+_CHAT_LOCK = threading.Lock()
+
+
+def notebook_execution_enabled() -> bool:
+    """Use a persistent per-chat Jupyter kernel unless explicitly disabled."""
+    value = os.environ.get("SRNAGENT_USE_NOTEBOOK", "").strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _chat_session_dir(chat_id: str) -> Path:
+    return session_dir(chat_id)
+
+
+def _default_execution_config() -> ExecutionConfig:
+    return ExecutionConfig(
+        use_notebook=notebook_execution_enabled(),
+        max_prompts_per_session=10_000,
+        storage_dir=sessions_root(),
+        strict_kernel_validation=False,
+        strict_env_validation=False,
+        sandbox_fallback_policy=SandboxFallbackPolicy.WARN_AND_FALLBACK,
+        workspace_dir=get_work_space(),
+        timeout=EXECUTION_TIMEOUT_SEC,
+    )
+
+
+def _create_chat_execution(project_root: Path, chat_id: str) -> ExecutionBackend:
+    chat_id = sanitize_chat_id(chat_id)
+    migrate_legacy_session(chat_id)
+    session_path = _chat_session_dir(chat_id)
+    session_path.mkdir(parents=True, exist_ok=True)
+    execution = initialize_execution_backend(
+        project_root,
+        config=_default_execution_config(),
+    )
+    executor = execution.notebook_executor
+    if executor is not None:
+        executor.configure_persistence(session_path)
+        if not executor.try_reconnect():
+            logger.info("Starting new kernel for chat %s", chat_id)
+    return execution
+
+
+def get_chat_execution(
+    project_root: Path,
+    chat_id: str,
+    *,
+    create: bool = True,
+) -> Optional[ExecutionBackend]:
+    """Return per-chat execution backend.
+
+    create=False avoids mkdir/kernel start — used by KernelPanel polling so
+    brand-new chats do not leave empty session shells on disk.
+    """
+    chat_id = sanitize_chat_id(chat_id)
+    with _CHAT_LOCK:
+        execution = _CHAT_EXECUTIONS.get(chat_id)
+        if execution is not None:
+            return execution
+        if not create:
+            return None
+        execution = _create_chat_execution(project_root, chat_id)
+        _CHAT_EXECUTIONS[chat_id] = execution
+        return execution
+
+
+def kernel_is_busy(project_root: Path, chat_id: str) -> bool:
+    """True when the chat kernel is executing code or inspect."""
+    try:
+        chat_id = sanitize_chat_id(chat_id)
+    except ValueError:
+        return False
+
+    with _CHAT_LOCK:
+        execution = _CHAT_EXECUTIONS.get(chat_id)
+
+    if execution is None or execution.notebook_executor is None:
+        return False
+    return bool(getattr(execution.notebook_executor, "is_busy", lambda: False)())
+
+
+def interrupt_chat_kernel(project_root: Path, chat_id: str, *, force: bool = False) -> bool:
+    """Interrupt the Jupyter kernel for a chat (best-effort).
+
+    By default only interrupts when the kernel is busy executing code.
+    Pass force=True for explicit user stop requests.
+    """
+    try:
+        chat_id = sanitize_chat_id(chat_id)
+    except ValueError:
+        return False
+
+    with _CHAT_LOCK:
+        execution = _CHAT_EXECUTIONS.get(chat_id)
+
+    if execution is None:
+        if not force:
+            logger.debug("Skip kernel interrupt for chat %s (no active executor)", chat_id)
+            return False
+        connection_file = _chat_session_dir(chat_id) / "kernel.json"
+        if not connection_file.exists():
+            return False
+        try:
+            from jupyter_client import KernelManager
+
+            km = KernelManager()
+            km.load_connection_file(str(connection_file))
+            if not km.is_alive():
+                return False
+            km.interrupt_kernel()
+            logger.info("Interrupted orphan kernel for chat %s", chat_id)
+            return True
+        except Exception as exc:
+            logger.warning("Failed to interrupt orphan kernel for chat %s: %s", chat_id, exc)
+            return False
+
+    executor = execution.notebook_executor
+    if executor is not None and not force and not getattr(executor, "is_busy", lambda: False)():
+        logger.debug("Skip kernel interrupt for chat %s (kernel idle)", chat_id)
+        return False
+
+    interrupted = execution.interrupt()
+    if interrupted:
+        logger.info("Interrupted kernel for chat %s", chat_id)
+    return interrupted
+
+
+def release_chat_kernel(chat_id: str, *, remove_session: bool = False) -> bool:
+    """Shutdown in-memory / orphan Jupyter kernel for a chat.
+
+    By default only releases the kernel. Pass remove_session=True (or call
+    delete_chat_session) to also wipe work_space/sessions/{chatId}/.
+    """
+    chat_id = sanitize_chat_id(chat_id)
+    with _CHAT_LOCK:
+        execution = _CHAT_EXECUTIONS.pop(chat_id, None)
+
+    released = False
+    if execution is not None:
+        executor = execution.notebook_executor
+        if executor is not None:
+            executor.shutdown(remove_persisted=False)
+            released = True
+
+    session_path = _chat_session_dir(chat_id)
+    if session_path.exists():
+        connection_file = session_path / "kernel.json"
+        if connection_file.exists():
+            try:
+                from jupyter_client import KernelManager
+
+                km = KernelManager()
+                km.load_connection_file(str(connection_file))
+                if km.is_alive():
+                    km.shutdown_kernel(now=False, restart=False)
+                    released = True
+            except Exception as exc:
+                logger.debug("Failed to shutdown orphan kernel: %s", exc)
+
+    if remove_session:
+        deleted = delete_session(chat_id)
+        if deleted:
+            logger.info("Removed session directory for chat %s", chat_id)
+            return True
+    return released
+
+
+def delete_chat_session(chat_id: str) -> bool:
+    """Fully delete a chat session directory and release its kernel."""
+    return release_chat_kernel(chat_id, remove_session=True)
