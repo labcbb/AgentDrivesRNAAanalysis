@@ -419,6 +419,36 @@ AGENT_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "spawn_subagent",
+            "description": (
+                "Delegate a self-contained sub-task to a sub-agent that runs its "
+                "own tool loop and returns a single summary. Use for scoped work "
+                "like exploring the workspace, summarising existing results, or "
+                "running a concrete code sub-task. agent_type=explore (read-only "
+                "reconnaissance), analyze (read-only summary of existing results), "
+                "or code (execute a concrete sub-task). The sub-agent cannot spawn "
+                "further sub-agents."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Self-contained sub-task description.",
+                    },
+                    "agent_type": {
+                        "type": "string",
+                        "enum": ["explore", "analyze", "code"],
+                        "description": "Sub-agent type (default: explore).",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish",
             "description": (
                 "Send your final reply directly to the user in chat. "

@@ -1205,6 +1205,7 @@ class SRNAgent:
         self.checkpoint_dir = getattr(exec_cfg, "checkpoint_dir", None)
         self.active_chat_id = ""
         self._active_goal_gate = None
+        self._subagent_skill_overview = skill_overview
 
         env_name = self.execution.runtime.conda_env or "unknown"
         mode = "notebook" if self.execution.use_notebook else "in-process"

@@ -408,6 +408,15 @@ def run_lc_tool_loop(
                 result = get_default_manager().call_mcp_tool(name, arguments)
                 if result is None:
                     result = f"MCP tool '{name}' not found or server disconnected."
+            elif name == "spawn_subagent":
+                from .agent_teams import spawn_subagent
+                agent_type = str(arguments.get("agent_type") or "explore")
+                sub_prompt = normalize_text_payload(arguments.get("prompt")) or ""
+                agent._emit_progress(
+                    on_progress, "status",
+                    message=f"子智能体（{agent_type}）执行中…",
+                )
+                result = spawn_subagent(agent, sub_prompt, agent_type=agent_type)
             else:
                 result = agent.dispatch_tool(name, arguments)
 
