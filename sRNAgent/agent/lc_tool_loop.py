@@ -417,6 +417,16 @@ def run_lc_tool_loop(
                     message=f"子智能体（{agent_type}）执行中…",
                 )
                 result = spawn_subagent(agent, sub_prompt, agent_type=agent_type)
+            elif name == "spawn_subagents":
+                from .agent_teams import spawn_subagents
+                tasks = arguments.get("tasks") or []
+                if not isinstance(tasks, list):
+                    tasks = []
+                agent._emit_progress(
+                    on_progress, "status",
+                    message=f"{len(tasks)} 个子智能体并行执行中…",
+                )
+                result = spawn_subagents(agent, tasks)
             else:
                 result = agent.dispatch_tool(name, arguments)
 

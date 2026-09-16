@@ -126,6 +126,50 @@ def spawn_subagent(
     return bounded_tool_result(summary, getattr(parent_agent, "max_tool_result_chars", 8000))
 
 
+def spawn_subagents(
+    parent_agent: Any,
+    tasks: List[Dict[str, Any]],
+) -> str:
+    """Run multiple sub-agents CONCURRENTLY; return all summaries.
+
+    Each task is ``{"prompt": str, "agent_type": str}``.  Sub-agents run in a
+    thread pool and share the parent's execution backend, so code-execution
+    tasks should be read-only or operate on disjoint state to avoid kernel
+    races.  For independent reconnaissance this is safe and fast.
+
+    Returns a single string with each sub-agent's summary under a numbered
+    header, suitable to use as one tool result.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not tasks:
+        return "[spawn_subagents] no tasks provided"
+
+    def _run_one(index: int, task: Dict[str, Any]) -> tuple[int, str]:
+        prompt = str(task.get("prompt") or "")
+        agent_type = str(task.get("agent_type") or "explore")
+        try:
+            summary = spawn_subagent(parent_agent, prompt, agent_type=agent_type)
+        except Exception as exc:  # noqa: BLE001
+            summary = f"[sub-agent {index} error] {exc}"
+        return index, summary
+
+    results: Dict[int, str] = {}
+    # Cap concurrency to avoid overwhelming the shared LLM/kernel.
+    max_workers = min(len(tasks), 4)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_run_one, i, t) for i, t in enumerate(tasks)]
+        for fut in as_completed(futures):
+            idx, summary = fut.result()
+            results[idx] = summary
+
+    parts = []
+    for idx in sorted(results):
+        parts.append(f"### Sub-agent {idx}\n{results[idx]}")
+    combined = "\n\n".join(parts)
+    return bounded_tool_result(combined, getattr(parent_agent, "max_tool_result_chars", 8000))
+
+
 def _run_subagent_loop(
     parent_agent: Any,
     messages: List[Dict[str, Any]],

@@ -140,3 +140,72 @@ def test_subagent_result_is_bounded():
     parent.max_tool_result_chars = 200
     result = spawn_subagent(parent, "test", agent_type="explore")
     assert len(result) <= 250  # bounded + truncation marker
+
+
+def test_spawn_subagents_parallel():
+    """Multiple sub-agents run concurrently and all summaries returned."""
+    # Each sub-agent finishes immediately with distinct text.
+    def make_llm(text):
+        return _FakeLLM([_FakeCompletion(content=text)])
+
+    # Three independent tasks; spawn_subagents runs them in a thread pool.
+    # We give each its own LLM via a parent that returns a per-task LLM.
+    import threading
+    counters = {"calls": 0}
+    lock = threading.Lock()
+
+    class _PerTaskLLM:
+        def complete(self, messages, tools=None, enable_thinking=None):
+            with lock:
+                counters["calls"] += 1
+            return _FakeCompletion(content=f"summary-{counters['calls']}")
+
+    parent = MagicMock()
+    parent.llm = _PerTaskLLM()
+    parent.max_tool_result_chars = 8000
+    parent._subagent_skill_overview = ""
+    parent.dispatch_tool = lambda name, args: "ok"
+
+    tasks = [
+        {"prompt": "inspect FASTQ dir", "agent_type": "explore"},
+        {"prompt": "inspect alignment dir", "agent_type": "explore"},
+        {"prompt": "inspect DE results", "agent_type": "analyze"},
+    ]
+    from sRNAgent.agent.agent_teams import spawn_subagents
+    result = spawn_subagents(parent, tasks)
+    assert "Sub-agent 0" in result
+    assert "Sub-agent 1" in result
+    assert "Sub-agent 2" in result
+    assert counters["calls"] == 3
+
+
+def test_spawn_subagents_empty():
+    from sRNAgent.agent.agent_teams import spawn_subagents
+    parent = _make_parent(_FakeLLM([]))
+    result = spawn_subagents(parent, [])
+    assert "no tasks" in result
+
+
+def test_spawn_subagents_captures_error():
+    def boom_dispatch(name, args):
+        raise RuntimeError("fail")
+
+    class _BoomLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, messages, tools=None, enable_thinking=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("llm exploded")
+            return _FakeCompletion(content="ok")
+
+    parent = MagicMock()
+    parent.llm = _BoomLLM()
+    parent.max_tool_result_chars = 8000
+    parent._subagent_skill_overview = ""
+    parent.dispatch_tool = boom_dispatch
+
+    from sRNAgent.agent.agent_teams import spawn_subagents
+    result = spawn_subagents(parent, [{"prompt": "x", "agent_type": "explore"}])
+    assert "error" in result

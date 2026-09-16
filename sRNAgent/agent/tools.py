@@ -449,6 +449,40 @@ AGENT_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "spawn_subagents",
+            "description": (
+                "Run MULTIPLE sub-agents CONCURRENTLY for independent sub-tasks. "
+                "Each gets a fresh context and returns one summary. Use when several "
+                "independent areas can be explored at once (e.g. inspect FASTQ dir, "
+                "alignment dir, and DE results in parallel). Faster than calling "
+                "spawn_subagent multiple times serially."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string"},
+                                "agent_type": {
+                                    "type": "string",
+                                    "enum": ["explore", "analyze", "code"],
+                                },
+                            },
+                            "required": ["prompt"],
+                        },
+                        "description": "List of independent sub-tasks to run in parallel.",
+                    },
+                },
+                "required": ["tasks"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "finish",
             "description": (
                 "Send your final reply directly to the user in chat. "
