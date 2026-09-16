@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from .context import bounded_tool_result, normalize_text_payload
+from .hooks import get_default_registry
 from .tools import AGENT_TOOL_SCHEMAS
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ class ToolLoopState(TypedDict, total=False):
     chat_id: str
     pending_tool_calls: List[Dict[str, Any]]
     assistant_content: str
+    rounds_since_plan_update: int
 
 
 def _summarize_tool_call(name: str, arguments: Dict[str, Any]) -> str:
@@ -96,10 +98,30 @@ def run_lc_tool_loop(
     code_approval_callback: Optional[Any] = None,
     chat_id: str = "",
     checkpoint_extra: Optional[Dict[str, Any]] = None,
+    goal_gate: Optional[Any] = None,
 ) -> str:
     """Run the LangGraph tool loop; return the final user-facing answer."""
 
     max_turns = int(getattr(agent, "max_turns", 200) or 200)
+    hooks = get_default_registry()
+
+    def _evaluate_stop(msgs: List[Dict[str, Any]], answer: str) -> Optional[str]:
+        """Return non-None to force another turn (Stop hook or goal gate)."""
+        # 1. User-registered Stop hooks
+        force = hooks.trigger_stop(msgs, answer)
+        if force is not None:
+            return force
+        # 2. Goal gate (s17 pattern)
+        if goal_gate is not None and getattr(goal_gate, "active", False):
+            llm_fn = getattr(agent, "_evaluator_complete", None)
+            decision = goal_gate.evaluate(msgs, answer, llm_complete=llm_fn)
+            if decision.action == "block":
+                return goal_gate.block_message(decision)
+            if decision.action == "impossible":
+                return f"[Goal impossible]\n{decision.reason}\nExplain to the user and stop."
+            if decision.action == "limit":
+                return f"[Goal limit reached]\n{decision.reason}\nSummarize what was done and stop."
+        return None
 
     def model_node(state: ToolLoopState) -> Dict[str, Any]:
         agent._check_cancelled(cancel_event)
@@ -132,6 +154,17 @@ def run_lc_tool_loop(
                     on_progress=on_progress,
                     cancel_event=cancel_event,
                 )
+                # Stop hook / goal gate: force another turn if goal not met.
+                force = _evaluate_stop(msgs, answer)
+                if force is not None:
+                    msgs.append({"role": "user", "content": force})
+                    return {
+                        "messages": msgs,
+                        "turn": turn + 1,
+                        "done": False,
+                        "pending_tool_calls": [],
+                        "rounds_since_plan_update": int(state.get("rounds_since_plan_update") or 0) + 1,
+                    }
                 agent._save_run_checkpoint(msgs, chat_id, checkpoint_extra)
                 if checkpoint_extra is None:
                     agent._clear_run_checkpoint(chat_id)
@@ -204,6 +237,26 @@ def run_lc_tool_loop(
                 on_progress=on_progress,
                 cancel_event=cancel_event,
             )
+            # Goal gate: even on explicit finish, check if goal is met.
+            force = _evaluate_stop(msgs, message)
+            if force is not None:
+                msgs.append({"role": "user", "content": force})
+                agent._emit_progress(
+                    on_progress,
+                    "tool_call",
+                    turn=turn + 1,
+                    toolCallId=item["id"],
+                    name="finish",
+                    summary=_summarize_tool_call("finish", item["arguments"]),
+                    arguments=item["arguments"],
+                )
+                return {
+                    "messages": msgs,
+                    "turn": turn + 1,
+                    "done": False,
+                    "pending_tool_calls": [],
+                    "rounds_since_plan_update": int(state.get("rounds_since_plan_update") or 0) + 1,
+                }
             agent._save_run_checkpoint(msgs, chat_id, checkpoint_extra)
             if checkpoint_extra is None:
                 agent._clear_run_checkpoint(chat_id)
@@ -270,7 +323,11 @@ def run_lc_tool_loop(
                     "pending_tool_calls": [],
                 }
 
-            if name == "execute_code":
+            # PreToolUse hook: non-None return blocks the tool (used as result).
+            blocked = hooks.trigger_pre_tool_use(name, arguments, msgs)
+            if blocked is not None:
+                result = blocked
+            elif name == "execute_code":
                 tool_arguments = _normalize_execute_code_args(arguments)
                 code = str(tool_arguments.get("code") or "")
                 description = str(tool_arguments.get("description") or "")
@@ -318,6 +375,10 @@ def run_lc_tool_loop(
                 result = agent.dispatch_tool(name, arguments)
 
             result = bounded_tool_result(result, agent.max_tool_result_chars)
+
+            # PostToolUse hook (side-effects only: logging, output guards).
+            hooks.trigger_post_tool_use(name, arguments, result, msgs)
+
             if name == "execute_code":
                 agent._emit_progress(
                     on_progress,
@@ -337,11 +398,25 @@ def run_lc_tool_loop(
                 }
             )
 
+        # Plan-step reminder: if 3+ turns passed without a plan update, nudge.
+        rounds_since = int(state.get("rounds_since_plan_update") or 0) + 1
+        if rounds_since >= 3:
+            rounds_since = 0
+            msgs.append({
+                "role": "user",
+                "content": (
+                    "<reminder>You have not updated the plan in a few turns. "
+                    "If you are working through a multi-step task, review your "
+                    "current step status and update it before continuing.</reminder>"
+                ),
+            })
+
         agent._save_run_checkpoint(msgs, chat_id, checkpoint_extra)
         return {
             "messages": msgs,
             "pending_tool_calls": [],
             "done": False,
+            "rounds_since_plan_update": rounds_since,
         }
 
     def after_model(state: ToolLoopState) -> str:
@@ -380,6 +455,7 @@ def run_lc_tool_loop(
             "chat_id": chat_id,
             "pending_tool_calls": [],
             "final_answer": "",
+            "rounds_since_plan_update": 0,
         }
     )
     answer = str(final.get("final_answer") or "").strip()

@@ -1402,6 +1402,13 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
             run_context = _build_run_context(chat_id, user_query=user_query)
             available_artifacts = load_session_memory(chat_id).get("artifacts") if chat_id else []
+            # Goal gate: if the user set a goal condition, wire it into the agent.
+            goal_condition = str(body.get("goalCondition") or "").strip()
+            if goal_condition:
+                from sRNAgent.agent.goal_gate import GoalGate
+                agent._active_goal_gate = GoalGate(goal_condition)
+            else:
+                agent._active_goal_gate = None
             # LangGraph (default) owns answer-vs-plan routing; domain execution
             # still calls run_with_history / run_planned under the hood.
             turn = run_agent_turn(

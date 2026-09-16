@@ -1196,6 +1196,7 @@ class SRNAgent:
         self.enable_checkpoint = bool(getattr(exec_cfg, "enable_checkpoint", True))
         self.checkpoint_dir = getattr(exec_cfg, "checkpoint_dir", None)
         self.active_chat_id = ""
+        self._active_goal_gate = None
 
         env_name = self.execution.runtime.conda_env or "unknown"
         mode = "notebook" if self.execution.use_notebook else "in-process"
@@ -1394,6 +1395,22 @@ class SRNAgent:
             "Context compacted: %d → %d est. tokens", before, after
         )
         return messages
+
+    def _evaluator_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        system: str = "",
+    ) -> str:
+        """Lightweight LLM call with no tools — used by the goal gate evaluator."""
+        msgs = list(messages)
+        if system:
+            msgs = [{"role": "system", "content": system}] + msgs
+        try:
+            completion = self.llm.complete(msgs, tools=None, enable_thinking=False)
+            return _resolve_answer_text(completion)
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _ensure_user_facing_reply(
         self,
@@ -1697,6 +1714,7 @@ class SRNAgent:
                 code_approval_callback=code_approval_callback,
                 chat_id=chat_id,
                 checkpoint_extra=checkpoint_extra,
+                goal_gate=getattr(self, "_active_goal_gate", None),
             )
 
         for turn in range(self.max_turns):
