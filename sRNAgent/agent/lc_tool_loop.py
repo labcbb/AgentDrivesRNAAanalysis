@@ -17,12 +17,14 @@ import json
 import logging
 import os
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from .context import bounded_tool_result, normalize_text_payload
 from .hooks import get_default_registry
+from .mcp_client import get_default_manager
 from .tools import AGENT_TOOL_SCHEMAS
 
 logger = logging.getLogger(__name__)
@@ -121,7 +123,20 @@ def run_lc_tool_loop(
                 return f"[Goal impossible]\n{decision.reason}\nExplain to the user and stop."
             if decision.action == "limit":
                 return f"[Goal limit reached]\n{decision.reason}\nSummarize what was done and stop."
+        # 3. Memory extraction (s09 pattern) — opt-in, only on genuine stop.
+        if os.environ.get("SRNAGENT_MEMORY_EXTRACT", "").lower() in ("1", "true", "yes"):
+            _extract_memories_on_stop(agent, msgs)
         return None
+
+    def _extract_memories_on_stop(agent: Any, msgs: List[Dict[str, Any]]) -> None:
+        """Extract durable memories at the stop boundary."""
+        try:
+            from .memory import extract_memories
+            workspace = getattr(agent, "project_root", None) or Path.cwd()
+            llm_fn = getattr(agent, "_evaluator_complete", None)
+            extract_memories(msgs, Path(workspace), llm_complete=llm_fn)
+        except Exception:  # noqa: BLE001
+            pass
 
     def model_node(state: ToolLoopState) -> Dict[str, Any]:
         agent._check_cancelled(cancel_event)
@@ -135,10 +150,28 @@ def run_lc_tool_loop(
             list(state.get("messages") or []),
             on_progress=on_progress,
         )
+        # Background task notification injection (s11 pattern).
+        try:
+            from .background import inject_background_notifications
+            inject_background_notifications(msgs)
+        except Exception:  # noqa: BLE001
+            pass
+        # Assemble dynamic tool pool: built-in + MCP (s14 pattern).
+        mcp = get_default_manager()
+        active_tools = AGENT_TOOL_SCHEMAS
+        if mcp.list_servers():
+            mcp_tools = []
+            for server_name in mcp.list_servers():
+                with mcp._lock:
+                    client = mcp._servers.get(server_name)
+                if client and client.connected:
+                    mcp_tools.extend(client.tool_schemas())
+            if mcp_tools:
+                active_tools = list(AGENT_TOOL_SCHEMAS) + mcp_tools
         agent._emit_progress(on_progress, "status", message="正在请求 LLM…")
         completion = agent._llm_complete_cancellable(
             msgs,
-            tools=AGENT_TOOL_SCHEMAS,
+            tools=active_tools,
             cancel_event=cancel_event,
             on_progress=on_progress,
             enable_thinking=False,
@@ -371,6 +404,10 @@ def run_lc_tool_loop(
                     )
                 else:
                     result = agent.dispatch_tool(name, tool_arguments)
+            elif get_default_manager().is_mcp_tool(name):
+                result = get_default_manager().call_mcp_tool(name, arguments)
+                if result is None:
+                    result = f"MCP tool '{name}' not found or server disconnected."
             else:
                 result = agent.dispatch_tool(name, arguments)
 

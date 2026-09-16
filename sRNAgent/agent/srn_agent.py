@@ -1148,6 +1148,14 @@ def _build_system_prompt(skill_overview: str, extra_system: str = "") -> str:
     return base
 
 
+def _extract_user_query(history: List[Dict[str, str]]) -> str:
+    """Pull the most recent user message from history for memory selection."""
+    for item in reversed(history or []):
+        if item.get("role") == "user":
+            return str(item.get("content") or "")
+    return ""
+
+
 class SRNAgent:
     """Minimal agent runtime with search_functions / search_skills / execute_code."""
 
@@ -1946,12 +1954,27 @@ class SRNAgent:
     ) -> str:
         started_at = time.time()
         messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        # Memory selection (s09 pattern): inject relevant cross-session memories.
+        try:
+            from .memory import select_relevant_memories
+            user_query = _extract_user_query(history) if history else ""
+            memory_block = select_relevant_memories(
+                user_query, self.project_root,
+                llm_complete=getattr(self, "_evaluator_complete", None),
+            )
+        except Exception:  # noqa: BLE001
+            memory_block = ""
         # 把会话级持久记忆（之前做过什么、产物在哪、用户决策）注入 system，
         # 让普通对话模式（run_with_history）不再失忆 —— 之前只有 plan 模式有
+        system_parts = [self.system_prompt]
+        if memory_block:
+            system_parts.append(memory_block)
         if extra_context:
+            system_parts.append(f"## 之前的工作记忆\n{extra_context}")
+        if len(system_parts) > 1:
             messages[0] = {
                 "role": "system",
-                "content": f"{self.system_prompt}\n\n## 之前的工作记忆\n{extra_context}",
+                "content": "\n\n".join(system_parts),
             }
 
         if resume and chat_id:
