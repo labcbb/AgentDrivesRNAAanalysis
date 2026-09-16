@@ -5,10 +5,13 @@ with its own turn budget (max_turns per step).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from copy import deepcopy
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .plan_state import (
     PlanGraph,
@@ -21,7 +24,7 @@ from .plan_state import (
 )
 from .plan_lifecycle import PlanLifecycle, clone_plan
 from .context import normalize_text_payload
-from .intent_router import IntentRouter, RouteIntent
+from .intent_router import IntentRouter, RouteIntent, is_gate_actionable_reply, is_plan_approval_confirm
 from .tools import list_available_skills, rank_skill_matches, resolve_skill_query
 from .workflow_contracts import WorkflowCompiler, apply_workflow_nodes, load_workflow_nodes, wire_artifact_dependencies
 
@@ -29,7 +32,7 @@ if TYPE_CHECKING:
     from .srn_agent import SRNAgent, ProgressCallback, CodeApprovalCallback
 
 _APPROVAL_ACCEPT_RE = re.compile(
-    r"^\s*(?:可以|确认(?:使用|执行|继续)?|同意|继续|按(?:此|上述)|采用|yes|ok|okay)(?:\s|[，,。.!！]|$)",
+    r"^\s*(?:可以|确认(?:使用|执行|继续|运行)?|同意|继续|按(?:此|上述)|采用|yes|ok|okay)(?:\s|[，,。.!！]|$)",
     re.I,
 )
 _APPROVAL_REJECT_RE = re.compile(
@@ -44,7 +47,7 @@ _APPROVAL_ASSIGNMENT_RE = re.compile(
 _APPROVAL_EXPLICIT_VALUE_RE = re.compile(r"\b(?:unstranded|forward|reverse|paired|unpaired)\b|\b[ACGTUN]{8,}\b", re.I)
 _APPROVAL_AFFIRMATION_RE = re.compile(
     r"^\s*(?:可以(?:的|啊|呀)?|可(?:以|行)|好(?:的|啊|呀)?|没问题|行|同意|确认|"
-    r"ok(?:ay)?|yes|yep|sure|go\s+ahead)\s*[，,。.!！]?\s*$",
+    r"ok(?:ay)?(?:\s+go\s+ahead)?|yes|yep|sure|go\s+ahead)\s*[，,。.!！]?\s*$",
     re.I,
 )
 _GROUP_CONFIRMATION_RE = re.compile(
@@ -1981,17 +1984,188 @@ def _build_step_user_message(
     )
 
 
+# Whole-phrase cancel markers only. A bare "cancelled" substring used to false-
+# fail steps whose success prose mentioned cancelled samples / filters.
+_CANCELLED_RESULT_MARKERS = (
+    "agent run cancelled",
+    "agent run canceled",
+    "agent cancelled",
+    "agent canceled",
+    "cancelled by user",
+    "canceled by user",
+    "user cancelled",
+    "user canceled",
+    "task was cancelled",
+    "task was canceled",
+)
+_TRANSIENT_ERROR_MARKERS = (
+    "llm http 408",
+    "llm http 409",
+    "llm http 425",
+    "llm http 429",
+    "llm http 500",
+    "llm http 502",
+    "llm http 503",
+    "llm http 504",
+    "llm connection error",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "connection refused",
+    "broken pipe",
+    "temporary failure",
+)
+_MAX_STEP_TRANSIENT_RETRIES = 2
+_REL_OUTPUT_PATH_RE = re.compile(
+    r"(?:^|[\s`'\"(=])((?:results|references|reports|figures)/[A-Za-z0-9_./\-]+)"
+)
+
+
+def _is_max_turns_result(result: str) -> bool:
+    lowered = (result or "").lower()
+    return "max turns" in lowered or "reached max turns" in lowered
+
+
+def _is_cancelled_result(result: str) -> bool:
+    lowered = (result or "").lower()
+    return any(marker in lowered for marker in _CANCELLED_RESULT_MARKERS)
+
+
+def _is_transient_error_text(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _is_transient_exception(exc: BaseException) -> bool:
+    if type(exc).__name__ == "AgentCancelledError":
+        return False
+    return _is_transient_error_text(f"{type(exc).__name__}: {exc}")
+
+
+def _is_transient_step_error(result: str) -> bool:
+    lowered = (result or "").lower()
+    if "step_execution_error:" not in lowered:
+        return False
+    return _is_transient_error_text(lowered)
+
+
 def _step_failed(result: str) -> bool:
     lowered = (result or "").lower()
-    if "max turns" in lowered or "reached max turns" in lowered:
+    if _is_max_turns_result(result):
         return True
     if "agent stopped without" in lowered:
         return True
-    if "cancelled" in lowered or "canceled" in lowered:
+    if _is_cancelled_result(result):
         return True
     if "step_execution_error:" in lowered:
         return True
     return False
+
+
+def _step_failure_message(step_index: int, result: str) -> str:
+    """Human-facing failure reason; do not always blame max turns."""
+    if _is_max_turns_result(result):
+        return f"步骤 {step_index} 未在轮次上限内完成"
+    if _is_transient_step_error(result):
+        return f"步骤 {step_index} 因临时 API/网络错误中断"
+    if _is_cancelled_result(result):
+        return f"步骤 {step_index} 已取消"
+    lowered = (result or "").lower()
+    if "agent stopped without" in lowered:
+        return f"步骤 {step_index} 未返回最终结果"
+    if "step_execution_error:" in lowered:
+        detail = (result or "").split(":", 1)[-1].strip()
+        if len(detail) > 160:
+            detail = detail[:157] + "…"
+        return f"步骤 {step_index} 执行异常：{detail or '未知错误'}"
+    return f"步骤 {step_index} 未完成"
+
+
+def _existing_workspace_paths(workspace: Path, text: str) -> List[Path]:
+    found: List[Path] = []
+    seen: set[str] = set()
+    for match in _REL_OUTPUT_PATH_RE.finditer(text or ""):
+        rel = match.group(1).rstrip(".,;:)'\"")
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        path = workspace / rel
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                found.append(path)
+            elif path.is_dir() and any(path.rglob("*")):
+                found.append(path)
+        except OSError:
+            continue
+    return found
+
+
+def _step_has_salvageable_outputs(step: Dict[str, Any]) -> bool:
+    """True when max-turns hit but durable step outputs already exist on disk."""
+    workspace = _resolve_analysis_workspace()
+    if workspace is None:
+        return False
+
+    # Only trust explicit step.outputs paths — title/goal prose often names
+    # older results/… paths from prior steps and used to false-salvage.
+    outputs_blob = "\n".join(str(item) for item in (step.get("outputs") or []))
+    if outputs_blob and _existing_workspace_paths(workspace, outputs_blob):
+        return True
+
+    title_goal = f"{step.get('title') or ''} {step.get('goal') or ''}".lower()
+    if "候选" in title_goal or "candidate" in title_goal:
+        ok, _reason = _target_candidates_products_consistent(workspace)
+        if ok:
+            return True
+
+    if "miranda" in title_goal or ("seed" in title_goal and "target" in title_goal):
+        miranda_root = workspace / "results" / "targets" / "miranda"
+        complete = 0
+        preds: List[Path] = []
+        if miranda_root.is_dir():
+            preds = sorted(miranda_root.glob("*/miranda_predictions.txt"))
+            for pred in preds:
+                try:
+                    size = pred.stat().st_size
+                    if size < 1000:
+                        continue
+                    tail = pred.read_text(encoding="utf-8", errors="ignore")[-80:]
+                    if "Scan Complete" in tail:
+                        complete += 1
+                except OSError:
+                    continue
+        if preds and complete >= max(1, (len(preds) + 1) // 2):
+            return True
+
+        combined = workspace / "results" / "targets" / "tRF_targets_combined.tsv"
+        try:
+            # Stale combined from a previous plan must not salvage a mid-scan step.
+            if combined.is_file() and combined.stat().st_size > 0:
+                age_sec = datetime.now(timezone.utc).timestamp() - combined.stat().st_mtime
+                if age_sec <= 6 * 3600:
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def _resolve_step_result(result: str, step: Dict[str, Any]) -> Tuple[str, str]:
+    """Classify a step result.
+
+    Returns ``(outcome, result)`` where outcome is ``\"done\"`` or ``\"failed\"``.
+    Max-turns with durable artifacts is salvaged to done so the original plan
+    can continue instead of replanning around a false failure.
+    """
+    if _is_max_turns_result(result) and _step_has_salvageable_outputs(step):
+        salvaged = (
+            f"{result}\n"
+            "（检测到本步骤相关产物已落盘，按完成处理，避免因轮次上限中断原计划）"
+        )
+        return "done", salvaged
+    if _step_failed(result):
+        return "failed", result
+    return "done", result
 
 
 def _format_plan_for_planner(plan: Dict[str, Any]) -> str:
@@ -2023,6 +2197,15 @@ def _approval_value_from_context(source: str, context: str, plan: Dict[str, Any]
     if normalized == "strandedness":
         match = re.search(r"\b(unstranded|forward|reverse)\b", text, re.I)
         return match.group(1).lower() if match else ""
+    if normalized == "target_candidate_selection":
+        workspace = _resolve_analysis_workspace()
+        if workspace is not None:
+            summary = _format_target_candidate_selection_summary(
+                _load_target_candidate_manifest(workspace)
+            )
+            if summary:
+                return summary
+        return ""
     if normalized == "analysis_design":
         explicit = re.search(r"(?:DESIGN|设计)\s*[:=：]\s*`?((?:un)?paired|配对|非配对|不配对)`?", text, re.I)
         if explicit:
@@ -2397,10 +2580,17 @@ def _build_final_summary(plan: Dict[str, Any]) -> str:
 
 
 def approval_response_is_actionable(response: str) -> bool:
-    """True for an unambiguous approval or a concrete parameter change."""
+    """True for an unambiguous approval or a concrete parameter change.
+
+    Must stay aligned with IntentRouter gate routing via ``is_gate_actionable_reply``
+    so CONTINUE replies like「adapter_3=…」/「好的，执行吧」actually reach
+    ``_prepare_restored_plan``.
+    """
     text = str(response or "").strip()
     if not text or _APPROVAL_REJECT_RE.search(text):
         return False
+    if is_gate_actionable_reply(text, awaiting_gate=True):
+        return True
     return bool(
         _APPROVAL_ACCEPT_RE.search(text)
         or _APPROVAL_AFFIRMATION_RE.search(text)
@@ -2423,6 +2613,339 @@ def _group_approval_is_ready(approval: Dict[str, Any]) -> bool:
     reviewed = approval.get("reviewed") if isinstance(approval.get("reviewed"), dict) else {}
     required = ("group_column", "group_counts", "control_group", "analysis_design")
     return all(str(reviewed.get(key) or "").strip() not in {"", "未记录"} for key in required)
+
+
+_TARGET_CANDIDATE_SELECT_CONTRACT = "select-target-candidates-before-prediction"
+_TARGET_CANDIDATE_CONFIRM_CONTRACT = "confirm-target-candidates-before-prediction"
+_TARGET_CANDIDATE_MANIFEST_REL = Path("results/differential/target_candidate_selection_manifest.json")
+_TARGET_CANDIDATE_CONFIRM_MARKER_REL = Path(
+    "results/differential/target_candidate_selection_confirmed.json"
+)
+
+
+def _resolve_analysis_workspace() -> Optional[Path]:
+    """Best-effort workspace root for durable candidate artifacts."""
+    try:
+        from work_space import get_work_space  # type: ignore
+
+        root = get_work_space()
+        if root is not None:
+            return Path(root)
+    except Exception:  # noqa: BLE001 - optional UI workspace binding
+        pass
+    cwd = Path.cwd()
+    if (cwd / "results" / "differential").is_dir() or (cwd / "results" / "adata").is_dir():
+        return cwd
+    return None
+
+
+def _load_target_candidate_manifest(workspace: Path) -> Optional[Dict[str, Any]]:
+    path = workspace / _TARGET_CANDIDATE_MANIFEST_REL
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _manifest_candidate_fingerprint(manifest: Dict[str, Any]) -> str:
+    payload = []
+    for entry in manifest.get("per_dataset") or []:
+        if not isinstance(entry, dict):
+            continue
+        payload.append({
+            "dataset": str(entry.get("dataset") or "").strip(),
+            "up": [str(x) for x in (entry.get("up_candidates") or [])],
+            "down": [str(x) for x in (entry.get("down_candidates") or [])],
+        })
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _format_target_candidate_selection_summary(manifest: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(manifest, dict):
+        return ""
+    filters = manifest.get("filters") if isinstance(manifest.get("filters"), dict) else {}
+    parts = [
+        f"top_n={filters.get('top_n', '?')}",
+        f"FDR<{filters.get('adj_p_max', '?')}",
+        f"|logFC|>{filters.get('log_fc_min', '?')}",
+        f"meanCPM>{filters.get('mean_cpm_min', '?')}",
+    ]
+    datasets: List[str] = []
+    for entry in manifest.get("per_dataset") or []:
+        if not isinstance(entry, dict):
+            continue
+        dataset = str(entry.get("dataset") or "").strip()
+        if not dataset:
+            continue
+        n_up = entry.get("n_up_selected")
+        n_down = entry.get("n_down_selected")
+        if n_up is None:
+            n_up = len(entry.get("up_candidates") or [])
+        if n_down is None:
+            n_down = len(entry.get("down_candidates") or [])
+        datasets.append(f"{dataset}: up={n_up} down={n_down}")
+    summary = "; ".join(parts)
+    if datasets:
+        summary = f"{summary}; " + "; ".join(datasets)
+    return summary[:800]
+
+
+def _feature_id_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    try:
+        items = list(value)
+    except TypeError:
+        return [str(value)]
+    return [str(item) for item in items]
+
+
+def _read_h5ad_candidate_features(h5_path: Path) -> Tuple[List[str], List[str]]:
+    import anndata as ad
+
+    adata = ad.read_h5ad(h5_path, backed="r")
+    try:
+        uns_up = adata.uns.get("target_candidate_selection")
+        uns_down = adata.uns.get("target_candidate_selection_down")
+        up = _feature_id_list(uns_up.get("features") if isinstance(uns_up, dict) else None)
+        down = _feature_id_list(uns_down.get("features") if isinstance(uns_down, dict) else None)
+        return up, down
+    finally:
+        file_handle = getattr(adata, "file", None)
+        if file_handle is not None:
+            try:
+                file_handle.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _target_candidates_products_consistent(workspace: Path) -> Tuple[bool, str]:
+    """True when manifest exists and each non-empty selection matches adata.uns."""
+    manifest = _load_target_candidate_manifest(workspace)
+    if not manifest:
+        return False, "manifest missing"
+    per_dataset = manifest.get("per_dataset")
+    if not isinstance(per_dataset, list) or not per_dataset:
+        return False, "manifest empty"
+    adata_dir = workspace / "results" / "adata"
+    matched = 0
+    for entry in per_dataset:
+        if not isinstance(entry, dict):
+            continue
+        dataset = str(entry.get("dataset") or "").strip()
+        if not dataset:
+            continue
+        expected_up = [str(x) for x in (entry.get("up_candidates") or [])]
+        expected_down = [str(x) for x in (entry.get("down_candidates") or [])]
+        if not expected_up and not expected_down:
+            continue
+        h5_path = adata_dir / f"srna_{dataset}.h5ad"
+        if not h5_path.is_file():
+            return False, f"missing h5ad {dataset}"
+        try:
+            actual_up, actual_down = _read_h5ad_candidate_features(h5_path)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"h5ad read fail {dataset}: {exc}"
+        if expected_up and set(expected_up) != set(actual_up):
+            return False, f"up mismatch {dataset}"
+        if expected_down and set(expected_down) != set(actual_down):
+            return False, f"down mismatch {dataset}"
+        matched += 1
+    if matched == 0:
+        return False, "manifest present but no non-empty selections matched"
+    return True, f"manifest matches {matched} dataset(s)"
+
+
+def _prior_target_candidate_confirmation_matches(workspace: Path) -> Tuple[bool, str]:
+    marker_path = workspace / _TARGET_CANDIDATE_CONFIRM_MARKER_REL
+    if not marker_path.is_file():
+        return False, "no prior confirmation"
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return False, "confirmation marker unreadable"
+    if not isinstance(marker, dict):
+        return False, "confirmation marker invalid"
+    manifest = _load_target_candidate_manifest(workspace)
+    # Without a current manifest we cannot prove the confirmation still applies
+    # to this analysis — refuse so a NEW_WORKFLOW cannot inherit a stale skip.
+    if not manifest:
+        return False, "manifest missing"
+    expected = str(marker.get("manifest_sha256") or "").strip()
+    if not expected:
+        return False, "confirmation missing manifest fingerprint"
+    if expected == _manifest_candidate_fingerprint(manifest):
+        return True, "prior confirmation matches manifest"
+    return False, "manifest changed since confirmation"
+
+
+def _persist_target_candidate_confirmation(workspace: Path, response: str = "") -> None:
+    manifest = _load_target_candidate_manifest(workspace) or {}
+    marker = {
+        "confirmed_at": datetime.now(timezone.utc).isoformat(),
+        "response": str(response or "").strip()[:500],
+        "manifest_sha256": _manifest_candidate_fingerprint(manifest) if manifest else "",
+    }
+    path = workspace / _TARGET_CANDIDATE_CONFIRM_MARKER_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def invalidate_target_candidate_confirmation(workspace: Optional[Path] = None) -> bool:
+    """Drop durable confirmation so a brand-new analysis cannot auto-skip gates.
+
+    Called when the UI clears the plan for NEW_WORKFLOW. Manifest/products are
+    left intact; only the user-confirmation marker is removed.
+    """
+    root = workspace or _resolve_analysis_workspace()
+    if root is None:
+        return False
+    path = root / _TARGET_CANDIDATE_CONFIRM_MARKER_REL
+    try:
+        if path.is_file():
+            path.unlink()
+            return True
+    except OSError:
+        return False
+    return False
+
+
+def _is_target_candidate_confirm_gate(step: Dict[str, Any]) -> bool:
+    approval = step.get("approval") if isinstance(step.get("approval"), dict) else {}
+    contract = str(step.get("workflowContract") or approval.get("id") or "").strip()
+    return contract == _TARGET_CANDIDATE_CONFIRM_CONTRACT
+
+
+def _is_target_candidate_select_step(step: Dict[str, Any]) -> bool:
+    if str(step.get("workflowContract") or "").strip() == _TARGET_CANDIDATE_SELECT_CONTRACT:
+        return True
+    # Replan sometimes drops workflowContract — recognize the canonical select
+    # step by title/goal, but never confuse it with the confirm gate.
+    if _is_target_candidate_confirm_gate(step):
+        return False
+    blob = f"{step.get('title') or ''} {step.get('goal') or ''}"
+    lowered = blob.lower()
+    if "confirm-target-candidates" in lowered or "确认靶标" in blob or "确认候选" in blob:
+        return False
+    if "select_target_candidates" in lowered or "select-target-candidates" in lowered:
+        return True
+    return bool(
+        re.search(
+            r"从差异结果确定靶标|确定靶标分析候选|选择靶标.*候选|select\s+target\s+candidates",
+            blob,
+            re.I,
+        )
+    )
+
+
+def _auto_complete_target_candidate_gates(
+    plan: Dict[str, Any],
+    *,
+    workspace: Optional[Path] = None,
+) -> bool:
+    """Mark select/confirm done when products match manifest or were confirmed once.
+
+    Select skips when products are consistent OR a confirmation marker still
+    matches the *current* manifest. A NEW_WORKFLOW must call
+    ``invalidate_target_candidate_confirmation`` so stale markers cannot skip.
+    """
+    root = workspace or _resolve_analysis_workspace()
+    if root is None:
+        return False
+    products_ok, products_reason = _target_candidates_products_consistent(root)
+    confirmed_ok, confirmed_reason = _prior_target_candidate_confirmation_matches(root)
+    if not products_ok and not confirmed_ok:
+        return False
+    reason = products_reason if products_ok else confirmed_reason
+    if products_ok and not confirmed_ok:
+        # Keep confirmation durable once products prove the selection exists.
+        _persist_target_candidate_confirmation(root, "auto: products consistent with manifest")
+        confirmed_ok = True
+        confirmed_reason = "auto: products consistent with manifest"
+        reason = products_reason
+    changed = False
+    for step in plan.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        status = str(step.get("status") or "")
+        if status in {STEP_DONE, STEP_SKIPPED, STEP_FAILED}:
+            continue
+        if status not in {STEP_PENDING, STEP_RUNNING, STEP_AWAITING_APPROVAL}:
+            continue
+        # Skip select when products match OR confirmation still matches this manifest.
+        if _is_target_candidate_select_step(step) and (products_ok or confirmed_ok):
+            step["status"] = STEP_DONE
+            step["result"] = f"已有候选产物/确认记录，跳过重跑（{reason}）"
+            changed = True
+            continue
+        if _is_target_candidate_confirm_gate(step):
+            step["status"] = STEP_DONE
+            step["result"] = f"候选集已确认（{reason}）"
+            approval = step.get("approval")
+            if not isinstance(approval, dict):
+                approval = {}
+                step["approval"] = approval
+            approval.setdefault("id", _TARGET_CANDIDATE_CONFIRM_CONTRACT)
+            approval["response"] = str(approval.get("response") or "auto-confirmed").strip()
+            approval.pop("lastResponse", None)
+            changed = True
+    return changed
+
+
+_DOWNLOAD_STEP_RE = re.compile(
+    r"fastq-dl|fastq_dl|download.*fastq|fastq.*download|下载.{0,12}(?:fastq|原始)|raw fastq",
+    re.I,
+)
+_PLAN_ACCESSION_RE = re.compile(
+    r"\b((?:SRP|ERP|DRP|PRJNA|PRJEB|PRJDB|SRR|ERR|DRR)\d+)\b",
+    re.I,
+)
+
+
+def _is_fastq_download_step(step: Dict[str, Any]) -> bool:
+    blob = " ".join(
+        str(step.get(key) or "")
+        for key in ("id", "title", "goal", "skill")
+    )
+    return bool(_DOWNLOAD_STEP_RE.search(blob))
+
+
+def _skip_existing_fastq_download_steps(plan: Dict[str, Any]) -> bool:
+    """Mark pending FASTQ download steps skipped when run files already exist."""
+    root = _resolve_analysis_workspace()
+    if root is None:
+        return False
+    try:
+        from sRNAgent.Tools.fastq.fastq_dl import workspace_fastq_runs
+    except Exception:  # noqa: BLE001
+        return False
+    changed = False
+    for step in plan.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        status = str(step.get("status") or "")
+        if status not in {STEP_PENDING, STEP_RUNNING}:
+            continue
+        if not _is_fastq_download_step(step):
+            continue
+        blob = " ".join(str(step.get(key) or "") for key in ("id", "title", "goal"))
+        match = _PLAN_ACCESSION_RE.search(blob)
+        if not match:
+            continue
+        runs = workspace_fastq_runs(root, match.group(1))
+        if not runs:
+            continue
+        step["status"] = STEP_SKIPPED
+        step["result"] = (
+            f"工作区已有 {len(runs)} 个 FASTQ run，跳过下载"
+            f"（{', '.join(sorted(runs)[:8])}{'…' if len(runs) > 8 else ''}）"
+        )
+        changed = True
+    return changed
 
 
 def _is_adapter_approval_gate(step: Dict[str, Any]) -> bool:
@@ -2701,6 +3224,8 @@ class PlanOrchestrator:
         # A prerequisite insertion changes the graph, so canonicalize it once
         # more before persistence or execution.
         lifecycle.normalize_structure()
+        _auto_complete_target_candidate_gates(plan)
+        _skip_existing_fastq_download_steps(plan)
         _refresh_plan_artifact_state(plan)
         return plan
 
@@ -2776,12 +3301,20 @@ class PlanOrchestrator:
                         step["result"] = f"用户确认：{approval_response.strip()}"
                         approval["response"] = approval_response.strip()
                         approval.pop("lastResponse", None)
+                        if _is_target_candidate_confirm_gate(step):
+                            workspace = _resolve_analysis_workspace()
+                            if workspace is not None:
+                                _persist_target_candidate_confirmation(
+                                    workspace, approval_response.strip()
+                                )
                     else:
                         approval["lastResponse"] = approval_response.strip()
                         if _approval_response_requests_followup(approval_response):
                             approval["followupRequest"] = approval_response.strip()[:800]
         # Approval consumption can change the same graph, so run the lifecycle
         # repair once more after applying the current user response.
+        _auto_complete_target_candidate_gates(restored)
+        _skip_existing_fastq_download_steps(restored)
         lifecycle.repair_completed_approval_dependencies()
         _refresh_plan_artifact_state(restored)
         return restored
@@ -3155,9 +3688,13 @@ class PlanOrchestrator:
             elif old and old.get("status") == STEP_DONE:
                 step["status"] = STEP_DONE
                 step["result"] = old.get("result") or step.get("result") or ""
+            # Never copy STEP_FAILED onto a replan step when the LLM omitted
+            # status — replan exists to retry. Explicit replanner_status=failed
+            # above still allows abandoning a step on purpose.
             elif old and old.get("status") == STEP_FAILED:
-                step["status"] = STEP_FAILED
-                step["result"] = old.get("result") or step.get("result") or ""
+                step["status"] = STEP_PENDING
+                if not str(step.get("result") or "").strip():
+                    step["result"] = ""
 
         revised = {
             "goal": replanned_goal,
@@ -3311,6 +3848,65 @@ class PlanOrchestrator:
             on_progress=on_progress,
             cancel_event=cancel_event,
         )
+
+    def _execute_step_resilient(
+        self,
+        step: Dict[str, Any],
+        *,
+        step_index: int,
+        step_total: int,
+        plan_goal: str,
+        user_query: str,
+        history: List[Dict[str, str]],
+        plan: Dict[str, Any],
+        resume_messages: Optional[List[Dict[str, Any]]] = None,
+        on_progress: Optional["ProgressCallback"] = None,
+        cancel_event: Optional[Any] = None,
+        code_approval_callback: Optional["CodeApprovalCallback"] = None,
+    ) -> str:
+        """Run ``_execute_step`` with a few retries on transient API/network errors."""
+        last_result = ""
+        for attempt in range(_MAX_STEP_TRANSIENT_RETRIES + 1):
+            attempt_resume = resume_messages
+            if attempt > 0:
+                checkpoint = self._load_checkpoint()
+                if (
+                    checkpoint
+                    and checkpoint.get("step_id") == step.get("id")
+                    and isinstance(checkpoint.get("messages"), list)
+                    and checkpoint["messages"]
+                ):
+                    attempt_resume = checkpoint["messages"]
+                self._emit(
+                    on_progress,
+                    "status",
+                    message=(
+                        f"步骤 {step_index} 遇到临时 API/网络错误，"
+                        f"正在重试（{attempt}/{_MAX_STEP_TRANSIENT_RETRIES}）…"
+                    ),
+                )
+            try:
+                return self._execute_step(
+                    step,
+                    step_index=step_index,
+                    step_total=step_total,
+                    plan_goal=plan_goal,
+                    user_query=user_query,
+                    history=history,
+                    plan=plan,
+                    resume_messages=attempt_resume,
+                    on_progress=on_progress,
+                    cancel_event=cancel_event,
+                    code_approval_callback=code_approval_callback,
+                )
+            except Exception as exc:  # noqa: BLE001 - convert to step result after retries
+                if type(exc).__name__ == "AgentCancelledError":
+                    raise
+                last_result = f"STEP_EXECUTION_ERROR: {type(exc).__name__}: {exc}"
+                if _is_transient_exception(exc) and attempt < _MAX_STEP_TRANSIENT_RETRIES:
+                    continue
+                return last_result
+        return last_result or "STEP_EXECUTION_ERROR: transient retries exhausted"
 
     @staticmethod
     def _next_pending_step(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -3548,11 +4144,15 @@ class PlanOrchestrator:
 
         while True:
             self.agent._check_cancelled(cancel_event)
+            if _auto_complete_target_candidate_gates(plan):
+                self._persist_plan(plan)
             pending = self._next_pending_step(plan)
             if pending is None:
                 graph = PlanGraph(plan)
                 waiting = graph.first_with_status(STEP_AWAITING_APPROVAL)
                 if waiting:
+                    if waiting.get("status") == STEP_DONE:
+                        continue
                     prompt = _build_approval_request(
                         plan,
                         waiting,
@@ -3582,6 +4182,8 @@ class PlanOrchestrator:
 
             step_index = steps_list.index(pending) + 1
             if isinstance(pending.get("approval"), dict):
+                if pending.get("status") == STEP_DONE:
+                    continue
                 pending["status"] = STEP_AWAITING_APPROVAL
                 prompt = _build_approval_request(
                     plan,
@@ -3624,26 +4226,22 @@ class PlanOrchestrator:
             ):
                 resume_messages = checkpoint["messages"]
 
-            try:
-                result = self._execute_step(
-                    pending,
-                    step_index=step_index,
-                    step_total=step_total,
-                    plan_goal=str(plan.get("goal") or ""),
-                    user_query=execution_user_query,
-                    history=history,
-                    plan=plan,
-                    resume_messages=resume_messages,
-                    on_progress=on_progress,
-                    cancel_event=cancel_event,
-                    code_approval_callback=code_approval_callback,
-                )
-            except Exception as exc:  # noqa: BLE001 - persist the failed step before replanning
-                if type(exc).__name__ == "AgentCancelledError":
-                    raise
-                result = f"STEP_EXECUTION_ERROR: {type(exc).__name__}: {exc}"
+            result = self._execute_step_resilient(
+                pending,
+                step_index=step_index,
+                step_total=step_total,
+                plan_goal=str(plan.get("goal") or ""),
+                user_query=execution_user_query,
+                history=history,
+                plan=plan,
+                resume_messages=resume_messages,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+                code_approval_callback=code_approval_callback,
+            )
+            outcome, result = _resolve_step_result(result, pending)
 
-            if _step_failed(result):
+            if outcome == "failed":
                 pending["status"] = STEP_FAILED
                 pending["result"] = result
                 self._persist_plan(plan)
@@ -3654,7 +4252,7 @@ class PlanOrchestrator:
                     plan=plan,
                     stepId=pending.get("id"),
                     stepIndex=step_index,
-                    message=f"步骤 {step_index} 未在轮次上限内完成",
+                    message=_step_failure_message(step_index, result),
                 )
 
                 if replan_attempts >= self.max_replan_attempts:

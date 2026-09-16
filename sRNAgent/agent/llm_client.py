@@ -3,10 +3,16 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+# Transient gateway / rate-limit / overload responses worth retrying.
+_TRANSIENT_HTTP_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+_LLM_MAX_RETRIES = 3
+_LLM_RETRY_BACKOFF_SEC = (1.0, 2.0, 4.0)
 
 
 @dataclass
@@ -221,15 +227,54 @@ class ChatClient:
             return self._complete_anthropic(messages, tools, enable_thinking=enable_thinking)
         return self._complete_openai(messages, tools, enable_thinking=enable_thinking)
 
+    @staticmethod
+    def _transient_http(code: int) -> bool:
+        return int(code) in _TRANSIENT_HTTP_CODES
+
+    @staticmethod
+    def _retry_sleep(attempt: int) -> None:
+        delay = _LLM_RETRY_BACKOFF_SEC[min(attempt, len(_LLM_RETRY_BACKOFF_SEC) - 1)]
+        time.sleep(delay)
+
     def _request(self, url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method="POST", headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from exc
+        last_error: Optional[BaseException] = None
+        for attempt in range(_LLM_MAX_RETRIES + 1):
+            request = urllib.request.Request(url, data=body, method="POST", headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    raw = response.read().decode("utf-8")
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        last_error = RuntimeError(f"LLM connection error: invalid JSON ({exc})")
+                        if attempt < _LLM_MAX_RETRIES:
+                            self._retry_sleep(attempt)
+                            continue
+                        raise last_error from exc
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                last_error = RuntimeError(f"LLM HTTP {exc.code}: {detail}")
+                if self._transient_http(exc.code) and attempt < _LLM_MAX_RETRIES:
+                    self._retry_sleep(attempt)
+                    continue
+                raise last_error from exc
+            except urllib.error.URLError as exc:
+                reason = getattr(exc, "reason", exc)
+                last_error = RuntimeError(f"LLM connection error: {reason}")
+                if attempt < _LLM_MAX_RETRIES:
+                    self._retry_sleep(attempt)
+                    continue
+                raise last_error from exc
+            except TimeoutError as exc:
+                last_error = RuntimeError(f"LLM connection error: timed out ({exc})")
+                if attempt < _LLM_MAX_RETRIES:
+                    self._retry_sleep(attempt)
+                    continue
+                raise last_error from exc
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("LLM request failed")
 
     def _request_with_auth_retry(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         last_error: Optional[RuntimeError] = None

@@ -170,10 +170,14 @@ class TaskProgressSupervisor:
             ]
         terminated: list[int] = []
         for pid in active_pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                continue
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(pid, sig)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        os.kill(pid, sig)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        break
             terminated.append(pid)
         return terminated
 
@@ -276,16 +280,6 @@ class TaskProgressSupervisor:
                 "recentArtifactChange": bool(changed),
                 "hasEvidence": True,
             }
-        if files:
-            stage = f"已发现 {len(files)} 个产物，任务仍在运行"
-            return {
-                "stage": stage,
-                "highlights": highlights,
-                "detail": stage,
-                "activeProcess": bool(active),
-                "recentArtifactChange": bool(changed),
-                "hasEvidence": True,
-            }
         if active:
             stage = "外部进程正在运行，等待首个产物"
             return {
@@ -293,7 +287,7 @@ class TaskProgressSupervisor:
                 "highlights": highlights,
                 "detail": stage,
                 "activeProcess": True,
-                "recentArtifactChange": False,
+                "recentArtifactChange": bool(changed),
                 "hasEvidence": True,
             }
         stage = "任务正在运行，等待首个可追踪产物"
@@ -302,6 +296,6 @@ class TaskProgressSupervisor:
             "highlights": highlights,
             "detail": stage,
             "activeProcess": False,
-            "recentArtifactChange": False,
+            "recentArtifactChange": bool(changed),
             "hasEvidence": False,
         }

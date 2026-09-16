@@ -99,7 +99,7 @@ def run_lc_tool_loop(
 ) -> str:
     """Run the LangGraph tool loop; return the final user-facing answer."""
 
-    max_turns = int(getattr(agent, "max_turns", 100) or 100)
+    max_turns = int(getattr(agent, "max_turns", 200) or 200)
 
     def model_node(state: ToolLoopState) -> Dict[str, Any]:
         agent._check_cancelled(cancel_event)

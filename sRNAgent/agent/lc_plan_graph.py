@@ -73,12 +73,15 @@ def run_lc_plan_steps(
     # Local imports avoid circular import at module load and keep domain helpers
     # owned by plan_orchestrator.py.
     from .plan_orchestrator import (
+        _auto_complete_target_candidate_gates,
         _build_approval_request,
         _build_final_summary,
-        _step_failed,
+        _resolve_step_result,
+        _step_failure_message,
     )
 
-    max_replan = int(getattr(orchestrator, "max_replan_attempts", 8) or 8)
+    raw_replan = getattr(orchestrator, "max_replan_attempts", 8)
+    max_replan = 8 if raw_replan is None else int(raw_replan)
     steps_list = plan.get("steps") or []
     if not isinstance(steps_list, list) or not steps_list:
         message = "计划生成失败：未生成任何可执行步骤，任务尚未运行。"
@@ -88,6 +91,8 @@ def run_lc_plan_steps(
     def pick_node(state: PlanStepState) -> Dict[str, Any]:
         orchestrator.agent._check_cancelled(cancel_event)
         current_plan = state["plan"]
+        if _auto_complete_target_candidate_gates(current_plan):
+            orchestrator._persist_plan(current_plan)
         steps = current_plan.get("steps") or []
         step_total = len(steps) if isinstance(steps, list) else 0
         pending = orchestrator._next_pending_step(current_plan)
@@ -96,6 +101,15 @@ def run_lc_plan_steps(
             graph = PlanGraph(current_plan)
             waiting = graph.first_with_status(STEP_AWAITING_APPROVAL)
             if waiting:
+                if waiting.get("status") == STEP_DONE:
+                    return {
+                        "plan": current_plan,
+                        "done": False,
+                        "outcome": "continue",
+                        "step_total": step_total,
+                        "current_step_id": "",
+                        "step_result": "",
+                    }
                 prompt = _build_approval_request(
                     current_plan,
                     waiting,
@@ -162,6 +176,15 @@ def run_lc_plan_steps(
 
         step_index = steps.index(pending) + 1
         if isinstance(pending.get("approval"), dict):
+            if pending.get("status") == STEP_DONE:
+                return {
+                    "plan": current_plan,
+                    "done": False,
+                    "outcome": "continue",
+                    "step_total": step_total,
+                    "current_step_id": "",
+                    "step_result": "",
+                }
             pending["status"] = STEP_AWAITING_APPROVAL
             prompt = _build_approval_request(
                 current_plan,
@@ -240,24 +263,19 @@ def run_lc_plan_steps(
         ):
             resume_messages = checkpoint["messages"]
 
-        try:
-            result = orchestrator._execute_step(
-                pending,
-                step_index=step_index,
-                step_total=step_total,
-                plan_goal=str(current_plan.get("goal") or ""),
-                user_query=execution_user_query,
-                history=history,
-                plan=current_plan,
-                resume_messages=resume_messages,
-                on_progress=on_progress,
-                cancel_event=cancel_event,
-                code_approval_callback=code_approval_callback,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if type(exc).__name__ == "AgentCancelledError":
-                raise
-            result = f"STEP_EXECUTION_ERROR: {type(exc).__name__}: {exc}"
+        result = orchestrator._execute_step_resilient(
+            pending,
+            step_index=step_index,
+            step_total=step_total,
+            plan_goal=str(current_plan.get("goal") or ""),
+            user_query=execution_user_query,
+            history=history,
+            plan=current_plan,
+            resume_messages=resume_messages,
+            on_progress=on_progress,
+            cancel_event=cancel_event,
+            code_approval_callback=code_approval_callback,
+        )
 
         return {"plan": current_plan, "step_result": result, "outcome": "continue"}
 
@@ -280,7 +298,8 @@ def run_lc_plan_steps(
         if pending is None:
             return {"done": False, "outcome": "continue", "plan": current_plan}
 
-        if _step_failed(result):
+        outcome, result = _resolve_step_result(result, pending)
+        if outcome == "failed":
             pending["status"] = STEP_FAILED
             pending["result"] = result
             orchestrator._persist_plan(current_plan)
@@ -291,7 +310,7 @@ def run_lc_plan_steps(
                 plan=current_plan,
                 stepId=pending.get("id"),
                 stepIndex=step_index,
-                message=f"步骤 {step_index} 未在轮次上限内完成",
+                message=_step_failure_message(step_index, result),
             )
 
             if replan_attempts >= max_replan:

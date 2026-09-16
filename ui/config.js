@@ -221,7 +221,7 @@
     if (fields.topP) fields.topP.value = String(config.agent.topP ?? 1);
     if (fields.maxTokens) fields.maxTokens.value = String(config.agent.maxTokens ?? 4096);
     if (fields.maxHistory) fields.maxHistory.value = String(config.agent.maxHistoryMessages ?? 40);
-    if (fields.maxTurns) fields.maxTurns.value = String(config.agent.maxTurns ?? 100);
+    if (fields.maxTurns) fields.maxTurns.value = String(Math.min(200, Number(config.agent.maxTurns ?? 200) || 200));
     if (fields.contextWindow) {
       fields.contextWindow.value = String(config.agent.contextWindow ?? vendor.contextWindow ?? 128000);
     }
@@ -255,7 +255,7 @@
     config.agent.topP = Number(fields.topP?.value || 1);
     config.agent.maxTokens = Number(fields.maxTokens?.value || 4096);
     config.agent.maxHistoryMessages = Number(fields.maxHistory?.value || 40);
-    config.agent.maxTurns = Number(fields.maxTurns?.value || 100);
+    config.agent.maxTurns = Math.max(1, Math.min(200, Number(fields.maxTurns?.value || 200) || 200));
     config.agent.contextWindow = Number(fields.contextWindow?.value || 128000);
     config.agent.stream = fields.stream?.checked !== false;
     config.agent.rememberApiKey = fields.rememberKey?.checked !== false;

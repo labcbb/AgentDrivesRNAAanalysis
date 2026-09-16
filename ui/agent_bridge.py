@@ -28,6 +28,7 @@ from sRNAgent.agent.orchestrator import run_agent_turn  # noqa: E402
 from sRNAgent.agent.lc_graph import langgraph_orchestrator_enabled  # noqa: E402
 from sRNAgent.agent.lc_tool_loop import lc_tool_loop_enabled  # noqa: E402
 from sRNAgent.agent.lc_plan_graph import lc_plan_graph_enabled  # noqa: E402
+from sRNAgent.agent.plan_orchestrator import invalidate_target_candidate_confirmation  # noqa: E402
 
 from chat_kernel_manager import (  # noqa: E402
     delete_chat_session,
@@ -61,7 +62,7 @@ from session_errors import (
     record_user_cancellation,
     update_run_context,
 )
-from session_plan import clear_plan, load_plan, plan_progress_summary, save_plan  # noqa: E402
+from session_plan import clear_plan, get_plan_epoch, load_plan, plan_progress_summary, save_plan  # noqa: E402
 from session_live import (  # noqa: E402
     close_live_bus,
     get_live_run_id,
@@ -95,6 +96,20 @@ _KERNEL_DRAIN_MAX_SEC = 6 * 3600
 _MAX_MEMORY_CONTEXT_TOKENS = 2400
 _MAX_EXECUTION_CONTEXT_TOKENS = 1200
 _MAX_RUN_CONTEXT_TOKENS = 3200
+
+
+def _clear_plan_for_new_workflow(chat_id: str) -> None:
+    """Clear session plan and drop durable target-candidate confirmation.
+
+    NEW_WORKFLOW must not inherit a prior confirmation skip marker from the
+    shared analysis workspace; products/manifest stay so consistent artifacts
+    can still short-circuit when they truly match.
+    """
+    clear_plan(chat_id)
+    try:
+        invalidate_target_candidate_confirmation(get_work_space())
+    except Exception:
+        pass
 
 
 def _default_execution_config(chat_id: str = "") -> ExecutionConfig:
@@ -625,6 +640,12 @@ def resolve_chat_id_for_run(run_id: str) -> str:
 def register_run(run_id: str, chat_id: str) -> threading.Event:
     cancel_event = threading.Event()
     with _runs_lock:
+        # Transfer chat ownership to this run. Keep older cancel Events in
+        # `_active_runs` so superseded workers still observe cancellation, but
+        # drop their chat→run pointers so they cannot rewrite the new plan.
+        for existing_run_id, existing_chat_id in list(_active_run_chat_ids.items()):
+            if existing_chat_id == chat_id and existing_run_id != run_id:
+                _active_run_chat_ids.pop(existing_run_id, None)
         _active_runs[run_id] = cancel_event
         _active_run_chat_ids[run_id] = chat_id
     return cancel_event
@@ -636,17 +657,16 @@ def cancel_run(
     *,
     interrupt_kernel: Optional[bool] = None,
     force_interrupt: bool = False,
+    suppress_error_record: bool = False,
 ) -> bool:
     resolved_chat_id = str(chat_id or "").strip()
     cancelled = False
-    runs_to_cleanup: List[str] = []
     with _runs_lock:
         if run_id:
             event = _active_runs.get(run_id)
             if event is not None:
                 event.set()
                 cancelled = True
-                runs_to_cleanup.append(run_id)
             if not resolved_chat_id:
                 resolved_chat_id = _active_run_chat_ids.get(run_id, "")
         if resolved_chat_id:
@@ -656,8 +676,8 @@ def cancel_run(
                     if event is not None:
                         event.set()
                         cancelled = True
-                    if active_run_id not in runs_to_cleanup:
-                        runs_to_cleanup.append(active_run_id)
+            if force_interrupt:
+                _active_code_by_chat.pop(resolved_chat_id, None)
 
     interrupted = False
     if resolved_chat_id:
@@ -673,15 +693,16 @@ def cancel_run(
                 )
             except ValueError:
                 interrupted = False
+        if force_interrupt:
+            _reset_interrupted_plan(resolved_chat_id)
 
-    for active_run_id in runs_to_cleanup:
-        cleanup_run(active_run_id)
+    # Signal cancel only above. Do NOT cleanup_run / close_live_bus here —
+    # the worker thread still emits terminal events (cancelled/error) onto
+    # the live bus, and cleanup_run must wait until that worker's finally
+    # so a replacement run for the same chat is not wiped mid-flight.
 
-    if resolved_chat_id:
-        try:
-            close_live_bus(resolved_chat_id)
-        except Exception:
-            pass
+    if suppress_error_record:
+        return cancelled or interrupted
 
     if resolved_chat_id and run_id and (cancelled or interrupted):
         if force_interrupt:
@@ -720,7 +741,7 @@ def cleanup_run(run_id: str) -> None:
         if chat_id and str(_active_code_by_chat.get(chat_id, {}).get("runId") or "") == run_id:
             _active_code_by_chat.pop(chat_id, None)
     if chat_id:
-        clear_run_context(chat_id)
+        clear_run_context(chat_id, run_id=run_id)
 
 
 def _approval_key(run_id: str, request_id: str) -> str:
@@ -732,8 +753,11 @@ def approve_code(run_id: str, request_id: str, approved: bool) -> bool:
     with _approval_lock:
         gate = _pending_approvals.get(key)
         if gate is None:
-            # Already auto-approved or processed — idempotent success for allow clicks.
-            return approved
+            # Timeout / already settled: never pretend a late "allow" succeeded.
+            stored = _approval_results.get(key)
+            if stored is None:
+                return False
+            return bool(stored) == bool(approved)
         _approval_results[key] = approved
         gate.set()
         return True
@@ -776,8 +800,8 @@ def _build_agent(body: Dict[str, Any]) -> tuple[SRNAgent, Dict[str, Any]]:
     chat_id = _resolve_chat_id(body)
     llm_config = LLMConfig.from_ui_payload(account, vendor, agent_cfg)
     extra_system = str(agent_cfg.get("systemPrompt") or "").strip()
-    max_turns = int(agent_cfg.get("maxTurns") or 100)
-    max_turns = max(1, min(max_turns, 100))
+    max_turns = int(agent_cfg.get("maxTurns") or 200)
+    max_turns = max(1, min(max_turns, 200))
     agent = SRNAgent(
         llm_config=llm_config,
         cwd=get_work_space(),
@@ -811,6 +835,9 @@ def _chat_code_panel_running(chat_id: str) -> bool:
 
 def _reset_interrupted_plan(chat_id: str) -> bool:
     """Return a cancelled or stale plan to a resumable state exactly once."""
+    # Pin epoch before load/mutate so a concurrent clear_plan cannot let us
+    # rewrite the newer turn's plan under a bumped epoch.
+    epoch = get_plan_epoch(chat_id)
     plan = load_plan(chat_id)
     if not isinstance(plan, dict):
         return False
@@ -819,8 +846,7 @@ def _reset_interrupted_plan(chat_id: str) -> bool:
     after = [str(step.get("status") or "") for step in plan.get("steps") or [] if isinstance(step, dict)]
     if before == after:
         return False
-    save_plan(chat_id, plan)
-    return True
+    return bool(save_plan(chat_id, plan, expected_epoch=epoch))
 
 
 def agent_run_status(chat_id: str) -> Dict[str, Any]:
@@ -863,6 +889,16 @@ def agent_run_status(chat_id: str) -> Dict[str, Any]:
             plan = load_plan(chat_id)
             plan_summary = plan_progress_summary(plan) if plan else ""
 
+    waiting_step = None
+    if plan and isinstance(plan.get("steps"), list):
+        waiting_step = next(
+            (
+                step for step in plan["steps"]
+                if str(step.get("status") or "") == "awaiting_approval"
+            ),
+            None,
+        )
+
     return {
         "ok": True,
         "chatId": chat_id,
@@ -900,6 +936,11 @@ def agent_run_status(chat_id: str) -> Dict[str, Any]:
         "plan": plan,
         "planSummary": plan_summary,
         "runningStepTitle": str((running_step or {}).get("title") or "").strip(),
+        "awaitingApproval": waiting_step is not None,
+        "approvalStepTitle": str((waiting_step or {}).get("title") or "").strip(),
+        "approvalPrompt": str(
+            ((waiting_step or {}).get("approval") or {}).get("prompt") or ""
+        ).strip(),
     }
 
 
@@ -950,7 +991,12 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
             reset_request_scope=not resume and not answer_without_resuming_plan,
         )
         if not resume and not answer_without_resuming_plan:
-            clear_plan(chat_id)
+            _clear_plan_for_new_workflow(chat_id)
+        run_plan_epoch = get_plan_epoch(chat_id)
+
+        def save_plan_for_this_run(cid: str, plan: Dict[str, Any]) -> None:
+            save_plan(cid, plan, expected_epoch=run_plan_epoch)
+
         run_context = _build_run_context(chat_id, user_query=user_query)
         available_artifacts = load_session_memory(chat_id).get("artifacts") if chat_id else []
         turn = run_agent_turn(
@@ -963,7 +1009,7 @@ def run_agent_chat(body: Dict[str, Any]) -> Dict[str, Any]:
             use_plan_mode=use_plan_mode,
             answer_without_resuming_plan=answer_without_resuming_plan,
             route_intent=route_decision.intent.value,
-            save_plan=save_plan,
+            save_plan=save_plan_for_this_run,
             load_plan=load_plan,
         )
         text = turn["answer"]
@@ -1185,10 +1231,11 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     # Remove the previous plan only after this request has acquired the chat;
     # a rejected observer must not erase the active operator's plan.
     if not resume and not answer_without_resuming_plan:
-        clear_plan(chat_id)
+        _clear_plan_for_new_workflow(chat_id)
 
     # Stop any in-flight agent loop for this chat; interrupt kernel only if it is busy.
-    cancel_run("", chat_id)
+    # Superseding by a new user turn is not a user Stop — don't pollute session_errors.
+    cancel_run("", chat_id, suppress_error_record=True)
     cancel_event = register_run(run_id, chat_id)
     event_queue: queue.Queue = queue.Queue()
     start_live_bus(chat_id, run_id)
@@ -1199,6 +1246,8 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
 
     def _publish(event: Dict[str, Any]) -> Dict[str, Any]:
         payload = dict(event or {})
+        payload.setdefault("runId", run_id)
+        payload.setdefault("chatId", chat_id)
         if device_id and payload.get("type") in {"heartbeat", "status", "run_start"}:
             try:
                 renew_operator_lease(chat_id, device_id, run_id=run_id)
@@ -1293,11 +1342,29 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
         approved = gate.wait(timeout=_APPROVAL_TIMEOUT_SEC)
         with _approval_lock:
             _pending_approvals.pop(key, None)
-            result = _approval_results.pop(key, False)
+            # Keep the settled result so a late UI click can detect expiry / mismatch
+            # instead of being treated as a successful allow.
+            if not approved and key not in _approval_results:
+                _approval_results[key] = False
+            result = bool(_approval_results.get(key, False))
 
         if cancel_event.is_set():
             raise AgentCancelledError("Agent run cancelled.")
         if not approved:
+            on_progress(
+                {
+                    "type": "supervisor_approval",
+                    "requestId": request_id,
+                    "action": "deny",
+                    "level": "timeout",
+                    "reason": (
+                        f"代码审批超时（{int(_APPROVAL_TIMEOUT_SEC)}s）未收到确认，"
+                        "按拒绝处理（不是用户主动点拒绝）"
+                    ),
+                    "mode": approval_mode,
+                    "source": "approval_timeout",
+                }
+            )
             return False
         return result
 
@@ -1324,7 +1391,15 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             # it afterward leaked the old pending steps into the planner and
             # could make an unrelated follow-up inherit the prior workflow.
             if not resume and not answer_without_resuming_plan:
-                clear_plan(chat_id)
+                _clear_plan_for_new_workflow(chat_id)
+            run_plan_epoch = get_plan_epoch(chat_id)
+
+            def save_plan_for_this_run(cid: str, plan: Dict[str, Any]) -> None:
+                # Drop writes after cancel or after a newer turn bumped the epoch.
+                if cancel_event.is_set():
+                    return
+                save_plan(cid, plan, expected_epoch=run_plan_epoch)
+
             run_context = _build_run_context(chat_id, user_query=user_query)
             available_artifacts = load_session_memory(chat_id).get("artifacts") if chat_id else []
             # LangGraph (default) owns answer-vs-plan routing; domain execution
@@ -1342,7 +1417,7 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                 on_progress=on_progress,
                 cancel_event=cancel_event,
                 code_approval_callback=request_code_approval,
-                save_plan=save_plan,
+                save_plan=save_plan_for_this_run,
                 load_plan=load_plan,
             )
             text = turn["answer"]
@@ -1369,7 +1444,13 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                 }
             )
         except AgentCancelledError:
-            _reset_interrupted_plan(chat_id)
+            # User Stop: this run still owns the chat → reset running→pending.
+            # Supersede: register_run already transferred ownership → do not
+            # rewrite the newer turn's plan.json.
+            with _runs_lock:
+                still_owns = _active_run_chat_ids.get(run_id) == chat_id
+            if still_owns:
+                _reset_interrupted_plan(chat_id)
             on_progress({"type": "cancelled", "message": "已停止生成"})
         except Exception as exc:  # noqa: BLE001
             import traceback as _tb
@@ -1410,6 +1491,11 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
                 pass
             event_queue.put(_STREAM_SENTINEL)
             cleanup_run(run_id)
+            try:
+                # Backup close if a terminal event never published (crash paths).
+                close_live_bus(chat_id, run_id=run_id)
+            except Exception:
+                pass
 
     thread = threading.Thread(target=worker, daemon=True)
     # Publish the sequence root before the worker can emit progress frames.
@@ -1451,15 +1537,25 @@ def run_agent_chat_stream(body: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
             # 多数事件在 on_progress 时已 publish；队列取出的终态事件也已 publish
             yield item
     finally:
-        if device_id:
+        # Primary SSE consumer exit must NOT tear down the live bus while THIS
+        # run's worker is still registered — refresh / disconnect would otherwise
+        # blind live followers even though the agent keeps running.
+        this_run_active = False
+        try:
+            with _runs_lock:
+                this_run_active = _active_run_chat_ids.get(run_id) == chat_id
+        except Exception:
+            this_run_active = False
+        if device_id and not this_run_active:
             try:
                 clear_operator_lease(chat_id, device_id)
             except Exception:
                 pass
-        try:
-            close_live_bus(chat_id, run_id=run_id)
-        except Exception:
-            pass
+        if not this_run_active:
+            try:
+                close_live_bus(chat_id, run_id=run_id)
+            except Exception:
+                pass
 
 
 def run_agent_live_stream(chat_id: str, after_seq: int = 0) -> Iterator[Dict[str, Any]]:

@@ -32,6 +32,7 @@ _VALID_FASTQ_SUFFIXES = (
 )
 
 _RUN_ACCESSION_RE = re.compile(r"^(?:SRR|ERR|DRR)\d+$", re.IGNORECASE)
+_RUN_PREFIX_RE = re.compile(r"^((?:SRR|ERR|DRR)\d+)", re.IGNORECASE)
 
 
 def _is_fastq(path: Path) -> bool:
@@ -73,49 +74,114 @@ def _discover_run_fastqs(out_dir: Path, run_acc: str) -> Dict[str, str]:
     }
 
 
+def _run_id_from_fastq_name(name: str) -> str:
+    stem = name
+    lower = stem.lower()
+    for suffix in _VALID_FASTQ_SUFFIXES:
+        if lower.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    match = _RUN_PREFIX_RE.match(stem)
+    return match.group(1) if match else ""
+
+
+def _iter_fastq_files(out_dir: Path, *, depth: int = 1):
+    if not out_dir.is_dir():
+        return
+    try:
+        children = list(out_dir.iterdir())
+    except OSError:
+        return
+    for path in children:
+        if path.is_file() and _is_fastq(path):
+            yield path
+        elif depth > 0 and path.is_dir():
+            yield from _iter_fastq_files(path, depth=depth - 1)
+
+
+def _record_fastq_hit(results: Dict[str, Dict[str, str]], key: str, fq: Path) -> None:
+    results.setdefault(key, {
+        "sample": key,
+        "fq1": "",
+        "fq2": "",
+        "layout": "unknown",
+    })
+    if results[key]["fq1"]:
+        return
+    if "_1." in fq.name:
+        results[key]["fq1"] = str(fq)
+        mate = fq.with_name(fq.name.replace("_1.", "_2.", 1))
+        if mate.exists():
+            results[key]["fq2"] = str(mate)
+            results[key]["layout"] = "paired"
+        else:
+            results[key]["layout"] = "paired"
+    elif "_2." in fq.name:
+        return
+    else:
+        results[key]["fq1"] = str(fq)
+        results[key]["fq2"] = ""
+        results[key]["layout"] = "single"
+
+
 def _discover_all_fastqs(
     out_dir: Path,
     accessions: Sequence[str],
 ) -> Dict[str, Dict[str, str]]:
     """Walk *out_dir* for every run directory produced by fastq-dl."""
     results: Dict[str, Dict[str, str]] = {}
+    if not out_dir.is_dir():
+        return results
 
     for sub in sorted(out_dir.iterdir()):
         if not sub.is_dir():
             continue
-        result = _discover_run_fastqs(out_dir, sub.name)
-        if result.get("fq1"):
-            results[sub.name] = result
+        if _RUN_ACCESSION_RE.match(sub.name):
+            result = _discover_run_fastqs(out_dir, sub.name)
+            if result.get("fq1"):
+                results[sub.name] = result
 
-    for fq in sorted(out_dir.iterdir()):
-        if not fq.is_file() or not _is_fastq(fq):
+    for fq in _iter_fastq_files(out_dir, depth=1):
+        run_id = _run_id_from_fastq_name(fq.name)
+        if run_id:
+            _record_fastq_hit(results, run_id, fq)
             continue
         for acc in accessions:
             if fq.name.startswith(acc):
-                key = acc
-                results.setdefault(key, {
-                    "sample": acc,
-                    "fq1": "",
-                    "fq2": "",
-                    "layout": "unknown",
-                })
-                if not results[key]["fq1"]:
-                    if "_1." in fq.name:
-                        results[key]["fq1"] = str(fq)
-                        mate = out_dir / fq.name.replace("_1.", "_2.")
-                        if mate.exists():
-                            results[key]["fq2"] = str(mate)
-                            results[key]["layout"] = "paired"
-                        else:
-                            results[key]["layout"] = "paired"
-                    elif "_2." in fq.name:
-                        continue
-                    else:
-                        results[key]["fq1"] = str(fq)
-                        results[key]["fq2"] = ""
-                        results[key]["layout"] = "single"
+                _record_fastq_hit(results, acc, fq)
 
     return results
+
+
+_FASTQ_SEARCH_REL = (
+    "data/raw/fastq",
+    "data/data/raw/fastq",
+    "raw/fastq",
+)
+
+
+def workspace_fastq_runs(workspace: Path, accession: str) -> Dict[str, Dict[str, str]]:
+    """Find existing run FASTQs for a study/run accession under common workspace dirs."""
+    acc = str(accession or "").strip()
+    if not acc:
+        return {}
+    root = Path(workspace)
+    dirs = []
+    for rel in _FASTQ_SEARCH_REL:
+        base = root / rel
+        dirs.append(base)
+        dirs.append(base / acc)
+    found: Dict[str, Dict[str, str]] = {}
+    seen: set[str] = set()
+    for directory in dirs:
+        resolved = str(directory)
+        if resolved in seen or not directory.is_dir():
+            continue
+        seen.add(resolved)
+        for key, info in _discover_all_fastqs(directory, [acc]).items():
+            if info.get("fq1") and Path(info["fq1"]).exists():
+                found[key] = info
+    return found
 
 
 def _discover_metadata_file(out_dir: Path, accession: str, prefix: Optional[str]) -> str:

@@ -355,7 +355,7 @@ window.DEFAULT_LLM_CONFIG = {
     topP: 1,
     maxTokens: 4096,
     maxHistoryMessages: 40,
-    maxTurns: 100,
+    maxTurns: 200,
     contextWindow: 524288,
     stream: true,
     rememberApiKey: true,

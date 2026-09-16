@@ -77,8 +77,45 @@ def test_reset_interrupted_plan_returns_running_step_to_pending(monkeypatch):
     }
     saved = []
     monkeypatch.setattr(agent_bridge, "load_plan", lambda _: plan)
-    monkeypatch.setattr(agent_bridge, "save_plan", lambda chat_id, payload: saved.append((chat_id, payload)))
+    monkeypatch.setattr(agent_bridge, "get_plan_epoch", lambda _: 7)
+
+    def fake_save(chat_id, payload, expected_epoch=None):
+        saved.append((chat_id, payload, expected_epoch))
+        return True
+
+    monkeypatch.setattr(agent_bridge, "save_plan", fake_save)
 
     assert agent_bridge._reset_interrupted_plan("chat-1") is True
     assert plan["steps"][1]["status"] == "pending"
-    assert saved == [("chat-1", plan)]
+    assert saved == [("chat-1", plan, 7)]
+
+
+def test_force_cancel_clears_code_active_state(monkeypatch):
+    chat_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    agent_bridge.register_run("run-1", chat_id)
+    agent_bridge._active_code_by_chat[chat_id] = {"runId": "run-1", "stage": "running"}
+    monkeypatch.setattr(agent_bridge, "kernel_is_busy", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(agent_bridge, "interrupt_chat_kernel", lambda *_args, **_kwargs: True)
+
+    assert agent_bridge.cancel_run(
+        "run-1", chat_id, force_interrupt=True, suppress_error_record=True,
+    ) is True
+    assert chat_id not in agent_bridge._active_code_by_chat
+    agent_bridge.cleanup_run("run-1")
+
+
+def test_clear_plan_for_new_workflow_invalidates_target_candidate_confirmation(monkeypatch, tmp_path):
+    cleared = []
+    invalidated = []
+    monkeypatch.setattr(agent_bridge, "clear_plan", lambda cid: cleared.append(cid))
+    monkeypatch.setattr(agent_bridge, "get_work_space", lambda: tmp_path)
+    monkeypatch.setattr(
+        agent_bridge,
+        "invalidate_target_candidate_confirmation",
+        lambda ws: invalidated.append(ws) or True,
+    )
+
+    agent_bridge._clear_plan_for_new_workflow("chat-new")
+
+    assert cleared == ["chat-new"]
+    assert invalidated == [tmp_path]

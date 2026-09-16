@@ -37,6 +37,7 @@ from sRNAgent.agent.plan_orchestrator import (  # noqa: E402
     _resolve_requirements_policy,
     _is_conversational_query,
     _is_read_only_query,
+    _skip_existing_fastq_download_steps,
     _strip_unrequested_html_report,
 )
 
@@ -89,6 +90,29 @@ def test_plan_lifecycle_persists_only_completed_artifact_outputs():
         "available": ["trimmed_fastq"],
         "provenance": {"trimmed_fastq": "trim"},
     }
+
+
+def test_pending_fastq_download_is_skipped_when_srr_files_exist(tmp_path, monkeypatch):
+    fastq_dir = tmp_path / "data" / "raw" / "fastq" / "SRP181693"
+    fastq_dir.mkdir(parents=True)
+    (fastq_dir / "SRR8479188.fastq.gz").write_bytes(b"x")
+    (fastq_dir / "SRR8479189.fastq.gz").write_bytes(b"x")
+    monkeypatch.setattr(
+        "sRNAgent.agent.plan_orchestrator._resolve_analysis_workspace",
+        lambda: tmp_path,
+    )
+
+    plan = {
+        "steps": [
+            {"id": "3", "title": "Download SRP181693 raw FASTQ via fastq-dl", "status": "pending"},
+            {"id": "4", "title": "3' adapter trimming for SRP181693", "status": "pending"},
+        ]
+    }
+
+    assert _skip_existing_fastq_download_steps(plan) is True
+    assert plan["steps"][0]["status"] == "skipped"
+    assert "SRR8479188" in plan["steps"][0]["result"]
+    assert plan["steps"][1]["status"] == "pending"
 
 
 def test_plan_json_completion_repairs_one_malformed_llm_response():
@@ -1068,6 +1092,14 @@ def test_non_confirmation_keeps_approval_gate_closed():
     assert approval_response_is_actionable("可以") is True
     assert approval_response_is_actionable("adapter_3=ACGTACGTACGT") is True
     assert approval_response_is_actionable("不可以，先解释") is False
+    # Must match IntentRouter gate confirms so CONTINUE replies close the gate.
+    assert approval_response_is_actionable("好的，执行吧") is True
+    assert approval_response_is_actionable("确认运行") is True
+    assert approval_response_is_actionable("执行") is True
+    assert approval_response_is_actionable("ok go ahead") is True
+    assert approval_response_is_actionable("adapter_3=ACGTACGTACGT") is True
+    assert approval_response_is_actionable("unstranded") is True
+    assert approval_response_is_actionable("TGGAATTCTCGGGTGCCAAGG") is True
 
 
 def test_approval_request_prints_known_values_and_edit_instructions():
@@ -1582,6 +1614,64 @@ def test_replan_matches_completed_steps_by_identity_not_shifted_id():
     assert by_title["miRNA 定量"]["status"] == "done"
     assert by_title["miRNA 定量"]["result"] == "old completed result"
     assert by_title["isomiR 定量"]["status"] == "pending"
+
+
+def test_replan_does_not_preserve_failed_status_for_retry():
+    """Failed steps must become pending on replan so the loop can retry them."""
+
+    class Completion:
+        content = (
+            '{"goal":"retry plan","steps":['
+            '{"id":"1","title":"运行 miRanda","goal":"predict","skill":"miranda-target"},'
+            '{"id":"2","title":"汇总","goal":"combine","skill":""}'
+            "]}"
+        )
+
+    class FakeAgent:
+        system_prompt = "system"
+
+        def _emit_progress(self, callback, event_type, **payload):
+            return None
+
+        def _llm_complete_cancellable(self, *args, **kwargs):
+            return Completion()
+
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    orchestrator = PlanOrchestrator.__new__(PlanOrchestrator)
+    orchestrator.agent = FakeAgent()
+    orchestrator.skill_overview = ""
+    old_plan = {
+        "goal": "old plan",
+        "version": 1,
+        "steps": [
+            {
+                "id": "1",
+                "title": "运行 miRanda",
+                "goal": "predict",
+                "skill": "miranda-target",
+                "status": "failed",
+                "result": "Agent reached max turns without calling finish.",
+            },
+            {
+                "id": "2",
+                "title": "汇总",
+                "goal": "combine",
+                "skill": "",
+                "status": "pending",
+            },
+        ],
+    }
+
+    revised = orchestrator._replan(
+        old_plan,
+        user_query="继续完成靶标预测",
+        extra_context="",
+    )
+    by_title = {step["title"]: step for step in revised["steps"]}
+
+    assert by_title["运行 miRanda"]["status"] == "pending"
+    assert by_title["汇总"]["status"] == "pending"
 
 
 def test_successful_steps_advance_the_persisted_plan_without_replanning():
@@ -2143,3 +2233,247 @@ def test_requirements_policy_keeps_high_priority_user_requirements():
     items = requirements["items"]
     assert any("MuData" in item or "mudata" in item.lower() for item in items)
     assert any("HTML" in item or ".html" in item for item in items)
+
+
+def test_target_candidate_gate_auto_completes_when_products_match_manifest(tmp_path):
+    import json
+    import os
+
+    import anndata as ad
+    import numpy as np
+    from sRNAgent.agent.plan_orchestrator import (
+        _auto_complete_target_candidate_gates,
+        _approval_value_from_context,
+        _TARGET_CANDIDATE_CONFIRM_MARKER_REL,
+    )
+
+    adata_dir = tmp_path / "results" / "adata"
+    diff_dir = tmp_path / "results" / "differential"
+    adata_dir.mkdir(parents=True)
+    diff_dir.mkdir(parents=True)
+    features_up = ["feat-up-1", "feat-up-2"]
+    features_down = ["feat-down-1"]
+    adata = ad.AnnData(X=np.zeros((2, 3)))
+    adata.var_names = features_up + features_down
+    adata.uns["target_candidate_selection"] = {"features": features_up}
+    adata.uns["target_candidate_selection_down"] = {"features": features_down}
+    adata.write_h5ad(adata_dir / "srna_DS1.h5ad")
+    (diff_dir / "target_candidate_selection_manifest.json").write_text(
+        json.dumps({
+            "filters": {"adj_p_max": 0.05, "log_fc_min": 1.0, "mean_cpm_min": 5.0, "top_n": 5},
+            "per_dataset": [{
+                "dataset": "DS1",
+                "n_up_selected": 2,
+                "n_down_selected": 1,
+                "up_candidates": features_up,
+                "down_candidates": features_down,
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    plan = {
+        "steps": [
+            {
+                "id": "select",
+                "status": "pending",
+                "workflowContract": "select-target-candidates-before-prediction",
+            },
+            {
+                "id": "confirm",
+                "status": "awaiting_approval",
+                "workflowContract": "confirm-target-candidates-before-prediction",
+                "approval": {"id": "confirm-target-candidates-before-prediction"},
+            },
+            {"id": "predict", "status": "pending", "depends_on": ["confirm"]},
+        ]
+    }
+    assert _auto_complete_target_candidate_gates(plan, workspace=tmp_path) is True
+    assert plan["steps"][0]["status"] == "done"
+    assert plan["steps"][1]["status"] == "done"
+    assert (tmp_path / _TARGET_CANDIDATE_CONFIRM_MARKER_REL).is_file()
+
+    # Replan-style pending gate should stay done via durable confirmation marker.
+    plan2 = {
+        "steps": [{
+            "id": "confirm",
+            "status": "pending",
+            "workflowContract": "confirm-target-candidates-before-prediction",
+            "approval": {"id": "confirm-target-candidates-before-prediction"},
+        }]
+    }
+    assert _auto_complete_target_candidate_gates(plan2, workspace=tmp_path) is True
+    assert plan2["steps"][0]["status"] == "done"
+
+    old = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        summary = _approval_value_from_context("target_candidate_selection", "", {})
+    finally:
+        os.chdir(old)
+    assert "DS1: up=2 down=1" in summary
+    assert "top_n=5" in summary
+
+
+def test_target_candidate_user_confirmation_persists_across_restore(tmp_path):
+    import json
+    import os
+
+    from sRNAgent.agent.plan_orchestrator import (
+        PlanOrchestrator,
+        _auto_complete_target_candidate_gates,
+        _manifest_candidate_fingerprint,
+        _TARGET_CANDIDATE_CONFIRM_MARKER_REL,
+    )
+
+    diff_dir = tmp_path / "results" / "differential"
+    diff_dir.mkdir(parents=True)
+    manifest = {
+        "per_dataset": [{
+            "dataset": "DS1",
+            "up_candidates": ["a"],
+            "down_candidates": [],
+        }],
+    }
+    (diff_dir / "target_candidate_selection_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+    # No matching h5ad → products are inconsistent, so only a prior confirmation works.
+    marker = {
+        "confirmed_at": "2026-01-01T00:00:00+00:00",
+        "response": "可以",
+        "manifest_sha256": _manifest_candidate_fingerprint(manifest),
+    }
+    (tmp_path / _TARGET_CANDIDATE_CONFIRM_MARKER_REL).write_text(
+        json.dumps(marker), encoding="utf-8",
+    )
+    plan = {
+        "steps": [{
+            "id": "confirm",
+            "title": "确认靶标预测候选集",
+            "status": "awaiting_approval",
+            "workflowContract": "confirm-target-candidates-before-prediction",
+            "approval": {"id": "confirm-target-candidates-before-prediction"},
+        }]
+    }
+    assert _auto_complete_target_candidate_gates(plan, workspace=tmp_path) is True
+    assert plan["steps"][0]["status"] == "done"
+
+    plan_wait = {
+        "steps": [{
+            "id": "confirm",
+            "status": "awaiting_approval",
+            "workflowContract": "confirm-target-candidates-before-prediction",
+            "approval": {"id": "confirm-target-candidates-before-prediction"},
+        }]
+    }
+    old = os.getcwd()
+    try:
+        os.chdir(tmp_path)
+        restored = PlanOrchestrator._prepare_restored_plan(plan_wait, approval_response="可以")
+    finally:
+        os.chdir(old)
+    assert restored["steps"][0]["status"] == "done"
+    assert (tmp_path / _TARGET_CANDIDATE_CONFIRM_MARKER_REL).is_file()
+
+
+def test_target_candidate_select_skips_on_matching_confirmation_without_products(tmp_path):
+    """Select may skip when confirmation still fingerprints the current manifest."""
+    import json
+
+    from sRNAgent.agent.plan_orchestrator import (
+        _auto_complete_target_candidate_gates,
+        _is_target_candidate_select_step,
+        _manifest_candidate_fingerprint,
+        _prior_target_candidate_confirmation_matches,
+        invalidate_target_candidate_confirmation,
+        _TARGET_CANDIDATE_CONFIRM_MARKER_REL,
+    )
+
+    diff_dir = tmp_path / "results" / "differential"
+    diff_dir.mkdir(parents=True)
+    manifest = {
+        "per_dataset": [{
+            "dataset": "DS1",
+            "up_candidates": ["a"],
+            "down_candidates": [],
+        }],
+    }
+    (diff_dir / "target_candidate_selection_manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+    marker = {
+        "confirmed_at": "2026-01-01T00:00:00+00:00",
+        "response": "可以",
+        "manifest_sha256": _manifest_candidate_fingerprint(manifest),
+    }
+    (tmp_path / _TARGET_CANDIDATE_CONFIRM_MARKER_REL).write_text(
+        json.dumps(marker), encoding="utf-8",
+    )
+
+    # Title-only select step (replan dropped workflowContract).
+    select_step = {
+        "id": "select",
+        "title": "从差异结果确定靶标分析候选小RNA",
+        "status": "pending",
+    }
+    assert _is_target_candidate_select_step(select_step) is True
+    assert _is_target_candidate_select_step({
+        "title": "确认靶标预测候选集",
+        "approval": {"id": "confirm-target-candidates-before-prediction"},
+    }) is False
+
+    plan = {
+        "steps": [
+            select_step,
+            {
+                "id": "confirm",
+                "status": "awaiting_approval",
+                "workflowContract": "confirm-target-candidates-before-prediction",
+                "approval": {"id": "confirm-target-candidates-before-prediction"},
+            },
+        ]
+    }
+    assert _auto_complete_target_candidate_gates(plan, workspace=tmp_path) is True
+    assert plan["steps"][0]["status"] == "done"
+    assert plan["steps"][1]["status"] == "done"
+
+    # NEW_WORKFLOW must drop the marker so a fresh analysis cannot skip.
+    assert invalidate_target_candidate_confirmation(tmp_path) is True
+    ok, reason = _prior_target_candidate_confirmation_matches(tmp_path)
+    assert ok is False
+    assert "no prior confirmation" in reason
+
+    plan_fresh = {
+        "steps": [
+            {"id": "select", "title": "从差异结果确定靶标分析候选小RNA", "status": "pending"},
+            {
+                "id": "confirm",
+                "status": "awaiting_approval",
+                "workflowContract": "confirm-target-candidates-before-prediction",
+                "approval": {"id": "confirm-target-candidates-before-prediction"},
+            },
+        ]
+    }
+    assert _auto_complete_target_candidate_gates(plan_fresh, workspace=tmp_path) is False
+    assert plan_fresh["steps"][0]["status"] == "pending"
+    assert plan_fresh["steps"][1]["status"] == "awaiting_approval"
+
+
+def test_target_candidate_confirmation_without_manifest_does_not_match(tmp_path):
+    import json
+
+    from sRNAgent.agent.plan_orchestrator import (
+        _prior_target_candidate_confirmation_matches,
+        _TARGET_CANDIDATE_CONFIRM_MARKER_REL,
+    )
+
+    marker_path = tmp_path / _TARGET_CANDIDATE_CONFIRM_MARKER_REL
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        json.dumps({"confirmed_at": "2026-01-01T00:00:00+00:00", "manifest_sha256": "abc"}),
+        encoding="utf-8",
+    )
+    ok, reason = _prior_target_candidate_confirmation_matches(tmp_path)
+    assert ok is False
+    assert "manifest missing" in reason

@@ -81,10 +81,15 @@ function setDeviceActiveChatId(chatId) {
 let isComposing = false;
 let pendingExecutionCode = "";
 let imeEnterStroke = false;
+/** Timestamp for the last IME-confirm Enter; stale flags must not block later sends. */
+let imeEnterStrokeAt = 0;
+const IME_ENTER_GUARD_MS = 450;
 let activeCodeExecutionId = null;
 let currentPage = "agent";
 /** @type {Map<string, { generation: number, runId: string, abortController: AbortController, messages: Array<any>, assistantEntry: any, pending: Element|null, idleTimer: number|null, lastStreamEventAt: number, codeExecutionId: string|null }>} */
 const chatStreams = new Map();
+/** Explicit Stop: leftover kernelBusy / live bus must not resurrect the run UI. */
+const userStoppedChats = new Set();
 let nextStreamGeneration = 0;
 const STREAM_IDLE_MS = 3600000;
 const STREAM_STATUS_POLL_MS = 4000;
@@ -93,22 +98,49 @@ const EXECUTION_ELAPSED_TICK_MS = 1000;
 const liveFollows = new Map();
 /** @type {Map<string, Array<{id: string, text: string, notice: Element|null}>>} 主任务运行期间用户发的新消息先排队，当前任务结束后自动发送 */
 const pendingSends = new Map();
-const BACKGROUND_WATCH_POLL_MS = 3000;
+const BACKGROUND_WATCH_POLL_MS = 2000;
 const BACKGROUND_EXECUTION_ID = "background-kernel-run";
 /** @type {Map<string, { timer: number, startedAt: number, pending: Element|null, assistantEntry: any|null }>} */
 const backgroundWatches = new Map();
+/** Retries for auto-chained steps that start after a brief idle gap. */
+const progressTrackingRetryTimers = new Map();
 let executionElapsedTimer = null;
 
 function isChatStreaming(chatId) {
   if (!chatId) return false;
   const stream = chatStreams.get(chatId);
   if (!stream) return false;
-  // 旁观伪 stream 不算「本机主发送流」
-  return !stream.isFollower;
+  // 旁观伪 stream 不算「本机主发送流」；done 后 soft-release 也不再占 Stop。
+  if (stream.isFollower || stream.composerReleased) return false;
+  return true;
 }
 
 function isLiveFollowing(chatId = activeChatId) {
-  return Boolean(chatId && liveFollows.has(chatId));
+  const follow = chatId ? liveFollows.get(chatId) : null;
+  if (!follow) return false;
+  // Soft-released after `done` while waiting for report / stream_end.
+  if (follow.composerReleased) return false;
+  return true;
+}
+
+/** True while a direct/live handle still exists (including soft-released). */
+function chatHasTransportHandle(chatId = activeChatId) {
+  return Boolean(
+    chatId
+    && (chatStreams.has(chatId) || liveFollows.has(chatId) || backgroundWatches.has(chatId)),
+  );
+}
+
+function clearStreamTimers(stream) {
+  if (!stream) return;
+  if (stream.idleTimer) {
+    window.clearInterval(stream.idleTimer);
+    stream.idleTimer = null;
+  }
+  if (stream.statusPollTimer) {
+    window.clearInterval(stream.statusPollTimer);
+    stream.statusPollTimer = null;
+  }
 }
 
 function isActiveChatSending() {
@@ -129,6 +161,73 @@ function getChatStream(chatId) {
 function syncComposerForActiveChat() {
   setComposerMode(isActiveChatSending() ? "stop" : "send");
   renderRecentChats();
+}
+
+function clearImeEnterGuard() {
+  imeEnterStroke = false;
+  imeEnterStrokeAt = 0;
+  isComposing = false;
+}
+
+function isImeEnterGuardActive() {
+  if (!imeEnterStroke) return false;
+  if (Date.now() - imeEnterStrokeAt > IME_ENTER_GUARD_MS) {
+    clearImeEnterGuard();
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Local "busy" flags (background watch / live follow / stop-mode button) can
+ * linger after the backend run is already idle — or be missing while the
+ * server is still running. Always reconcile against run-status.
+ * @returns {Promise<boolean>} true when the chat is still genuinely busy
+ */
+async function reconcileComposerIdleState() {
+  clearImeEnterGuard();
+
+  const status = await fetchRunStatus(activeChatId);
+  const awaitingApproval = Boolean(
+    status?.awaitingApproval || planAwaitingApproval(status),
+  );
+  const serverBusy = Boolean(
+    status?.ok
+    && !awaitingApproval
+    && (status.hasActiveRun || status.kernelBusy || status.liveAvailable || status.codeActive),
+  );
+
+  if (serverBusy) {
+    // Keep / restore local busy tracking so Enter queues instead of starting a
+    // second run that would cancel the live task.
+    if (!backgroundWatches.has(activeChatId) && !isChatStreaming(activeChatId)) {
+      const lastAssistant = [...chatHistory].reverse().find((item) => item?.role === "assistant");
+      startBackgroundRunWatch(activeChatId, { assistantEntry: lastAssistant || null });
+      void attachLiveEventStream(activeChatId, status);
+    }
+    setComposerMode("stop");
+    renderRecentChats();
+    return true;
+  }
+
+  // Status unknown: trust local flags only.
+  if (!status?.ok) {
+    if (!isActiveChatSending() && sendBtn?.dataset.mode === "stop") {
+      setComposerMode("send");
+    }
+    return isActiveChatSending();
+  }
+
+  // Server idle (including approval gates / completed plans): drop local busy
+  // markers so the user can send.
+  if (awaitingApproval) {
+    forceComposerIdle(activeChatId, { skipDrain: true });
+    return false;
+  }
+  if (isActiveChatSending() || sendBtn?.dataset.mode === "stop" || isPlanSettled(status)) {
+    forceComposerIdle(activeChatId);
+  }
+  return false;
 }
 
 function getChatRecord(chatId) {
@@ -199,19 +298,16 @@ function cancelAllChatStreams() {
 
 function finishChatStream(chatId, options = {}) {
   const stream = chatStreams.get(chatId);
-  if (stream?.idleTimer) {
-    window.clearInterval(stream.idleTimer);
-    stream.idleTimer = null;
-  }
-  if (stream?.statusPollTimer) {
-    window.clearInterval(stream.statusPollTimer);
-    stream.statusPollTimer = null;
-  }
+  clearStreamTimers(stream);
   chatStreams.delete(chatId);
   renderRecentChats();
   if (chatId !== activeChatId) return;
   syncComposerForActiveChat();
-  schedulePendingSendDrain(chatId);
+  // Approval gates free the composer for a *manual* reply. Do not auto-drain
+  // a previously queued message as if it were the confirmation.
+  if (!options.skipDrain) {
+    schedulePendingSendDrain(chatId);
+  }
   if (!options.keepBackgroundWatch && window.llmIsLocalServer?.()) {
     if (isActiveChatSending()) {
       window.KernelPanel?.stopPolling?.();
@@ -1175,10 +1271,145 @@ function hasRunningCodePanelExecution(chatId = activeChatId) {
 }
 
 function isTaskLikelyActive(status, chatId = activeChatId) {
+  if (chatId && userStoppedChats.has(chatId)) return false;
   if (status?.ok) {
     return Boolean(status.hasActiveRun || status.kernelBusy);
   }
   return false;
+}
+
+function serverProgressLikelyActive(status, chatId = activeChatId) {
+  if (chatId && userStoppedChats.has(chatId)) return false;
+  if (!status?.ok) return false;
+  // Only a *running* plan step means the agent is still working.
+  // Pending / awaiting_approval steps are idle from the server's point of view
+  // (especially approval gates — the user must be able to reply in the composer).
+  return Boolean(
+    status.hasActiveRun
+    || status.kernelBusy
+    || status.liveAvailable
+    || status.codeActive
+    || planHasRunningSteps(status),
+  );
+}
+
+function clearProgressTrackingRetry(chatId) {
+  if (!chatId) return;
+  const timer = progressTrackingRetryTimers.get(chatId);
+  if (timer) window.clearTimeout(timer);
+  progressTrackingRetryTimers.delete(chatId);
+}
+
+/**
+ * Keep To-dos / CODE / live status fresh across auto-chained plan steps.
+ * Primary SSE and live-follow streams often end between steps; without this
+ * the UI freezes until the user focuses the composer or refreshes.
+ */
+async function ensureProgressTracking(chatId, {
+  status = null,
+  pending = null,
+  assistantEntry = null,
+  _retry = 0,
+} = {}) {
+  if (!chatId) return null;
+  let snap = status;
+  if (!snap) {
+    snap = await fetchRunStatus(chatId);
+  }
+  if (!snap?.ok) return snap;
+  if (userStoppedChats.has(chatId)) {
+    forceComposerIdle(chatId, { skipDrain: true });
+    return snap;
+  }
+
+  const runActive = isTaskLikelyActive(snap, chatId);
+  const waitingApproval = planAwaitingApproval(snap);
+  const progressActive = serverProgressLikelyActive(snap, chatId) || runActive;
+
+  // Approval gate: agent is idle and waiting for a user reply in the composer.
+  if (waitingApproval && !runActive) {
+    forceComposerIdle(chatId, { skipDrain: true });
+    if (chatId === activeChatId && snap.plan?.steps?.length) {
+      rememberLivePlan(snap.plan);
+      renderTodosBoard(getActivePlanSnapshot());
+    }
+    return snap;
+  }
+
+  // Plan fully finished (or truly idle): never leave Stop mode stuck.
+  if (!progressActive) {
+    if (isPlanSettled(snap) || _retry >= 6) {
+      forceComposerIdle(chatId);
+      if (chatId === activeChatId && snap.plan?.steps?.length && isPlanSettled(snap)) {
+        rememberLivePlan(snap.plan);
+        renderTodosBoard(getActivePlanSnapshot());
+      }
+      return snap;
+    }
+    // Auto-continue can leave a short idle window between turns.
+    clearProgressTrackingRetry(chatId);
+    const timer = window.setTimeout(() => {
+      progressTrackingRetryTimers.delete(chatId);
+      void ensureProgressTracking(chatId, {
+        pending,
+        assistantEntry,
+        _retry: _retry + 1,
+      });
+    }, _retry === 0 ? 400 : 900);
+    progressTrackingRetryTimers.set(chatId, timer);
+    return snap;
+  }
+
+  const entry = assistantEntry
+    || [...(chatId === activeChatId ? chatHistory : (getChatRecord(chatId)?.messages || []))]
+      .reverse()
+      .find((item) => item?.role === "assistant")
+    || null;
+
+  // Live SSE / status watch need a real run. Plan-only "pending" between
+  // auto-chained steps must not flap the background watcher — keep probing.
+  if (runActive || snap.liveAvailable || snap.codeActive) {
+    clearProgressTrackingRetry(chatId);
+    if (!isChatStreaming(chatId) && !liveFollows.has(chatId)) {
+      void attachLiveEventStream(chatId, snap);
+    }
+  }
+  if (runActive && !isChatStreaming(chatId) && !backgroundWatches.has(chatId)) {
+    clearProgressTrackingRetry(chatId);
+    startBackgroundRunWatch(chatId, { pending, assistantEntry: entry });
+  }
+  if (!runActive && !snap.liveAvailable && !snap.codeActive && _retry < 8) {
+    clearProgressTrackingRetry(chatId);
+    const timer = window.setTimeout(() => {
+      progressTrackingRetryTimers.delete(chatId);
+      void ensureProgressTracking(chatId, {
+        pending,
+        assistantEntry,
+        _retry: _retry + 1,
+      });
+    }, 700);
+    progressTrackingRetryTimers.set(chatId, timer);
+  }
+
+  if (chatId === activeChatId) {
+    if (runActive) {
+      syncRunStatusToUI(chatId, snap, {
+        pending,
+        assistantEntry: entry,
+        persist: false,
+      });
+    } else if (snap.plan?.steps?.length && (planHasRunningSteps(snap) || planAwaitingApproval(snap))) {
+      rememberLivePlan(snap.plan);
+      renderTodosBoard(getActivePlanSnapshot());
+    }
+    // Approval gates are idle: never leave the composer stuck in stop mode.
+    if (planAwaitingApproval(snap) && !runActive) {
+      forceComposerIdle(chatId, { skipDrain: true });
+    } else {
+      syncComposerForActiveChat();
+    }
+  }
+  return snap;
 }
 
 function isPlanSettled(status) {
@@ -1188,6 +1419,20 @@ function isPlanSettled(status) {
     const s = String(step?.status || "");
     return s === "done" || s === "failed" || s === "skipped";
   });
+}
+
+function planHasRunningSteps(planOrStatus) {
+  const steps = Array.isArray(planOrStatus?.steps)
+    ? planOrStatus.steps
+    : (Array.isArray(planOrStatus?.plan?.steps) ? planOrStatus.plan.steps : []);
+  return steps.some((step) => String(step?.status || "") === "running");
+}
+
+function planAwaitingApproval(planOrStatus) {
+  const steps = Array.isArray(planOrStatus?.steps)
+    ? planOrStatus.steps
+    : (Array.isArray(planOrStatus?.plan?.steps) ? planOrStatus.plan.steps : []);
+  return steps.some((step) => String(step?.status || "") === "awaiting_approval");
 }
 
 function planHasActiveSteps(planOrStatus) {
@@ -1570,8 +1815,8 @@ function finishBackgroundExecutionCard() {
 
 function shouldShowBackgroundExecutionCard(status, assistantEntry = null) {
   if (!status) return false;
-  const codeReallyRunning = Boolean(status.kernelBusy || status.codeActive);
-  if (codeReallyRunning) return true;
+  if (activeChatId && userStoppedChats.has(activeChatId)) return false;
+  if (Boolean(status.codeActive)) return true;
   // Reply already finalized: do not keep a leftover "Agent 运行中" card while
   // the backend briefly still reports hasActiveRun during cleanup.
   if (assistantEntry?._finalReplyLocked) return false;
@@ -1590,9 +1835,10 @@ function syncRunStatusToUI(chatId, status, options = {}) {
     if (status.plan?.steps?.length && target) {
       const entryHasPlan = assistantEntryHasPlan(assistantEntry);
       const domHasPlan = Boolean(target.querySelector?.(".chat-thinking__step--plan"));
-      // Never paste a leftover settled plan.json into a brand-new turn's Thinking.
-      if (planHasActiveSteps(status) || entryHasPlan || domHasPlan) {
+      // Never paste a leftover pending/gate plan into a side-question turn.
+      if (planHasRunningSteps(status) || entryHasPlan || domHasPlan) {
         const planTitle = resolvePlanSnapshotTitle(status.plan.goal);
+        rememberLivePlan(status.plan);
         appendThinkingStep(
           target,
           {
@@ -1605,13 +1851,18 @@ function syncRunStatusToUI(chatId, status, options = {}) {
             body: status.plan.steps
               .map((s) => {
                 const mark =
-                  s.status === "done" ? "✓" : s.status === "running" ? "▶" : s.status === "failed" ? "✗" : "○";
+                  s.status === "done" ? "✓"
+                    : s.status === "running" ? "▶"
+                      : s.status === "failed" ? "✗"
+                        : s.status === "awaiting_approval" ? "?"
+                          : "○";
                 return `${mark} ${s.title || s.goal || s.id}`;
               })
               .join("\n"),
           },
           { persist: false },
         );
+        renderTodosBoard(getActivePlanSnapshot());
       }
     }
     if (shouldShowBackgroundExecutionCard(status, assistantEntry)) {
@@ -1638,29 +1889,29 @@ async function pollBackgroundRunStatus(chatId) {
 
   const status = await fetchRunStatus(chatId);
   if (!status) {
-    const offlinePlan = planSnapshotFromThinking(watch.assistantEntry);
-    const offlineStatus = {
-      ok: true,
-      plan: offlinePlan,
-      planSummary: "服务连接已断开，运行状态无法确认",
-      stalePlanStep: Boolean(offlinePlan?.steps?.some((step) => step?.status === "running")),
-    };
-    reconcileStaleTaskUi(chatId, offlineStatus, {
-      pending: watch.pending,
-      assistantEntry: watch.assistantEntry,
-      forceMessage: true,
-    });
+    watch.misses = (watch.misses || 0) + 1;
+    // After repeated probe failures, release the composer instead of locking send forever.
+    if (watch.misses >= 3) {
+      stopBackgroundRunWatch(chatId);
+      if (chatId === activeChatId) syncComposerForActiveChat();
+      schedulePendingSendDrain(chatId);
+    }
     return;
   }
+  watch.misses = 0;
   if (isStaleTaskState(status)) {
     reconcileStaleTaskUi(chatId, status, {
       pending: watch.pending,
       assistantEntry: watch.assistantEntry,
     });
+    stopBackgroundRunWatch(chatId);
+    if (chatId === activeChatId) syncComposerForActiveChat();
+    schedulePendingSendDrain(chatId);
     return;
   }
   if (!isTaskLikelyActive(status, chatId)) {
     stopBackgroundRunWatch(chatId);
+    detachLiveEventStream(chatId);
     if (chatId === activeChatId) {
       finishBackgroundExecutionCard();
       markRunningExecutionsStopped();
@@ -1675,7 +1926,15 @@ async function pollBackgroundRunStatus(chatId) {
           persistChatMessages(chatId, chatHistory);
         }
       }
+      // Explicitly free Stop mode; dangling liveFollow used to keep it stuck.
+      setComposerMode("send");
     }
+    // Keep probing through the idle gap before an auto-chained next step.
+    void ensureProgressTracking(chatId, {
+      status,
+      pending: watch.pending,
+      assistantEntry: watch.assistantEntry,
+    });
     schedulePendingSendDrain(chatId);
     return;
   }
@@ -1860,12 +2119,20 @@ function applyLiveFollowEvent(chatId, event) {
     }
     handleAgentStreamEvent(target, event);
     markLiveEventSeen();
+    if (event.type === "code_approval_required") {
+      showCodeApproval(target, event, {
+        runId: follow?.runId || event.runId || "",
+        autoApprove: approvalMode === "auto",
+      });
+    }
     if (event.type === "final" && event.content) {
-      assistantEntry.content = stripExecutionMemoryBlock(event.content);
+      if (!assistantEntry._finalReplyLocked) {
+        assistantEntry.content = stripExecutionMemoryBlock(event.content);
+      }
       persistChatMessages(chatId, messages);
     }
     if (event.type === "done" && event.text) {
-      assistantEntry.content = stripExecutionMemoryBlock(event.text);
+      freezeAssistantFinalText(assistantEntry, stripExecutionMemoryBlock(event.text));
       updateMessageGroup(target, assistantEntry.content);
       persistChatMessages(chatId, messages);
     }
@@ -1882,12 +2149,22 @@ function applyLiveFollowEvent(chatId, event) {
   }
 
   if (event.type === "final" || event.type === "done" || event.type === "cancelled" || event.type === "error" || event.type === "stream_end") {
+    // Step tool-loops also emit `final`; only true run terminals release the composer.
+    if (event.type === "final") return;
+    // `done` frees the composer but keeps the live follower so `run_report_ready`
+    // (emitted after done) is not lost. Full teardown waits for stream_end.
+    if (event.type === "done") {
+      releaseComposerAfterStream(chatId, { keepStream: true });
+      return;
+    }
     releaseComposerAfterStream(chatId);
   }
 }
 
 async function attachLiveEventStream(chatId, status = null) {
-  if (!chatId || isChatStreaming(chatId) || liveFollows.has(chatId)) return;
+  // Soft-released direct streams still own the run until stream_end — never
+  // dual-attach a live follower beside them (would yank Stop back / race UI).
+  if (!chatId || isChatStreaming(chatId) || chatStreams.has(chatId) || liveFollows.has(chatId)) return;
   if (!window.agentLiveEventStream) return;
 
   let snap = status;
@@ -1943,12 +2220,19 @@ async function attachLiveEventStream(chatId, status = null) {
         console.warn("live event stream error", error);
       }
     } finally {
-      liveFollows.delete(chatId);
-      const stream = chatStreams.get(chatId);
-      if (stream?.isFollower) chatStreams.delete(chatId);
-      if (chatId === activeChatId) {
-        syncComposerForActiveChat();
-        schedulePendingSendDrain(chatId);
+      // Only tear down THIS follow. A newer attachLiveEventStream (e.g. after
+      // auto-chained step reconnect) may already own the map entry.
+      const current = liveFollows.get(chatId);
+      if (current?.abortController === abortController) {
+        liveFollows.delete(chatId);
+        const stream = chatStreams.get(chatId);
+        if (stream?.isFollower) chatStreams.delete(chatId);
+        if (chatId === activeChatId) {
+          syncComposerForActiveChat();
+          schedulePendingSendDrain(chatId);
+        }
+        // If the server kept going after this stream ended, re-subscribe.
+        void ensureProgressTracking(chatId);
       }
     }
   })();
@@ -2113,6 +2397,22 @@ function persistActiveChat() {
   persistChatMessages(activeChatId, chatHistory);
 }
 
+function chatHasPendingCodeApproval(chatId = activeChatId) {
+  const panel = getChatRecord(chatId)?.codePanel || [];
+  return panel.some(
+    (item) => item?.type === "approval" && (!item.status || item.status === "pending"),
+  );
+}
+
+function resolveCodeApprovalRunId(chatId = activeChatId, artifact = null) {
+  return (
+    String(artifact?.runId || "").trim()
+    || getChatStream(chatId)?.runId
+    || liveFollows.get(chatId)?.runId
+    || ""
+  );
+}
+
 function recordCodeArtifactForChat(chatId, artifact) {
   const chat = ensureChatRecord(chatId);
   if (!chat || !Array.isArray(chat.codePanel)) return;
@@ -2140,6 +2440,13 @@ function recordCodeArtifactForChat(chatId, artifact) {
   saveChatStore();
   scheduleServerSessionSave(chatId);
   renderRecentChats();
+  // Background tabs persist the card; when that chat is already visible, redraw
+  // so pending approval buttons appear without waiting for a tab switch.
+  if (chatId === activeChatId && artifact.type === "approval") {
+    renderCodePanel(chat.codePanel, {
+      interactive: isActiveChatSending() || chatHasPendingCodeApproval(chatId),
+    });
+  }
 }
 
 function resetCodePanel() {
@@ -2153,11 +2460,13 @@ function renderChatThread() {
   if (chatHistory.length === 0) {
     threadInner.innerHTML = welcomeCardHtml();
     renderQueuedSendNotices(activeChatId);
-    renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: isActiveChatSending() });
-    renderTodosBoard(getActivePlanSnapshot());
-    scrollThreadToBottom();
-    return;
-  }
+  renderCodePanel(getActiveChatRecord()?.codePanel || [], {
+    interactive: isActiveChatSending() || chatHasPendingCodeApproval(),
+  });
+  renderTodosBoard(getActivePlanSnapshot());
+  scrollThreadToBottom();
+  return;
+}
   chatHistory.forEach((item) => {
     if (item.role !== "user" && item.role !== "assistant") return;
     const fallback = item.role === "assistant" && item.thinkingSteps?.length ? "" : "（无回复）";
@@ -2172,7 +2481,9 @@ function renderChatThread() {
     }
   });
   renderQueuedSendNotices(activeChatId);
-  renderCodePanel(getActiveChatRecord()?.codePanel || [], { interactive: isActiveChatSending() });
+  renderCodePanel(getActiveChatRecord()?.codePanel || [], {
+    interactive: isActiveChatSending() || chatHasPendingCodeApproval(),
+  });
   renderTodosBoard(getActivePlanSnapshot());
 }
 
@@ -2182,7 +2493,7 @@ function deleteChat(chatId, event) {
     event.stopPropagation();
   }
   if (!chatId) return;
-  if (isChatStreaming(chatId)) return;
+  if (chatHasTransportHandle(chatId)) return;
 
   // Explicit server delete (kernel release alone no longer wipes session dirs).
   if (chatPersistenceMode === "server") {
@@ -2847,7 +3158,7 @@ function buildThinkingPlanData(plan, eventType = "", message = "") {
   const interrupted = steps.filter((step) => step?.status === "interrupted").length;
   const awaitingApproval = steps.filter((step) => step?.status === "awaiting_approval").length;
   const failed = steps.filter((step) => step?.status === "failed").length;
-  const pending = Math.max(0, steps.length - done - running - interrupted - failed);
+  const pending = Math.max(0, steps.length - done - running - interrupted - failed - awaitingApproval);
   const autoInserted = steps.filter((step) => step?.autoInserted);
   return {
     eventType: String(eventType || ""),
@@ -3105,7 +3416,7 @@ function sanitizeCodePanel(codePanel) {
 
   runningIndices.forEach((index, order) => {
     const keepRunning =
-      (isChatStreaming(activeChatId) || backgroundWatches.has(activeChatId))
+      chatHasTransportHandle(activeChatId)
       && order === runningIndices.length - 1;
     if (!keepRunning) {
       items[index] = stripDownloadProgressFields({
@@ -3629,7 +3940,20 @@ function renderCodePanel(codePanel, options = {}) {
 
   sanitized.forEach((artifact) => {
     if (artifact.type === "approval") {
-      renderApprovalArtifact(artifact, interactive);
+      const card = renderApprovalArtifact(artifact, interactive);
+      const pending = !artifact.status || artifact.status === "pending";
+      if (card && interactive && pending) {
+        const runId = resolveCodeApprovalRunId(activeChatId, artifact);
+        wireApprovalCard(
+          card,
+          {
+            requestId: artifact.id,
+            description: artifact.description,
+            code: artifact.code,
+          },
+          { runId },
+        );
+      }
     } else if (artifact.type === "execution") {
       renderExecutionArtifact(normalizeExecutionArtifact(hydrateExecutionElapsed(artifact)), {
         showStop: interactive && isActiveChatSending() && !artifact.done && !artifact.stopped,
@@ -3660,7 +3984,10 @@ function markApprovalCard(card, status) {
 }
 
 async function settleCodeApproval(card, event, approved, options = {}) {
-  const runId = options.runId || getChatStream(activeChatId)?.runId || "";
+  const artifact = getActiveChatRecord()?.codePanel?.find(
+    (item) => item.type === "approval" && item.id === event.requestId,
+  );
+  const runId = options.runId || resolveCodeApprovalRunId(activeChatId, artifact);
   const desc = event.description || "即将在当前 conda / Jupyter 环境中执行以下 Python 代码。";
   const status = approved ? (options.auto ? "auto-approved" : "approved") : "denied";
 
@@ -3703,18 +4030,39 @@ async function settleCodeApproval(card, event, approved, options = {}) {
 }
 
 function wireApprovalCard(card, event, options = {}) {
-  if (!card || card.dataset.approvalWired === "true") return;
+  if (!card) return;
+  const incomingRunId = String(options.runId || "").trim();
+  if (incomingRunId) {
+    card.dataset.approvalRunId = incomingRunId;
+  }
+  card.dataset.approvalRequestId = String(event.requestId || card.dataset.requestId || "");
+
+  const resolveOpts = () => {
+    const artifact = getActiveChatRecord()?.codePanel?.find(
+      (item) => item.type === "approval" && item.id === event.requestId,
+    );
+    return {
+      ...options,
+      runId:
+        card.dataset.approvalRunId
+        || resolveCodeApprovalRunId(activeChatId, artifact),
+    };
+  };
+
+  if (card.dataset.approvalWired === "true") {
+    return;
+  }
   card.dataset.approvalWired = "true";
 
   card.querySelector(".code-approval__allow")?.addEventListener("click", () => {
-    void settleCodeApproval(card, event, true, options);
+    void settleCodeApproval(card, event, true, resolveOpts());
   });
   card.querySelector(".code-approval__deny")?.addEventListener("click", () => {
-    void settleCodeApproval(card, event, false, options);
+    void settleCodeApproval(card, event, false, resolveOpts());
   });
   card.querySelector(".code-approval__allow-all")?.addEventListener("click", () => {
     setAutoApproveCode(true);
-    void settleCodeApproval(card, event, true, { ...options, auto: true });
+    void settleCodeApproval(card, event, true, { ...resolveOpts(), auto: true });
   });
 }
 
@@ -3776,6 +4124,7 @@ function showCodeApproval(_group, event, options = {}) {
     description: desc,
     code: event.code || "",
     status: shouldAuto ? "auto-approved" : "pending",
+    runId,
   });
 
   card = renderApprovalArtifact(
@@ -3785,6 +4134,7 @@ function showCodeApproval(_group, event, options = {}) {
       description: desc,
       code: event.code || "",
       status: shouldAuto ? "auto-approved" : "pending",
+      runId,
     },
     !shouldAuto,
   );
@@ -4158,6 +4508,51 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
   if (event.type === "status" && event.message) {
     return;
   }
+  if (event.type === "code_approval_required") {
+    let desc = event.description || "即将在当前 conda / Jupyter 环境中执行以下 Python 代码。";
+    if (event.supervisor?.reason) {
+      desc = `需用户确认（${event.supervisor.level || "skill"}）：${event.supervisor.reason}\n\n${desc}`;
+    }
+    const shouldAuto = approvalMode === "auto";
+    const runId =
+      event.runId
+      || getChatStream(streamChatId)?.runId
+      || liveFollows.get(streamChatId)?.runId
+      || "";
+    recordCodeArtifactForChat(streamChatId, {
+      type: "approval",
+      id: event.requestId,
+      description: desc,
+      code: event.code || "",
+      status: shouldAuto ? "auto-approved" : "pending",
+      runId,
+    });
+    appendThinkingStepToEntry(assistantEntry, {
+      id: streamThinkingStepId(event, "approval"),
+      kind: "result",
+      title: shouldAuto ? "代码已自动批准" : "等待批准代码执行",
+      body: String(desc).slice(0, 240),
+      roundId: eventThinkingRoundId(event),
+    });
+    if (shouldAuto && runId && event.requestId) {
+      void window.approveAgentCode?.(runId, event.requestId, true);
+    }
+    return;
+  }
+  if (event.type === "run_report_ready") {
+    const taskHint = event.taskLabel ? `${event.taskLabel}：` : "";
+    appendThinkingStepToEntry(assistantEntry, {
+      id: streamThinkingStepId(event, "report"),
+      kind: "result",
+      title: "运行报告已追加",
+      body: `${taskHint}${event.reportSummary || "可在左侧 Report 页查看"}`,
+      roundId: eventThinkingRoundId(event),
+    });
+    if (streamChatId === activeChatId) {
+      void refreshReportPage();
+    }
+    return;
+  }
   if (
     event.type === "plan_created"
     || event.type === "plan_revised"
@@ -4179,6 +4574,9 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
         assistantEntry.content = msg;
       }
     }
+    if (isApprovalEvent) {
+      releaseComposerForApproval(streamChatId, event.plan || null);
+    }
     if (event.plan?.steps?.length) {
       const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
       const planData = buildThinkingPlanData(event.plan, event.type, msg);
@@ -4191,7 +4589,11 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
         body: event.plan.steps
           .map((s) => {
             const mark =
-              s.status === "done" ? "✓" : s.status === "running" ? "▶" : s.status === "failed" ? "✗" : "○";
+              s.status === "done" ? "✓"
+                : s.status === "running" ? "▶"
+                  : s.status === "failed" ? "✗"
+                    : s.status === "awaiting_approval" ? "?"
+                      : "○";
             return `${mark} ${s.title || s.goal || s.id}`;
           })
           .join("\n"),
@@ -4219,7 +4621,10 @@ function handleAgentStreamEventBackground(streamChatId, streamMessages, assistan
     return;
   }
   if (event.type === "final" && event.content) {
-    freezeAssistantFinalText(assistantEntry, stripExecutionMemoryBlock(event.content));
+    // Step-local finals: update text without locking — plan may continue.
+    if (!assistantEntry._finalReplyLocked) {
+      assistantEntry.content = stripExecutionMemoryBlock(event.content);
+    }
     return;
   }
   if (event.type === "thinking" && String(event.content || "").trim()) return;
@@ -4271,6 +4676,18 @@ function handleAgentStreamEvent(group, event) {
   if (event.type === "status" && event.message) {
     setLiveStatus(group, event.message);
     scrollThreadToBottom();
+    return;
+  }
+
+  if (event.type === "run_report_ready") {
+    const taskHint = event.taskLabel ? `${event.taskLabel}：` : "";
+    appendThinkingStep(group, {
+      id: streamThinkingStepId(event, "report"),
+      kind: "result",
+      title: "运行报告已追加",
+      body: `${taskHint}${event.reportSummary || "可在左侧 Report 页查看"}`,
+    });
+    void refreshReportPage();
     return;
   }
 
@@ -4330,6 +4747,10 @@ function handleAgentStreamEvent(group, event) {
       }
     }
     if (isApprovalEvent && msg) persistActiveChat();
+    if (isApprovalEvent) {
+      // Approval pauses the agent loop — free the composer so the user can reply.
+      releaseComposerForApproval(activeChatId, event.plan || null);
+    }
     if (event.plan?.steps?.length) {
       const planTitle = resolvePlanSnapshotTitle(event.plan.goal, event.type);
       const planData = buildThinkingPlanData(event.plan, event.type, msg);
@@ -4341,7 +4762,11 @@ function handleAgentStreamEvent(group, event) {
         body: event.plan.steps
           .map((s) => {
             const mark =
-              s.status === "done" ? "✓" : s.status === "running" ? "▶" : s.status === "failed" ? "✗" : "○";
+              s.status === "done" ? "✓"
+                : s.status === "running" ? "▶"
+                  : s.status === "failed" ? "✗"
+                    : s.status === "awaiting_approval" ? "?"
+                      : "○";
             return `${mark} ${s.title || s.goal || s.id}`;
           })
           .join("\n"),
@@ -4371,7 +4796,10 @@ function handleAgentStreamEvent(group, event) {
   if (event.type === "final" && event.content) {
     const entry = getLastAssistantEntry();
     const text = stripExecutionMemoryBlock(event.content);
-    if (entry) freezeAssistantFinalText(entry, text);
+    // Do not freeze on step-local finals — the plan may still be running.
+    if (entry && !entry._finalReplyLocked) {
+      entry.content = text;
+    }
     updateMessageGroup(group, text);
     persistActiveChat();
     return;
@@ -4450,16 +4878,70 @@ function resetComposerControls() {
   }
 }
 
-function releaseComposerAfterStream(chatId) {
-  // A terminal server event is authoritative. Do not leave a stale live
-  // follower/background watch keeping the composer in stop mode.
+function forceComposerIdle(chatId, options = {}) {
+  if (!chatId) return;
+  clearProgressTrackingRetry(chatId);
   stopBackgroundRunWatch(chatId);
-  const follow = liveFollows.get(chatId);
-  if (follow) {
-    liveFollows.delete(chatId);
-    follow.abortController?.abort();
+  detachLiveEventStream(chatId);
+  finishChatStream(chatId, { skipDrain: Boolean(options.skipDrain) });
+  if (chatId === activeChatId) {
+    setComposerMode("send");
   }
-  finishChatStream(chatId);
+}
+
+function releaseComposerForApproval(chatId, plan = null) {
+  if (!chatId) return;
+  // Free Stop → Send for a manual confirmation; never auto-send a queued message.
+  forceComposerIdle(chatId, { skipDrain: true });
+  // Drop queued "运行/生成…" texts — draining them after confirm would clear_plan.
+  clearPendingSends(chatId);
+  if (plan?.steps?.length && chatId === activeChatId) {
+    rememberLivePlan(plan);
+    renderTodosBoard(getActivePlanSnapshot());
+  }
+}
+
+function clearPendingSends(chatId) {
+  if (!chatId) return;
+  const q = pendingSends.get(chatId);
+  if (!q?.length) {
+    pendingSends.delete(chatId);
+    return;
+  }
+  q.forEach((item) => removeQueuedSendNotice(item));
+  pendingSends.delete(chatId);
+  updateQueuedSendNotices(chatId);
+}
+
+function releaseComposerAfterStream(chatId, options = {}) {
+  // A terminal server event is authoritative for THIS stream. Clear local
+  // markers, then immediately re-probe — auto-chained plan steps often start
+  // the next turn right away, and without re-attach the UI freezes until the
+  // user focuses the composer or refreshes.
+  if (options.keepStream) {
+    // Soft-release Stop after `done` but keep the SSE/live generation alive so
+    // trailing events (`run_report_ready`) are not dropped by generation guards.
+    clearProgressTrackingRetry(chatId);
+    stopBackgroundRunWatch(chatId);
+    const stream = chatStreams.get(chatId);
+    if (stream) {
+      stream.composerReleased = true;
+      // Drop idle/status polls now — they must not outlive soft-release or a
+      // superseding turn (finally may early-return before clearing them).
+      clearStreamTimers(stream);
+    }
+    const follow = liveFollows.get(chatId);
+    if (follow) follow.composerReleased = true;
+    if (chatId === activeChatId) {
+      setComposerMode("send");
+      renderRecentChats();
+    }
+    return;
+  }
+  // Always drop live-follow too: a dangling follow keeps isActiveChatSending()
+  // true even after hasActiveRun becomes false (composer stuck on Stop).
+  forceComposerIdle(chatId, { skipDrain: Boolean(options.skipDrain) });
+  void ensureProgressTracking(chatId);
 }
 
 function isStreamGenerationLive(chatId, generation) {
@@ -4468,7 +4950,6 @@ function isStreamGenerationLive(chatId, generation) {
 }
 
 async function handleStop() {
-  if (!isActiveChatSending()) return;
   const stream = chatStreams.get(activeChatId);
   const follow = liveFollows.get(activeChatId);
   const runId = stream?.runId || follow?.runId || "";
@@ -4477,21 +4958,21 @@ async function handleStop() {
     stream.generation = -1;
     stream.abortController?.abort();
   }
-  if (follow) {
-    // 先取消后端任务，再断开旁观流
-  }
   // 立即清除队列，避免取消请求等待期间任务恰好结束而自动发送一条追加消息。
   clearPendingSends(activeChatId);
+  clearProgressTrackingRetry(activeChatId);
   markRunningExecutionsStopped();
   stopBackgroundRunWatch(activeChatId);
-  if (window.cancelAgentRun) {
-    await window.cancelAgentRun(runId || null, activeChatId);
+  if (activeChatId) userStoppedChats.add(activeChatId);
+  // 用户显式停止：强制 interrupt 内核（即使 runId 已丢失 / 流已断）
+  if (window.cancelAgentRun && activeChatId) {
+    await window.cancelAgentRun(runId || null, activeChatId, { force: true });
   }
   detachLiveEventStream(activeChatId);
-  if (stream?.isFollower) {
-    chatStreams.delete(activeChatId);
-  }
+  // 清掉 chatStreams，否则 isActiveChatSending() 仍为 true，停止按钮会一直卡住
+  finishChatStream(activeChatId, { keepBackgroundWatch: true });
   syncComposerForActiveChat();
+  resetComposerControls();
 }
 
 function updateMessageGroup(group, text) {
@@ -4517,8 +4998,11 @@ function resetComposer() {
   composer.style.height = "auto";
 }
 
-function queuedSendNoticeText(position, total) {
-  return `⏳ 当前任务运行中，消息已加入队列（第 ${position} 条，共 ${total} 条）。当前任务结束后自动发送。`;
+function queuedSendNoticeText(item, position, total) {
+  const preview = String(item?.text || "").trim().replace(/\s+/g, " ");
+  const short = preview.length > 80 ? `${preview.slice(0, 80)}…` : preview;
+  const body = short ? `「${short}」` : "一条消息";
+  return `⏳ 任务运行中，${body} 已加入队列（第 ${position}/${total} 条），结束后自动发送。`;
 }
 
 function removeQueuedSendNotice(item) {
@@ -4530,7 +5014,7 @@ function updateQueuedSendNotices(chatId) {
   const queue = pendingSends.get(chatId) || [];
   queue.forEach((item, index) => {
     const label = item.notice?.querySelector(".queued-send-notice__text");
-    if (label) label.textContent = queuedSendNoticeText(index + 1, queue.length);
+    if (label) label.textContent = queuedSendNoticeText(item, index + 1, queue.length);
   });
   if (chatId === activeChatId) scrollThreadToBottom();
 }
@@ -4548,6 +5032,7 @@ function appendQueuedSendNotice(chatId, item) {
   row.className = "queued-send-notice";
   const label = document.createElement("span");
   label.className = "queued-send-notice__text";
+  label.textContent = queuedSendNoticeText(item, 1, 1);
   row.appendChild(label);
 
   const cancel = document.createElement("button");
@@ -4561,6 +5046,7 @@ function appendQueuedSendNotice(chatId, item) {
 
   textEl.replaceChildren(row);
   item.notice = group;
+  updateQueuedSendNotices(chatId);
 }
 
 function renderQueuedSendNotices(chatId) {
@@ -4581,15 +5067,11 @@ function withdrawPendingSend(chatId, itemId) {
   else updateQueuedSendNotices(chatId);
 }
 
-function clearPendingSends(chatId) {
-  const queue = pendingSends.get(chatId) || [];
-  queue.forEach(removeQueuedSendNotice);
-  pendingSends.delete(chatId);
-}
-
 async function handleSend() {
   if (!composer) return;
-  if (isActiveChatSending()) {
+  // Drop stale stop-mode / IME locks when the backend is already idle.
+  const busy = await reconcileComposerIdleState();
+  if (busy) {
     // 主任务运行中：不打断，把消息加入队列，当前任务结束后自动发送
     const queued = composer.value.trim();
     if (!queued) return;
@@ -4641,15 +5123,23 @@ async function handleSend() {
   let streamComposerReleased = false;
   let reply = "";
 
+  let ownedIdleTimer = null;
+  let ownedStatusPollTimer = null;
+
   const touchStreamActivity = () => {
     const stream = chatStreams.get(streamChatId);
-    if (stream) stream.lastStreamEventAt = Date.now();
+    if (stream && stream.generation === streamGeneration) {
+      stream.lastStreamEventAt = Date.now();
+    }
   };
 
   const clearStreamIdleTimer = () => {
+    if (ownedIdleTimer != null) {
+      window.clearInterval(ownedIdleTimer);
+      ownedIdleTimer = null;
+    }
     const stream = chatStreams.get(streamChatId);
-    if (stream?.idleTimer) {
-      window.clearInterval(stream.idleTimer);
+    if (stream && stream.generation === streamGeneration) {
       stream.idleTimer = null;
     }
   };
@@ -4657,11 +5147,12 @@ async function handleSend() {
   const startStreamIdleTimer = () => {
     clearStreamIdleTimer();
     const stream = chatStreams.get(streamChatId);
-    if (!stream) return;
-    stream.idleTimer = window.setInterval(() => {
+    if (!stream || stream.generation !== streamGeneration) return;
+    ownedIdleTimer = window.setInterval(() => {
       void (async () => {
         const current = chatStreams.get(streamChatId);
-        if (!current || Date.now() - current.lastStreamEventAt < STREAM_IDLE_MS) return;
+        if (!current || current.generation !== streamGeneration) return;
+        if (Date.now() - current.lastStreamEventAt < STREAM_IDLE_MS) return;
         const status = await fetchRunStatus(streamChatId);
         if (isTaskLikelyActive(status, streamChatId)) {
           current.lastStreamEventAt = Date.now();
@@ -4671,12 +5162,16 @@ async function handleSend() {
         window.cancelAgentRun?.(current.runId, streamChatId);
       })();
     }, 5000);
+    stream.idleTimer = ownedIdleTimer;
   };
 
   const clearStreamStatusPoll = () => {
+    if (ownedStatusPollTimer != null) {
+      window.clearInterval(ownedStatusPollTimer);
+      ownedStatusPollTimer = null;
+    }
     const stream = chatStreams.get(streamChatId);
-    if (stream?.statusPollTimer) {
-      window.clearInterval(stream.statusPollTimer);
+    if (stream && stream.generation === streamGeneration) {
       stream.statusPollTimer = null;
     }
   };
@@ -4684,8 +5179,8 @@ async function handleSend() {
   const startStreamStatusPoll = () => {
     clearStreamStatusPoll();
     const stream = chatStreams.get(streamChatId);
-    if (!stream) return;
-    stream.statusPollTimer = window.setInterval(() => {
+    if (!stream || stream.generation !== streamGeneration) return;
+    ownedStatusPollTimer = window.setInterval(() => {
       if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
       void (async () => {
         const status = await fetchRunStatus(streamChatId);
@@ -4721,6 +5216,7 @@ async function handleSend() {
         });
       })();
     }, STREAM_STATUS_POLL_MS);
+    stream.statusPollTimer = ownedStatusPollTimer;
   };
 
   try {
@@ -4739,6 +5235,7 @@ async function handleSend() {
 
     pending = appendMessage("assistant", "思考中…", { loading: true });
 
+    userStoppedChats.delete(streamChatId);
     streamGeneration = ++nextStreamGeneration;
     runId = createId();
     abortController = new AbortController();
@@ -4838,14 +5335,16 @@ async function handleSend() {
         }
         if (event.type === "final" && event.content) {
           answered = true;
-          if (!historyRecorded) {
-            if (assistantEntry) {
-              freezeAssistantFinalText(
-                assistantEntry,
+          // Mid-plan step finals must not freeze the bubble or release Stop —
+          // only the run-level `done` / approval gate owns those.
+          if (assistantEntry && !assistantEntry._finalReplyLocked) {
+            assistantEntry.content = stripExecutionMemoryBlock(event.content);
+            if (isVisible) {
+              updateMessageGroup(
+                resolvePendingGroup(pending),
                 stripExecutionMemoryBlock(event.content),
               );
             }
-            historyRecorded = true;
             persistChatMessages(streamChatId, streamMessages);
           }
         }
@@ -4866,13 +5365,13 @@ async function handleSend() {
             persistChatMessages(streamChatId, streamMessages);
           }
         }
-        if (event.type === "final" || event.type === "done") {
+        if (event.type === "done") {
           // The reply is complete even if the SSE transport has not closed
-          // yet. Release the stop button immediately; the generation guard in
-          // `finally` prevents this retiring stream from touching a new turn.
+          // yet. Release the stop button immediately; keep the generation so
+          // trailing `run_report_ready` still passes isStreamGenerationLive.
           if (!streamComposerReleased) {
             streamComposerReleased = true;
-            releaseComposerAfterStream(streamChatId);
+            releaseComposerAfterStream(streamChatId, { keepStream: true });
           }
           // Drop synthetic CODE "Agent 运行中" as soon as the reply lands —
           // do not wait for SSE close / cleanup_run (can lag several seconds).
@@ -4993,12 +5492,14 @@ async function handleSend() {
     if (assistantEntry) assistantEntry.content = message;
     persistChatMessages(streamChatId, streamMessages);
   } finally {
+    // Always clear THIS generation's timers — even when superseded — so a new
+    // turn cannot inherit leaked intervals from a soft-released predecessor.
+    clearStreamIdleTimer();
+    clearStreamStatusPoll();
     // A terminal event may already have released this composer, and the user
     // may have started the next turn. Never let a retiring stream clear that
     // newer turn's state.
     if (!isStreamGenerationLive(streamChatId, streamGeneration)) return;
-    clearStreamIdleTimer();
-    clearStreamStatusPoll();
     // Clear synthetic background CODE card BEFORE run-status stale detection,
     // otherwise a leftover "Agent 运行中" card looks like an interrupted task
     // and overwrites the real assistant reply (e.g. completed plan result).
@@ -5049,7 +5550,10 @@ async function handleSend() {
         persist: false,
       });
       startBackgroundRunWatch(streamChatId, { pending, assistantEntry });
+      // Finish soft-released direct stream FIRST so attachLiveEventStream is
+      // not blocked by chatStreams.has(chatId).
       finishChatStream(streamChatId, { keepBackgroundWatch: true });
+      void attachLiveEventStream(streamChatId, status);
       return;
     }
 
@@ -5065,6 +5569,8 @@ async function handleSend() {
       persistChatMessages(streamChatId, streamMessages);
     }
     finishChatStream(streamChatId);
+    // Cover the brief idle gap before an auto-chained next plan step starts.
+    void ensureProgressTracking(streamChatId, { pending, assistantEntry });
     // 主任务结束后，自动发送排队中的消息（不打断语义）
     void drainPendingSends(streamChatId);
   }
@@ -5075,6 +5581,43 @@ async function drainPendingSends(chatId) {
   if (!chatId || chatId !== activeChatId) return;
   const q = pendingSends.get(chatId);
   if (!q || q.length === 0) return;
+  // Never drain while the server is still working or the plan is mid-flight —
+  // intermediate step `final` used to open a false-idle window that cancelled
+  // the live plan by starting a new chat stream.
+  if (isActiveChatSending()) {
+    return;
+  }
+  // Local plan snapshot is authoritative when status fetch flakes.
+  if (planAwaitingApproval({ plan: getActivePlanSnapshot() })) {
+    return;
+  }
+  const status = await fetchRunStatus(chatId);
+  // Fail closed: unknown status must not auto-send a queued "运行/生成…".
+  if (!status?.ok) {
+    return;
+  }
+  const awaitingApproval = Boolean(
+    status?.awaitingApproval || planAwaitingApproval(status),
+  );
+  // Approval gates require an explicit user reply in the composer. Auto-draining
+  // a previously queued "运行/生成…" message can clear_plan and destroy the gate.
+  if (awaitingApproval) {
+    return;
+  }
+  const serverBusy = Boolean(
+    status.hasActiveRun
+    || status.kernelBusy
+    || status.liveAvailable
+    || status.codeActive
+    || (planHasActiveSteps(status) && !isPlanSettled(status)),
+  );
+  if (serverBusy) {
+    // Keep the queue; ensureProgressTracking / later idle will retry.
+    if (!backgroundWatches.has(chatId) && (status.hasActiveRun || status.kernelBusy)) {
+      void ensureProgressTracking(chatId, { status });
+    }
+    return;
+  }
   const next = q.shift();
   if (q.length === 0) pendingSends.delete(chatId);
   if (!next) return;
@@ -5097,8 +5640,9 @@ async function drainPendingSends(chatId) {
  */
 function schedulePendingSendDrain(chatId) {
   if (!chatId || chatId !== activeChatId || !(pendingSends.get(chatId)?.length)) return;
+  if (planAwaitingApproval({ plan: getActivePlanSnapshot() })) return;
   window.setTimeout(() => {
-    if (!isActiveChatSending()) void drainPendingSends(chatId);
+    void drainPendingSends(chatId);
   }, 0);
 }
 
@@ -5386,10 +5930,24 @@ composer?.addEventListener("compositionstart", () => {
 
 composer?.addEventListener("compositionend", () => {
   isComposing = false;
+  // compositionend can land after the confirming Enter keydown; clear promptly.
+  window.setTimeout(() => {
+    clearImeEnterGuard();
+  }, 0);
+});
+
+composer?.addEventListener("blur", () => {
+  clearImeEnterGuard();
+});
+
+composer?.addEventListener("focus", () => {
+  clearImeEnterGuard();
+  // Recover a stuck stop button when the backend is already idle.
+  void reconcileComposerIdleState();
 });
 
 composer?.addEventListener("input", () => {
-  imeEnterStroke = false;
+  clearImeEnterGuard();
   composer.style.height = "auto";
   composer.style.height = `${composer.scrollHeight}px`;
 });
@@ -5397,30 +5955,34 @@ composer?.addEventListener("input", () => {
 composer?.addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || event.shiftKey) return;
 
-  // 仅看当前按键的 IME 状态，不用模块级 isComposing（避免残留导致无法发送）
+  // Confirming an IME candidate must not send; only block this physical stroke.
   if (event.isComposing || event.keyCode === 229) {
     imeEnterStroke = true;
+    imeEnterStrokeAt = Date.now();
     return;
   }
 
-  // 同一次物理 Enter：先确认 IME，再弹起的 keydown 不发送
-  if (imeEnterStroke) {
+  if (isImeEnterGuardActive()) {
     return;
   }
 
+  // Enter always sends/queues. Stopping is only via the stop button.
   event.preventDefault();
+  clearImeEnterGuard();
   void handleSend();
 });
 
 composer?.addEventListener("keyup", (event) => {
   if (event.key === "Enter") {
-    imeEnterStroke = false;
+    clearImeEnterGuard();
   }
 });
 
 composerForm?.addEventListener("submit", (event) => {
   event.preventDefault();
-  if (event.isComposing || imeEnterStroke) return;
+  if (event.isComposing || isImeEnterGuardActive()) return;
+  // Form submit = send/queue, never stop.
+  clearImeEnterGuard();
   void handleSend();
 });
 
@@ -5441,7 +6003,19 @@ document.querySelector(".agent-chat__composer-footer")?.addEventListener("change
 
 sendBtn?.addEventListener("click", (event) => {
   event.preventDefault();
-  handleSend();
+  void (async () => {
+    const hasDraft = Boolean(composer?.value?.trim());
+    // Stop button with empty composer = stop. If there is draft text, prefer
+    // send/queue so users are not surprised when the icon is in stop mode.
+    if (sendBtn.dataset.mode === "stop" && !hasDraft) {
+      const busy = await reconcileComposerIdleState();
+      if (busy) {
+        await handleStop();
+        return;
+      }
+    }
+    await handleSend();
+  })();
 });
 
 bindUploadCard("drop-zone-analysis", "file-input-analysis", "Analysis Mode");
@@ -5642,6 +6216,7 @@ window.addEventListener("proxy-server-probed", () => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
+    void reconcileComposerIdleState();
     void refreshChatStoreFromServerIfIdle();
   }
 });

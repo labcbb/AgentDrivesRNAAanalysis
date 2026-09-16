@@ -20,6 +20,8 @@ from session_store import _read_json, _write_json, ensure_session_dir, sanitize_
 
 _PLAN_FILE = "plan.json"
 _LOCK = threading.RLock()
+# Bumped on clear_plan so a cancelled/superseded worker cannot rewrite plan.json.
+_PLAN_EPOCHS: Dict[str, int] = {}
 
 
 def _plan_path(chat_id: str) -> Path:
@@ -29,6 +31,14 @@ def _plan_path(chat_id: str) -> Path:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def get_plan_epoch(chat_id: str) -> int:
+    if not chat_id:
+        return 0
+    chat_id = sanitize_chat_id(chat_id)
+    with _LOCK:
+        return int(_PLAN_EPOCHS.get(chat_id, 0))
 
 
 def empty_plan(goal: str = "") -> Dict[str, Any]:
@@ -50,9 +60,19 @@ def load_plan(chat_id: str) -> Optional[Dict[str, Any]]:
     return payload
 
 
-def save_plan(chat_id: str, plan: Dict[str, Any]) -> None:
+def save_plan(
+    chat_id: str,
+    plan: Dict[str, Any],
+    *,
+    expected_epoch: Optional[int] = None,
+) -> bool:
+    """Persist plan.json.
+
+    When ``expected_epoch`` is set, the write is dropped if ``clear_plan`` has
+    bumped the chat's epoch since this run started (supersede / new workflow).
+    """
     if not chat_id:
-        return
+        return False
     chat_id = sanitize_chat_id(chat_id)
     body = dict(plan)
     body["chatId"] = chat_id
@@ -60,15 +80,22 @@ def save_plan(chat_id: str, plan: Dict[str, Any]) -> None:
     if not body.get("createdAt"):
         body["createdAt"] = body["updatedAt"]
     with _LOCK:
+        current = int(_PLAN_EPOCHS.get(chat_id, 0))
+        if expected_epoch is not None and int(expected_epoch) != current:
+            return False
         _write_json(_plan_path(chat_id), body)
+        return True
 
 
 def clear_plan(chat_id: str) -> None:
     if not chat_id:
         return
+    chat_id = sanitize_chat_id(chat_id)
     path = _plan_path(chat_id)
-    if path.exists():
-        path.unlink(missing_ok=True)
+    with _LOCK:
+        _PLAN_EPOCHS[chat_id] = int(_PLAN_EPOCHS.get(chat_id, 0)) + 1
+        if path.exists():
+            path.unlink(missing_ok=True)
 
 
 def normalize_plan(raw: Dict[str, Any], *, goal: str = "") -> Dict[str, Any]:

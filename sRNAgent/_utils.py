@@ -171,6 +171,7 @@ def run_cli_cmd(
         cwd=cwd,
         env=env,
         bufsize=1,
+        start_new_session=True,
     )
     assert proc.stdout is not None
     # This import is intentionally local: CLI helpers are also used outside

@@ -201,12 +201,14 @@ def forward_agent_cancel(body: dict[str, Any]) -> dict[str, Any]:
         chat_id = str(body.get("chatId") or "").strip()
         if not run_id and not chat_id:
             return {"ok": False, "error": "runId 或 chatId 不能为空"}
-        # Explicit stop (runId present) may interrupt a busy kernel; chat-only cancel stops LLM only.
+        # Explicit UI stop sends force=true (or runId) → interrupt kernel even if busy-flag is stale.
+        # Chat-only cancel without force keeps old behavior: stop LLM; interrupt only when kernel busy.
+        force = bool(body.get("force")) or bool(run_id)
         cancelled = cancel_run(
             run_id,
             chat_id,
-            interrupt_kernel=bool(run_id) or None,
-            force_interrupt=bool(run_id),
+            interrupt_kernel=True if force else None,
+            force_interrupt=force,
         )
         return {"ok": True, "cancelled": cancelled}
     except Exception as exc:  # noqa: BLE001
@@ -224,7 +226,13 @@ def forward_agent_approve(body: dict[str, Any]) -> dict[str, Any]:
         approved = bool(body.get("approved"))
         ok = approve_code(run_id, request_id, approved)
         if not ok:
-            return {"ok": False, "error": "用户拒绝了代码执行"}
+            # approve_code returns False only when the gate is gone / mismatched —
+            # successful deny returns True with approved=False.
+            return {
+                "ok": False,
+                "error": "审批请求已失效、已超时或与当前状态不一致",
+                "expired": True,
+            }
         return {"ok": True, "approved": approved}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"sRNAgent approve error: {exc}"}

@@ -1155,7 +1155,7 @@ class SRNAgent:
         self,
         llm_config: Optional[LLMConfig] = None,
         cwd: Optional[Path] = None,
-        max_turns: int = 100,
+        max_turns: int = 200,
         extra_system_prompt: str = "",
         execution_config: Optional[ExecutionConfig] = None,
         execution_backend: Optional[ExecutionBackend] = None,

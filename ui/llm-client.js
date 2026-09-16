@@ -259,13 +259,17 @@
     return { text: "", meta: {}, incomplete: true };
   }
 
-  async function cancelAgentRun(runId, chatId) {
+  async function cancelAgentRun(runId, chatId, options = {}) {
     if (!runId && !chatId) return;
     try {
       await fetch(`${PROXY_BASE}/api/agent/cancel`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ runId, chatId }),
+        body: JSON.stringify({
+          runId,
+          chatId,
+          force: Boolean(options.force),
+        }),
       });
     } catch {
       // best-effort cancel
@@ -554,7 +558,9 @@
       buffer = parsed.rest;
       for (const event of parsed.events) {
         onEvent?.(event);
-        if (event.type === "stream_end" || event.type === "done" || event.type === "cancelled" || event.type === "error") {
+        // Keep reading after `done` — the worker still emits `run_report_ready`
+        // before closing the live bus with stream_end.
+        if (event.type === "stream_end" || event.type === "cancelled" || event.type === "error") {
           return;
         }
       }

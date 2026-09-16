@@ -9,8 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from session_memory import append_work_log, build_session_memory_context, build_workspace_manifest, load_session_memory, record_stream_event, remember_user_query, save_session_memory  # noqa: E402
-from session_plan import save_plan  # noqa: E402
-from session_plan import normalize_plan, plan_progress_summary  # noqa: E402
+from session_plan import clear_plan, get_plan_epoch, load_plan, normalize_plan, plan_progress_summary, save_plan  # noqa: E402
 from session_store import ensure_session_dir, is_orphan_session, load_chat_record, save_chat_record  # noqa: E402
 from work_space import configure_work_space  # noqa: E402
 
@@ -526,6 +525,36 @@ def test_workspace_manifest_has_a_file_scan_budget():
         manifest = build_workspace_manifest(max_files=10, max_scan_files=3)
 
         assert "工作区清单扫描在 3 个文件处停止" in manifest
+
+
+def test_clear_plan_bumps_epoch_and_blocks_stale_saves():
+    with tempfile.TemporaryDirectory() as tmp:
+        configure_work_space(tmp)
+        epoch0 = get_plan_epoch(CHAT_ID)
+        assert save_plan(CHAT_ID, {"goal": "g", "steps": [{"id": "1", "title": "t", "status": "pending"}]})
+        assert load_plan(CHAT_ID) is not None
+
+        clear_plan(CHAT_ID)
+        epoch1 = get_plan_epoch(CHAT_ID)
+        assert epoch1 == epoch0 + 1
+        assert load_plan(CHAT_ID) is None
+
+        # Stale writer from the pre-clear run must not resurrect the plan.
+        assert save_plan(
+            CHAT_ID,
+            {"goal": "stale", "steps": [{"id": "1", "title": "t", "status": "running"}]},
+            expected_epoch=epoch0,
+        ) is False
+        assert load_plan(CHAT_ID) is None
+
+        assert save_plan(
+            CHAT_ID,
+            {"goal": "fresh", "steps": [{"id": "1", "title": "t", "status": "pending"}]},
+            expected_epoch=epoch1,
+        )
+        plan = load_plan(CHAT_ID)
+        assert plan is not None
+        assert plan["goal"] == "fresh"
 
 
 if __name__ == "__main__":

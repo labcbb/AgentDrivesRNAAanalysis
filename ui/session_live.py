@@ -12,7 +12,9 @@ from session_store import sanitize_chat_id
 _MAX_BUFFER = 500
 _SUBSCRIBER_QUEUE_SIZE = 512
 _HEARTBEAT_SEC = 3.0
-_TERMINAL_TYPES = frozenset({"done", "cancelled", "error", "stream_end"})
+_TERMINAL_TYPES = frozenset({"cancelled", "error", "stream_end"})
+# `done` is terminal for the agent answer, but the worker still emits
+# `run_report_ready` afterward — keep the bus open until explicit close.
 _PROGRESS_TYPES = frozenset({"code_execution_progress"})
 
 _LOCK = threading.RLock()
@@ -144,6 +146,10 @@ def publish_live_event(chat_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         bus = _BUSES.get(chat_id)
     if bus is None or bus.closed:
         return dict(event)
+    # Drop stale publishes from a cancelled worker after a newer run replaced the bus.
+    event_run_id = str(event.get("runId") or "").strip()
+    if event_run_id and event_run_id != bus.run_id:
+        return dict(event)
     payload = bus.publish(event)
     if str(payload.get("type") or "") in _TERMINAL_TYPES:
         close_live_bus(chat_id, run_id=bus.run_id, final_event=None)
@@ -236,7 +242,7 @@ def iter_live_events(chat_id: str, after_seq: int = 0) -> Iterator[Dict[str, Any
                     "type": "heartbeat",
                     "chatId": chat_id,
                     "runId": bus.run_id,
-                    "hasActiveRun": True,
+                    "hasActiveRun": not bus.closed,
                     "message": "实时同步中…",
                 }
                 continue

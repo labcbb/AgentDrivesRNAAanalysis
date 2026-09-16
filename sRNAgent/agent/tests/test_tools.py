@@ -156,6 +156,43 @@ def test_fastq_dl_metadata_only_keeps_existing_fastq_paths(tmp_path: Path, monke
     assert "SRR000001" in result.uns["fastq_dl_runs"]
 
 
+def test_fastq_dl_discovers_flat_srr_files_for_study_accession(tmp_path):
+    module = importlib.import_module("sRNAgent.Tools.fastq.fastq_dl")
+    out_dir = tmp_path / "SRP181693"
+    out_dir.mkdir()
+    (out_dir / "SRR8479188.fastq.gz").write_bytes(b"x")
+    (out_dir / "SRR8479189.fastq.gz").write_bytes(b"x")
+
+    found = module._discover_all_fastqs(out_dir, ["SRP181693"])
+    assert set(found) == {"SRR8479188", "SRR8479189"}
+    assert Path(found["SRR8479188"]["fq1"]).exists()
+
+    ws = tmp_path / "workspace"
+    dest = ws / "data" / "raw" / "fastq" / "SRP181693"
+    dest.mkdir(parents=True)
+    (dest / "SRR8479188.fastq.gz").write_bytes(b"x")
+    workspace_hits = module.workspace_fastq_runs(ws, "SRP181693")
+    assert "SRR8479188" in workspace_hits
+
+
+def test_fastq_dl_skips_study_accession_when_srr_files_exist(tmp_path, monkeypatch):
+    module = importlib.import_module("sRNAgent.Tools.fastq.fastq_dl")
+    out_dir = tmp_path / "SRP181693"
+    out_dir.mkdir()
+    (out_dir / "SRR8479188.fastq.gz").write_bytes(b"x")
+    called = []
+
+    def fake_run_cli(cmd, **_kwargs):
+        called.append(cmd)
+
+    monkeypatch.setattr(module, "run_cli_cmd", fake_run_cli)
+    adata = ad.AnnData(obs=pd.DataFrame(index=["S1"]))
+    result = module.fastq_dl(adata, accessions="SRP181693", output_dir=str(out_dir), overwrite=False)
+
+    assert called == []
+    assert result.obs.loc["S1", "fastq_path"].endswith("SRR8479188.fastq.gz")
+
+
 class _DummyAgent:
     def __init__(self):
         self.rewrite_calls = 0

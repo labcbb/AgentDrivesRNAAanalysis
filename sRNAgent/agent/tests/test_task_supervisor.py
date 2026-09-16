@@ -33,3 +33,19 @@ def test_empty_supervisor_does_not_override_real_stdout_progress(tmp_path: Path)
 
     assert snapshot["hasEvidence"] is False
     assert snapshot["stage"] == "任务正在运行，等待首个可追踪产物"
+
+
+def test_stale_workspace_files_are_not_reported_as_running_artifacts(tmp_path: Path):
+    out = tmp_path / "data" / "raw" / "fastq"
+    out.mkdir(parents=True)
+    for index in range(20):
+        (out / f"junk_{index}.txt").write_text("x", encoding="utf-8")
+
+    supervisor = TaskProgressSupervisor(
+        workspace=tmp_path,
+        code='output_dir = Path("data/raw/fastq")',
+    )
+    snapshot = supervisor.snapshot()
+
+    assert snapshot["hasEvidence"] is False
+    assert "个产物" not in snapshot["stage"]

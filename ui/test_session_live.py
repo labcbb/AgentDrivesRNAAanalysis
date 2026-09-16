@@ -24,3 +24,20 @@ def test_published_live_events_return_the_replay_sequence():
         assert second["runId"] == "run-1"
     finally:
         close_live_bus(CHAT_ID, run_id="run-1")
+
+
+def test_done_keeps_bus_open_for_run_report_ready():
+    from session_live import has_live_bus
+
+    start_live_bus(CHAT_ID, "run-2")
+    try:
+        publish_live_event(CHAT_ID, {"type": "done", "text": "ok", "runId": "run-2"})
+        assert has_live_bus(CHAT_ID)
+        report = publish_live_event(
+            CHAT_ID,
+            {"type": "run_report_ready", "reportSummary": "report", "runId": "run-2"},
+        )
+        assert report.get("_seq")
+        assert has_live_bus(CHAT_ID)
+    finally:
+        close_live_bus(CHAT_ID, run_id="run-2")

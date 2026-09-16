@@ -11,7 +11,8 @@ from session_store import _read_json, _write_json, ensure_session_dir, sanitize_
 
 _ERRORS_FILE = "session_errors.json"
 _LOCK = threading.RLock()
-_MAX_EVENTS = 48
+_MAX_EVENTS = 80
+_MAX_CODE_ERROR_EVENTS = 24
 _CONTEXT_MAX = 1200
 # 与 bounded_tool_result 的 max_chars 对齐：错误 detail 保留完整 head+tail，
 # 使 traceback 尾部（真正的错误行）能落盘，不再只有 600 字符的头部
@@ -50,37 +51,65 @@ def _truncate_preserve_tail(text: str, limit: int, tail: int = 600) -> str:
     return f"{value[:head]}{marker}{value[-tail:]}"
 
 
-def load_session_errors(chat_id: str) -> Dict[str, Any]:
-    if not chat_id:
-        return {"events": [], "updatedAt": None}
-    payload = _read_json(_errors_path(chat_id))
-    if not payload:
-        return {"events": [], "updatedAt": None}
-    events = payload.get("events") if isinstance(payload.get("events"), list) else []
-    return {
-        "events": events,
-        "updatedAt": payload.get("updatedAt"),
-    }
+def _trim_session_error_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Cap total events and code_error noise (also applied on load for old files)."""
+    items = [item for item in (events or []) if isinstance(item, dict)]
+    code_errors = [item for item in items if str(item.get("kind") or "") == "code_error"]
+    other = [item for item in items if str(item.get("kind") or "") != "code_error"]
+    if len(code_errors) > _MAX_CODE_ERROR_EVENTS:
+        code_errors = code_errors[-_MAX_CODE_ERROR_EVENTS:]
+    merged = other + code_errors
+    merged.sort(key=lambda item: str(item.get("at") or ""))
+    return merged[-_MAX_EVENTS:]
 
 
 def save_session_errors(chat_id: str, payload: Dict[str, Any]) -> None:
     if not chat_id:
         return
     chat_id = sanitize_chat_id(chat_id)
+    events = payload.get("events") or []
+    if not isinstance(events, list):
+        events = []
     body = {
         "chatId": chat_id,
-        "events": payload.get("events") or [],
+        "events": _trim_session_error_events(events),
         "updatedAt": _utc_now(),
     }
     with _LOCK:
         _write_json(_errors_path(chat_id), body)
 
 
-def clear_run_context(chat_id: str) -> None:
+def load_session_errors(chat_id: str) -> Dict[str, Any]:
+    if not chat_id:
+        return {"events": [], "updatedAt": None}
+    payload = _read_json(_errors_path(chat_id))
+    if not payload:
+        return {"events": [], "updatedAt": None}
+    raw_events = payload.get("events") if isinstance(payload.get("events"), list) else []
+    events = _trim_session_error_events(raw_events)
+    # Rewrite trimmed payload so old oversized files shrink on disk.
+    if len(events) < len(raw_events):
+        try:
+            save_session_errors(chat_id, {"events": events})
+        except Exception:
+            pass
+    return {
+        "events": events,
+        "updatedAt": payload.get("updatedAt"),
+    }
+
+
+def clear_run_context(chat_id: str, *, run_id: str = "") -> None:
     if not chat_id:
         return
+    chat_id = sanitize_chat_id(chat_id)
     with _LOCK:
-        _run_context.pop(sanitize_chat_id(chat_id), None)
+        if run_id:
+            current = _run_context.get(chat_id) or {}
+            if str(current.get("runId") or "") and str(current.get("runId") or "") != str(run_id):
+                # A newer run already owns this chat's context — leave it alone.
+                return
+        _run_context.pop(chat_id, None)
 
 
 def update_run_context(chat_id: str, event: Dict[str, Any]) -> None:
@@ -211,7 +240,8 @@ def record_session_error(
         if _is_duplicate(events, event["kind"], event["summary"]):
             return
         events.append(event)
-        store["events"] = events[-_MAX_EVENTS:]
+        # Prefer keeping plan/SSE/cancel signals over flooding code_error noise.
+        store["events"] = _trim_session_error_events(events)
         save_session_errors(chat_id, store)
 
 
@@ -296,7 +326,7 @@ def record_sse_disconnect(chat_id: str, *, run_id: str = "") -> None:
     record_session_error(
         chat_id,
         kind="sse_disconnect",
-        summary="前端流式连接断开，Agent LLM 循环已停止（内核中的代码可能仍在运行）",
+        summary="前端流式连接断开（后台 Agent 任务默认继续运行，不会因此取消）",
         run_id=run_id,
         source="serve_sse",
     )

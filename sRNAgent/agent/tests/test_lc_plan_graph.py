@@ -46,6 +46,12 @@ class FakeOrchestrator:
     def _execute_step(self, step, **kwargs):
         return f"done:{step.get('id')}"
 
+    def _execute_step_resilient(self, step, **kwargs):
+        return self._execute_step(step, **kwargs)
+
+    def _load_checkpoint(self):
+        return None
+
     def _replan(self, plan, **kwargs):
         return plan
 
