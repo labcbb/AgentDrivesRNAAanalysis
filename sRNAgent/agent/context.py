@@ -115,6 +115,88 @@ def bounded_tool_result(result: str, max_chars: int = 8000) -> str:
     return truncate_text(result, max_chars)
 
 
+# ---------------------------------------------------------------------- #
+# Microcompaction (Claude Code pattern): LLM-summarise a single overly-long
+# tool result instead of just head+tail truncating it.  This keeps key data
+# (paths, numbers, error lines) that head+tail would drop, at the cost of
+# one extra lightweight LLM call per large result.
+# ---------------------------------------------------------------------- #
+_MICROCOMPACT_THRESHOLD = 4000
+_MICROCOMPACT_INPUT_CAP = 20000
+_MICROCOMPACT_SYSTEM = (
+    "You are sRNAgent's tool-output compactor. The user message is the raw "
+    "output of a tool. Compress it into a compact summary that preserves, "
+    "VERBATIM where possible: exact file paths, exact error/traceback lines, "
+    "key numbers, table headers, and the final result line. Drop repetitive "
+    "boilerplate and progress bars. Keep the same language. Output only the "
+    "compacted text, no preamble."
+)
+
+
+def _looks_like_error(result: str) -> bool:
+    """Heuristic: keep error/traceback output verbatim (head+tail), not summarised."""
+    head = result[:2000]
+    return bool(
+        "Traceback (most recent call last)" in result
+        or "Error:" in head
+        or "Exception:" in head
+    )
+
+
+def _llm_microcompact(llm: Any, result: str, tool_name: str) -> str:
+    """One-shot LLM summary of a single tool result. Returns "" on failure."""
+    try:
+        completion = llm.complete(
+            [
+                {"role": "system", "content": _MICROCOMPACT_SYSTEM},
+                {
+                    "role": "user",
+                    "content": f"[tool: {tool_name}]\n{result[:_MICROCOMPACT_INPUT_CAP]}",
+                },
+            ],
+            tools=None,
+            enable_thinking=False,
+        )
+        text = str(getattr(completion, "content", "") or "").strip()
+        return text if len(text) >= 20 else ""
+    except Exception:  # noqa: BLE001 — microcompaction is best-effort
+        return ""
+
+
+def microcompact_tool_result(
+    result: str,
+    *,
+    llm: Optional[Any] = None,
+    max_chars: int = 8000,
+    threshold: int = _MICROCOMPACT_THRESHOLD,
+    tool_name: str = "",
+) -> str:
+    """Summarise an overly-long tool result via LLM before the hard cap.
+
+    If the result exceeds ``threshold`` and an LLM is available, ask the LLM
+    for a compact summary (preserving paths/errors/numbers) and return it with
+    a marker noting the compression.  Error/traceback output is kept verbatim
+    via head+tail (``bounded_tool_result``) so exact exception lines survive.
+    Falls back to ``bounded_tool_result`` when the LLM is unavailable, the
+    summary is empty/longer than the original, or the result is small.
+    """
+    if not result:
+        return "(no output)"
+    # Small results: no work needed beyond the hard cap.
+    if len(result) <= threshold:
+        return bounded_tool_result(result, max_chars)
+    # Errors: keep verbatim head+tail — an LLM summary can drop the exact line.
+    if _looks_like_error(result):
+        return bounded_tool_result(result, max_chars)
+    if llm is None:
+        return bounded_tool_result(result, max_chars)
+    summary = _llm_microcompact(llm, result, tool_name)
+    if summary and len(summary) < len(result):
+        marker = f"\n…[工具输出已由 LLM 摘要压缩（原文 {len(result)} 字符）]"
+        return bounded_tool_result(f"{summary}{marker}", max_chars)
+    return bounded_tool_result(result, max_chars)
+
+
 def should_compact(messages: List[Dict[str, Any]], max_tokens: int) -> bool:
     return max_tokens > 0 and messages_tokens(messages) > max_tokens
 

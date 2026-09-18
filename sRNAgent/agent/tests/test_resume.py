@@ -61,7 +61,10 @@ def _make_agent(tmp: Path, chat_id: str, llm: _FakeLLM) -> SRNAgent:
     return agent
 
 
-def test_interrupted_run_writes_checkpoint_and_resumes():
+def test_interrupted_run_writes_checkpoint_and_resumes(monkeypatch):
+    # Microcompaction adds LLM calls on large tool results; this test counts
+    # calls precisely, so disable it here (it tests resume, not compaction).
+    monkeypatch.setenv("SRNAGENT_MICROCOMPACT", "0")
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         chat_id = "chat-resume"

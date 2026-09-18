@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from .context import bounded_tool_result, normalize_text_payload
+from .context import bounded_tool_result, microcompact_tool_result, normalize_text_payload
 from .hooks import get_default_registry
 from .mcp_client import get_default_manager
 from .tools import AGENT_TOOL_SCHEMAS
@@ -430,7 +430,17 @@ def run_lc_tool_loop(
             else:
                 result = agent.dispatch_tool(name, arguments)
 
-            result = bounded_tool_result(result, agent.max_tool_result_chars)
+            # Microcompaction (s15 pattern): LLM-summarise overly-long results
+            # instead of just head+tail truncating. Opt-out via env.
+            if os.environ.get("SRNAGENT_MICROCOMPACT", "1").lower() in ("0", "false", "no"):
+                result = bounded_tool_result(result, agent.max_tool_result_chars)
+            else:
+                result = microcompact_tool_result(
+                    result,
+                    llm=getattr(agent, "llm", None),
+                    max_chars=agent.max_tool_result_chars,
+                    tool_name=name,
+                )
 
             # PostToolUse hook (side-effects only: logging, output guards).
             hooks.trigger_post_tool_use(name, arguments, result, msgs)
