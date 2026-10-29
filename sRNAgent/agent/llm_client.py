@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 # Transient gateway / rate-limit / overload responses worth retrying.
 _TRANSIENT_HTTP_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
@@ -127,8 +128,47 @@ def _anthropic_headers(config: LLMConfig) -> Dict[str, str]:
     return _anthropic_header_variants(config)[0]
 
 
+def _safe_url(url: str) -> str:
+    """Endpoint without credentials or query string, safe to show in errors."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+# MiniMax serves OpenAI-compatible calls at /v1 and Anthropic-compatible calls
+# at /anthropic — the same host, two different path prefixes.
+_MINIMAX_HOSTS = frozenset({"api.minimaxi.com", "api.minimax.io"})
+_MINIMAX_PATH_SUFFIXES = (
+    "/v1/messages",
+    "/v1/chat/completions",
+    "/anthropic",
+    "/chat/completions",
+    "/messages",
+    "/v1",
+)
+
+
+def _minimax_base(base_url: str, protocol: str) -> str:
+    """Point a MiniMax base URL at the path prefix the given protocol needs."""
+    parts = urlsplit(base_url)
+    if (parts.hostname or "").lower() not in _MINIMAX_HOSTS:
+        return base_url
+    path = parts.path.rstrip("/")
+    while True:
+        for suffix in _MINIMAX_PATH_SUFFIXES:
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+                break
+        else:
+            break
+    prefix = "/anthropic" if protocol == "anthropic-messages" else "/v1"
+    return urlunsplit((parts.scheme, parts.netloc, f"{path}{prefix}", "", ""))
+
+
 def _anthropic_url(base_url: str) -> str:
-    base = base_url.rstrip("/")
+    base = _minimax_base(base_url.rstrip("/"), "anthropic-messages").rstrip("/")
     if base.endswith("/v1/messages"):
         return base
     if base.endswith("/v1"):
@@ -139,7 +179,7 @@ def _anthropic_url(base_url: str) -> str:
 
 
 def _openai_url(base_url: str) -> str:
-    base = base_url.rstrip("/")
+    base = _minimax_base(base_url.rstrip("/"), "openai-completions").rstrip("/")
     if base.endswith("/chat/completions"):
         return base
     if base.endswith("/v1"):
@@ -254,7 +294,9 @@ class ChatClient:
                         raise last_error from exc
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
-                last_error = RuntimeError(f"LLM HTTP {exc.code}: {detail}")
+                last_error = RuntimeError(
+                    f"LLM HTTP {exc.code}: {detail} [url={_safe_url(url)}]"
+                )
                 if self._transient_http(exc.code) and attempt < _LLM_MAX_RETRIES:
                     self._retry_sleep(attempt)
                     continue

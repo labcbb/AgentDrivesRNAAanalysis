@@ -14,7 +14,7 @@ import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlsplit, urlunsplit
 
 from work_space import configure_work_space, resolve_work_space_path, WorkSpacePathError
 from jupyterlab_manager import (
@@ -32,8 +32,41 @@ def normalize_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
+# MiniMax serves OpenAI-compatible calls at /v1 and Anthropic-compatible calls
+# at /anthropic — the same host, two different path prefixes. Keep in sync with
+# sRNAgent/agent/llm_client.py::_minimax_base.
+_MINIMAX_HOSTS = frozenset({"api.minimaxi.com", "api.minimax.io"})
+_MINIMAX_PATH_SUFFIXES = (
+    "/v1/messages",
+    "/v1/chat/completions",
+    "/anthropic",
+    "/chat/completions",
+    "/messages",
+    "/v1",
+)
+
+
+def _minimax_base(base_url: str, protocol: str) -> str:
+    """Point a MiniMax base URL at the path prefix the given protocol needs."""
+    parts = urlsplit(base_url)
+    if (parts.hostname or "").lower() not in _MINIMAX_HOSTS:
+        return base_url
+    path = parts.path.rstrip("/")
+    while True:
+        for suffix in _MINIMAX_PATH_SUFFIXES:
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+                break
+        else:
+            break
+    prefix = "/anthropic" if protocol == "anthropic-messages" else "/v1"
+    return urlunsplit((parts.scheme, parts.netloc, f"{path}{prefix}", "", ""))
+
+
 def build_anthropic_url(base_url: str) -> str:
-    base = normalize_base_url(base_url)
+    base = _minimax_base(normalize_base_url(base_url), "anthropic-messages").rstrip("/")
+    if base.endswith("/v1/messages"):
+        return base
     if base.endswith("/v1"):
         return f"{base}/messages"
     if base.endswith("/anthropic"):
@@ -42,7 +75,7 @@ def build_anthropic_url(base_url: str) -> str:
 
 
 def build_openai_url(base_url: str) -> str:
-    base = normalize_base_url(base_url)
+    base = _minimax_base(normalize_base_url(base_url), "openai-completions").rstrip("/")
     if base.endswith("/chat/completions"):
         return base
     if base.endswith("/v1"):
