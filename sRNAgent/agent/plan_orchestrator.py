@@ -11,7 +11,7 @@ import re
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from .plan_state import (
     PlanGraph,
@@ -106,7 +106,7 @@ _PAIRED_INFEASIBLE_RE = re.compile(
 )
 _MIRNA_RE = re.compile(r"\bmirna\b|miRNA|mirdeep", re.I)
 _PIRNA_RE = re.compile(r"\bpirna\b|piRNA", re.I)
-_TRNA_RE = re.compile(r"\btrna\b|tRNA|tRF|tRAX", re.I)
+_TRNA_RE = re.compile(r"\btrna\b|tRNA|tRF|tRR|tRAX", re.I)
 _ISOMIR_RE = re.compile(r"\biso[- ]?mir\b|isomiR|mirtop", re.I)
 _ISOMIR_PARALLEL_RE = re.compile(
     r"(?:iso[- ]?mir|isomiR|mirtop|样本).{0,32}(?:并行|并发|同时|parallel|concurrent)|"
@@ -144,6 +144,19 @@ _TARGET_PREDICTION_RE = re.compile(
     r"miranda|starbase|encori|(?:3['’′]?\s*)?utr|seed|靶标预测|靶基因|靶标",
     re.I,
 )
+
+# Skills whose planner step is rebuilt by `_expand_plan_prerequisites`.  Every
+# other step keeps its planner-authored ID, so only those IDs must be
+# protected from reallocation.
+_REBUILT_STEP_SKILLS = frozenset({
+    "alignment-srna",
+    "feature-count",
+    "samtools_idxstats",
+    "fragment-analysis",
+    "differential-analysis",
+    "mirdeep2-mirna",
+    "isomir-quantification",
+})
 _EXPLICIT_DE_REQUEST_RE = re.compile(
     r"(?:运行|执行|进行|完成|重跑|重新跑|run|perform|execute|rerun).{0,24}"
     r"(?:差异分析|differential(?:-analysis)?|limma|DE)"
@@ -334,6 +347,7 @@ def _make_plan_step(
     execution_contracts: Optional[List[Dict[str, Any]]] = None,
     inputs: Optional[List[str]] = None,
     outputs: Optional[List[str]] = None,
+    depends_on: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     step = {
         "id": str(step_id),
@@ -352,6 +366,8 @@ def _make_plan_step(
         step["inputs"] = [str(item) for item in inputs if str(item).strip()]
     if outputs:
         step["outputs"] = [str(item) for item in outputs if str(item).strip()]
+    if depends_on:
+        step["depends_on"] = [str(item) for item in depends_on if str(item).strip()]
     return step
 
 
@@ -1156,6 +1172,19 @@ def _is_de_input_validation_step(step: Dict[str, Any]) -> bool:
     ))
 
 
+def _is_report_step(step: Dict[str, Any]) -> bool:
+    """True when a step produces the HTML analysis report.
+
+    The user-facing regex also matches a bare "报告", so a QC step that
+    merely mentions a MultiQC 聚合报告 was classified as the report
+    deliverable and pushed behind the analyses that consume it.
+    """
+    if str(step.get("skill") or "").strip().lower() == "reporting":
+        return True
+    text = " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
+    return bool(re.search(r"html", text, re.I)) and bool(re.search(r"报告|report", text, re.I))
+
+
 def _order_de_workflow_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Enforce prerequisites -> quantification -> validation -> DE -> report."""
     # A target-candidate selector legitimately consumes differential results,
@@ -1174,6 +1203,14 @@ def _order_de_workflow_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]
     de_steps: List[Dict[str, Any]] = []
     summaries: List[Dict[str, Any]] = []
     reports: List[Dict[str, Any]] = []
+    buckets = (
+        prerequisites,
+        quantification,
+        validation,
+        de_steps,
+        summaries,
+        reports,
+    )
     for step in steps:
         text = " ".join(str(step.get(key) or "") for key in ("title", "goal", "skill"))
         if _is_de_input_validation_step(step):
@@ -1182,13 +1219,54 @@ def _order_de_workflow_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]
             quantification.append(step)
         elif _is_de_step(step):
             de_steps.append(step)
-        elif _HTML_REPORT_RE.search(text):
+        elif _is_report_step(step):
             reports.append(step)
         elif _DE_SUMMARY_RE.search(text):
             summaries.append(step)
         else:
             prerequisites.append(step)
-    return [*prerequisites, *quantification, *validation, *de_steps, *summaries, *reports]
+
+    # The phase buckets express a *preference*, never a licence to move a
+    # consumer ahead of its producer.  Sorting by phase alone put the adapter
+    # preflight after the gate it feeds and the QC step after the plots that
+    # consume it, so the graph could not be walked in list order.  Emit a
+    # stable topological order that still prefers the earlier phase whenever
+    # the dependency edges allow it.
+    rank: Dict[int, int] = {}
+    for phase, bucket in enumerate(buckets):
+        for step in bucket:
+            rank[id(step)] = phase
+
+    by_id = {
+        str(step.get("id") or "").strip(): step
+        for step in steps
+        if isinstance(step, dict) and str(step.get("id") or "").strip()
+    }
+    ordered: List[Dict[str, Any]] = []
+    resolved: set[str] = set()
+    remaining = list(steps)
+    while remaining:
+        ready = [
+            step for step in remaining
+            if all(
+                dependency not in by_id or dependency in resolved
+                for dependency in (
+                    str(item).strip()
+                    for item in (step.get("depends_on") or [])
+                    if str(item).strip()
+                )
+            )
+        ]
+        if not ready:
+            # A cycle cannot be satisfied by ordering alone; keep the
+            # remaining steps visible so the plan graph can report it.
+            ordered.extend(remaining)
+            break
+        chosen = min(ready, key=lambda step: (rank.get(id(step), 0), steps.index(step)))
+        remaining.remove(chosen)
+        resolved.add(str(chosen.get("id") or "").strip())
+        ordered.append(chosen)
+    return ordered
 
 
 def _normalise_requirement_text(text: str) -> str:
@@ -1310,9 +1388,22 @@ def _ensure_step(
     title: str,
     goal: str,
     skill: str,
+    reserved: Optional[Set[str]] = None,
 ) -> int:
-    if skill and any(str(item.get("skill") or "").strip().lower() == skill.lower() for item in expanded):
+    if skill:
+        if any(str(item.get("skill") or "").strip().lower() == skill.lower() for item in expanded):
+            return next_id
+    elif any(str(item.get("title") or "").strip() == title.strip() for item in expanded):
+        # A skill-less prerequisite (e.g. "核查现有 raw counts 矩阵") can only
+        # be recognised by its title.  Without this the planner's own check
+        # and the auto-inserted one both appear in the plan.
         return next_id
+    used = reserved if reserved is not None else set()
+    # Never hand out an ID a planner step already used: the ID may still be
+    # referenced by a `depends_on` edge or by a persisted checkpoint.
+    while str(next_id) in used:
+        next_id += 1
+    used.add(str(next_id))
     expanded.append(_make_plan_step(
         step_id=str(next_id),
         title=title,
@@ -1331,6 +1422,30 @@ def _expand_plan_prerequisites(
 ) -> List[Dict[str, Any]]:
     expanded: List[Dict[str, Any]] = []
     next_id = 1
+    # A planner step ID is semantic: other steps reference it through
+    # `depends_on`, and a persisted checkpoint stores it.  Renumbering the
+    # steps must therefore remap those references, and it must never hand a
+    # planner ID to a different step -- otherwise the plan graph resolves a
+    # dependency against the wrong node and the execution order silently
+    # diverges from the planner's intent.
+    reserved_ids: Set[str] = {
+        str(step.get("id") or "").strip()
+        for step in steps
+        if isinstance(step, dict)
+        and str(step.get("id") or "").strip()
+        and str(step.get("skill") or "").strip().lower() not in _REBUILT_STEP_SKILLS
+    }
+    id_remap: Dict[str, str] = {}
+
+    def _allocate_step_id() -> str:
+        nonlocal next_id
+        while str(next_id) in reserved_ids:
+            next_id += 1
+        allocated = str(next_id)
+        next_id += 1
+        reserved_ids.add(allocated)
+        return allocated
+
     has_trimmed_fastq = _context_has_trimmed_fastq(extra_context)
     has_raw_fastq = _context_has_raw_fastq(extra_context)
     has_bam = _context_has_bam(extra_context)
@@ -1346,12 +1461,14 @@ def _expand_plan_prerequisites(
     has_isomir_count_validation = False
 
     for step in steps:
+        original_id = str(step.get("id") or "").strip()
         skill_slug = str(step.get("skill") or "").strip().lower()
         if skill_slug == "alignment-srna":
             if not has_trimmed_fastq and has_raw_fastq:
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="完成 FASTQ 质控与修剪",
                     goal="先对原始 small RNA FASTQ 进行 adapter trimming 和质控，产出 trimmed_path / clean_fastq_path，供后续比对使用。",
                     skill="fastq-qc",
@@ -1361,6 +1478,7 @@ def _expand_plan_prerequisites(
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="准备参考基因组 FASTA",
                     goal="先下载或确认可用的参考基因组 FASTA，供构建 Bowtie index 和后续比对使用。",
                     skill="reference-download",
@@ -1374,6 +1492,7 @@ def _expand_plan_prerequisites(
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
+                        reserved=reserved_ids,
                         title="完成 FASTQ 质控与修剪",
                         goal="先对原始 small RNA FASTQ 进行 adapter trimming 和质控，产出 trimmed_path / clean_fastq_path，供后续比对和计数使用。",
                         skill="fastq-qc",
@@ -1383,6 +1502,7 @@ def _expand_plan_prerequisites(
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
+                        reserved=reserved_ids,
                         title="准备参考基因组 FASTA",
                         goal="确保已有参考基因组 FASTA，用于构建 Bowtie index 和后续基因组比对。",
                         skill="reference-download",
@@ -1391,6 +1511,7 @@ def _expand_plan_prerequisites(
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="完成参考基因组比对",
                     goal="先生成 genome-aligned coordinate-sorted BAM（bam_path），供 featureCounts 计数使用。",
                     skill="alignment-srna",
@@ -1402,6 +1523,7 @@ def _expand_plan_prerequisites(
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
+                        reserved=reserved_ids,
                         title="完成 FASTQ 质控与修剪",
                         goal="先对原始 small RNA FASTQ 做 adapter trimming 和质控，产出 trimmed_path / clean_fastq_path，供小 RNA 参考序列比对使用。",
                         skill="fastq-qc",
@@ -1410,6 +1532,7 @@ def _expand_plan_prerequisites(
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="完成 small-RNA 参考序列比对",
                     goal="先生成针对 small-RNA FASTA reference 的 BAM（bam_path），再执行 samtools idxstats 定量。",
                     skill="alignment-srna",
@@ -1420,6 +1543,7 @@ def _expand_plan_prerequisites(
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="完成 FASTQ 质控与修剪",
                     goal="先对原始 small RNA FASTQ 进行 adapter trimming 和质控，产出 trimmed_path / clean_fastq_path，供后续 fragmentomics 使用。",
                     skill="fastq-qc",
@@ -1429,6 +1553,7 @@ def _expand_plan_prerequisites(
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="完成参考基因组比对",
                     goal="生成 coordinate-sorted BAM（bam_path）以支持 FSC、RCD 和 BPM 特征提取；若缺上游 QC FASTQ，则先使用已有 trimmed FASTQ 进行比对。",
                     skill="alignment-srna",
@@ -1438,6 +1563,7 @@ def _expand_plan_prerequisites(
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="准备参考基因组 FASTA",
                     goal="确保 reference-download 提供 genome_fasta 或已有可用参考 FASTA，供 BPM 断点基序计算使用。",
                     skill="reference-download",
@@ -1453,6 +1579,7 @@ def _expand_plan_prerequisites(
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
+                        reserved=reserved_ids,
                         title="核查 fragmentomics 定量矩阵",
                         goal=(
                             "读取独立 fragmentomics AnnData，确认 layers['counts'] / X 为 raw counts、"
@@ -1463,25 +1590,29 @@ def _expand_plan_prerequisites(
                     has_fragment_count_validation = True
                 if not has_group_info:
                     step_copy = _make_plan_step(
-                        step_id=str(next_id),
+                        step_id=_allocate_step_id(),
                         title="确认 fragmentomics 样本分组信息",
                         goal="检查 fragmentomics_adata.obs 的 group/Condition/treatment 列，向用户确认后再运行差异分析。",
                         skill="",
                         auto_inserted=True,
                     )
                     expanded.append(step_copy)
-                    next_id += 1
                     has_group_info = True
+                step_id = _allocate_step_id()
+                if original_id:
+                    id_remap[original_id] = step_id
                 expanded.append(_make_plan_step(
-                    step_id=str(next_id),
+                    step_id=step_id,
                     title=str(step.get("title") or "fragmentomics 差异分析（limma-voom）"),
                     goal=str(step.get("goal") or "使用独立 fragmentomics AnnData 的 raw counts 运行 limma-voom 差异分析。"),
                     skill=str(step.get("skill") or "differential-analysis"),
                     status=str(step.get("status") or STEP_PENDING),
                     result=str(step.get("result") or ""),
                     auto_inserted=bool(step.get("autoInserted")),
+                    inputs=step.get("inputs"),
+                    outputs=step.get("outputs"),
+                    depends_on=step.get("depends_on"),
                 ))
-                next_id += 1
                 continue
             if modality == "isomir":
                 if (
@@ -1491,6 +1622,7 @@ def _expand_plan_prerequisites(
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
+                        reserved=reserved_ids,
                         title="核查 isomiR 定量矩阵",
                         goal=(
                             "读取独立 isomir AnnData，确认 mirtop 已写入 layers['counts'] / X，"
@@ -1518,6 +1650,7 @@ def _expand_plan_prerequisites(
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
+                        reserved=reserved_ids,
                         title=title,
                         goal=goal,
                         skill=provider,
@@ -1526,16 +1659,21 @@ def _expand_plan_prerequisites(
                     # Keep the DE node after its assay-specific count
                     # provider. The provider is a prerequisite, not a
                     # replacement for the requested differential analysis.
+                    step_id = _allocate_step_id()
+                    if original_id:
+                        id_remap[original_id] = step_id
                     expanded.append(_make_plan_step(
-                        step_id=str(next_id),
+                        step_id=step_id,
                         title=str(step.get("title") or "差异分析"),
                         goal=str(step.get("goal") or "运行差异分析"),
                         skill="differential-analysis",
                         status=str(step.get("status") or STEP_PENDING),
                         result=str(step.get("result") or ""),
                         auto_inserted=bool(step.get("autoInserted")),
+                        inputs=step.get("inputs"),
+                        outputs=step.get("outputs"),
+                        depends_on=step.get("depends_on"),
                     ))
-                    next_id += 1
                     continue
                 # A generic DE request does not authorize choosing a counting
                 # engine. Validate the existing raw-count input and let the
@@ -1545,6 +1683,7 @@ def _expand_plan_prerequisites(
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
+                        reserved=reserved_ids,
                         title="核查现有 raw counts 矩阵",
                         goal="只读检查对应 AnnData 是否已有 raw counts；不得自行选择 featureCounts 或替换既定定量方法。",
                         skill="",
@@ -1556,6 +1695,7 @@ def _expand_plan_prerequisites(
                             next_id = _ensure_step(
                                 expanded,
                                 next_id=next_id,
+                                reserved=reserved_ids,
                                 title="完成 FASTQ 质控与修剪",
                                 goal="先做 small RNA FASTQ 质控与 adapter trimming，为后续定量准备输入。",
                                 skill="fastq-qc",
@@ -1565,6 +1705,7 @@ def _expand_plan_prerequisites(
                             next_id = _ensure_step(
                                 expanded,
                                 next_id=next_id,
+                                reserved=reserved_ids,
                                 title="准备参考基因组 FASTA",
                                 goal="先准备参考基因组 FASTA，供显式请求的 featureCounts 流程使用。",
                                 skill="reference-download",
@@ -1573,6 +1714,7 @@ def _expand_plan_prerequisites(
                         next_id = _ensure_step(
                             expanded,
                             next_id=next_id,
+                            reserved=reserved_ids,
                             title="完成参考基因组比对",
                             goal="先生成 BAM（bam_path），供用户明确请求的 featureCounts 计数使用。",
                             skill="alignment-srna",
@@ -1581,6 +1723,7 @@ def _expand_plan_prerequisites(
                     next_id = _ensure_step(
                         expanded,
                         next_id=next_id,
+                        reserved=reserved_ids,
                         title="生成 featureCounts 定量矩阵",
                         goal="仅按用户明确指定的 featureCounts 方法生成 raw counts。",
                         skill="feature-count",
@@ -1588,16 +1731,21 @@ def _expand_plan_prerequisites(
                     has_counts = True
                 # The differential-analysis workflow contract owns the
                 # evidence preflight and approval gate.
+                step_id = _allocate_step_id()
+                if original_id:
+                    id_remap[original_id] = step_id
                 expanded.append(_make_plan_step(
-                    step_id=str(next_id),
+                    step_id=step_id,
                     title=str(step.get("title") or "差异分析"),
                     goal=str(step.get("goal") or "运行差异分析"),
                     skill="differential-analysis",
                     status=str(step.get("status") or STEP_PENDING),
                     result=str(step.get("result") or ""),
                     auto_inserted=bool(step.get("autoInserted")),
+                    inputs=step.get("inputs"),
+                    outputs=step.get("outputs"),
+                    depends_on=step.get("depends_on"),
                 ))
-                next_id += 1
                 continue
             # The differential-analysis workflow contract owns the evidence
             # preflight and approval gate. Do not create an untyped duplicate
@@ -1607,6 +1755,7 @@ def _expand_plan_prerequisites(
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="准备 miRNA 参考资源",
                     goal="先准备 genome FASTA 与 miRBase 参考资源，供 miRDeep2 定量或预测使用。",
                     skill="reference-download",
@@ -1616,6 +1765,7 @@ def _expand_plan_prerequisites(
                 next_id = _ensure_step(
                     expanded,
                     next_id=next_id,
+                    reserved=reserved_ids,
                     title="完成 FASTQ 质控与修剪",
                     goal="优先用 cutadapt 完成 small RNA FASTQ 的 adapter trimming，为 miRDeep2 提供更干净的输入。",
                     skill="fastq-qc",
@@ -1627,39 +1777,50 @@ def _expand_plan_prerequisites(
             # biologically equivalent for variant-level isomiR analysis.
             has_counts = True
 
-        if skill_slug not in {
-            "alignment-srna",
-            "feature-count",
-            "samtools_idxstats",
-            "fragment-analysis",
-            "differential-analysis",
-            "mirdeep2-mirna",
-            "isomir-quantification",
-        }:
+        if skill_slug not in _REBUILT_STEP_SKILLS:
             # This is not an expansion target. Preserve the complete node:
             # contract IDs, artifact edges, approval state, and completed
             # status are semantic data, not presentational fields that can be
             # recreated from title/goal text.
             preserved = deepcopy(step)
-            preserved.setdefault("id", str(next_id))
-            preserved.setdefault("title", f"Step {next_id}")
+            if not str(preserved.get("id") or "").strip():
+                preserved["id"] = _allocate_step_id()
+            preserved.setdefault("title", f"Step {preserved.get('id')}")
             preserved.setdefault("goal", str(preserved.get("title") or ""))
             preserved.setdefault("skill", "")
             preserved.setdefault("status", STEP_PENDING)
             preserved.setdefault("result", "")
             expanded.append(preserved)
-            next_id += 1
             continue
+        step_id = _allocate_step_id()
+        if original_id:
+            id_remap[original_id] = step_id
         expanded.append(_make_plan_step(
-            step_id=str(next_id),
+            step_id=step_id,
             title=str(step.get("title") or "执行片段组学分析"),
             goal=str(step.get("goal") or step.get("title") or ""),
             skill=str(step.get("skill") or ""),
             status=str(step.get("status") or STEP_PENDING),
             result=str(step.get("result") or ""),
             auto_inserted=bool(step.get("autoInserted")),
+            inputs=step.get("inputs"),
+            outputs=step.get("outputs"),
+            depends_on=step.get("depends_on"),
         ))
-        next_id += 1
+
+    if id_remap:
+        # Rewrite the planner's dependency edges onto the renumbered steps.
+        # A single lookup, never chained, so a pair of swapped IDs cannot
+        # oscillate between the two nodes.
+        for item in expanded:
+            dependencies = item.get("depends_on")
+            if not isinstance(dependencies, list) or not dependencies:
+                continue
+            item["depends_on"] = [
+                id_remap.get(str(dependency).strip(), str(dependency).strip())
+                for dependency in dependencies
+                if str(dependency).strip()
+            ]
 
     return expanded or steps
 

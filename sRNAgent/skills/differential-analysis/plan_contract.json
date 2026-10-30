@@ -62,6 +62,21 @@
           "edit_hint": "请回复“可以”采用上述配置；回复“不可以”并说明问题；或直接回复“group_col=字段，control_group=组名，design=unpaired/paired”更改。若分组未记录，也可直接下达检索指令（如“根据 SRR 样本号用 fastq-dl 检索分组”或“从 GEO 样本注释检索分组”）；系统会先检索证据，再重新请你确认。"
         }
       }
+    },
+    {
+      "id": "de-analysis-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["differential-analysis"]},
+      "selector": {
+        "skills": ["differential-analysis"],
+        "title_patterns": ["(?:差异分析|de\\b|differential)"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["group_design_confirmed", "raw_counts"],
+        "outputs": ["differential_results", "de_annotated_adata"]
+      }
     }
   ]
 }

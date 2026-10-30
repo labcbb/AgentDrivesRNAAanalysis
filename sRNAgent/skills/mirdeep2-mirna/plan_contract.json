@@ -1,0 +1,21 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "mirna-quantification-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["mirdeep2-mirna"]},
+      "selector": {
+        "skills": ["mirdeep2-mirna"],
+        "title_patterns": ["(?:定量|quantif).*(?:miRNA|miR)|(?:miRNA|miR).*(?:定量|quantif)"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["trimmed_fastq", "mirbase_mature_fasta", "mirbase_hairpin_fasta", "bowtie_genome_index", "reference_genome_fasta"],
+        "outputs": ["raw_counts"]
+      }
+    }
+  ]
+}

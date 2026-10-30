@@ -2477,3 +2477,231 @@ def test_target_candidate_confirmation_without_manifest_does_not_match(tmp_path)
     ok, reason = _prior_target_candidate_confirmation_matches(tmp_path)
     assert ok is False
     assert "manifest missing" in reason
+
+
+# --------------------------------------------------------------------------
+# Regression tests for the wrong-plan-order defect.
+#
+# A live agent produced a plan whose order contradicted its own data
+# dependencies: differential analysis was runnable while the group-design
+# approval was still open, quantification published no counts artifact, and
+# the QC step was pushed behind the plots that consume its MultiQC output.
+# --------------------------------------------------------------------------
+
+def _de_workflow_plan() -> list:
+    """A minimal but realistic miRNA quant -> DE -> report plan."""
+    return [
+        {
+            "id": "download", "title": "下载SRP261717 FASTQ并保留样本元数据",
+            "goal": "download fastq", "skill": "fastq-dl-srna",
+            "outputs": ["fastq_paths", "sample_metadata_evidence"],
+        },
+        {
+            "id": "reference", "title": "下载参考数据并构建Bowtie索引",
+            "goal": "build index", "skill": "reference-download",
+            "outputs": [
+                "reference_genome_fasta", "mirbase_mature_fasta",
+                "mirbase_hairpin_fasta", "bowtie_genome_index",
+            ],
+        },
+        {
+            "id": "quant", "title": "定量已知miRNA",
+            "goal": "quantify known miRNA", "skill": "mirdeep2-mirna",
+        },
+        {
+            "id": "de", "title": "完成非配对miRNA差异分析",
+            "goal": "run differential expression", "skill": "differential-analysis",
+        },
+        {
+            "id": "trim", "title": "完成批量接头修剪与FASTQ质控",
+            "goal": "trim and produce a MultiQC聚合报告", "skill": "fastq-qc",
+            "inputs": ["trim_config_confirmed", "fastq_paths"],
+            "outputs": ["trimmed_fastq_paths", "fastqc_reports", "multiqc_report"],
+        },
+        {
+            "id": "plots", "title": "生成并登记分析图件",
+            "goal": "plot figures", "skill": "plotting",
+            "inputs": [
+                "de_annotated_adata", "target_annotated_adata",
+                "fastqc_reports", "multiqc_report",
+            ],
+            "outputs": ["registered_analysis_figures"],
+        },
+        {
+            "id": "report", "title": "生成HTML科学分析报告",
+            "goal": "html report", "skill": "reporting",
+            "inputs": [
+                "target_annotated_adata", "registered_analysis_figures",
+                "differential_results", "fastqc_reports", "multiqc_report",
+            ],
+            "outputs": ["analysis_report_html"],
+        },
+    ]
+
+
+def _compile_de_workflow_plan() -> list:
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    return _enforce_workflow_contracts(
+        _de_workflow_plan(),
+        skill_registry=registry,
+        user_query="定量miRNA并做差异分析",
+        extra_context="",
+    )
+
+
+def _backward_edges(steps: list) -> list:
+    """Dependency edges whose producer appears after its consumer."""
+    position = {str(step.get("id")): index for index, step in enumerate(steps)}
+    edges = []
+    for index, step in enumerate(steps):
+        for dependency in step.get("depends_on") or []:
+            dependency = str(dependency)
+            if dependency in position and position[dependency] > index:
+                edges.append((dependency, str(step.get("id"))))
+    return edges
+
+
+def _find_step(steps: list, *, skill: str, title: str = "") -> dict:
+    """Locate a compiled step by skill and optional title fragment."""
+    for step in steps:
+        if str(step.get("skill") or "") != skill:
+            continue
+        if title and title not in str(step.get("title") or ""):
+            continue
+        return step
+    raise AssertionError(f"step not found: skill={skill} title={title}")
+
+
+def test_de_analysis_stays_blocked_until_the_group_gate_is_confirmed():
+    """The DE step must not be runnable while its group approval is open."""
+    from sRNAgent.agent.plan_state import PlanGraph
+
+    planned = _compile_de_workflow_plan()
+    gate = _find_step(planned, skill="differential-analysis", title="确认差异分析样本分组")
+    de = _find_step(planned, skill="differential-analysis", title="完成非配对miRNA差异分析")
+
+    assert gate["status"] == "pending"
+    assert gate["id"] in de["depends_on"]
+
+    gate["status"] = "awaiting_approval"
+    graph = PlanGraph({"steps": planned})
+    runnable = graph.next_runnable_pending(pending="pending", completed={"done", "skipped"})
+    assert runnable is not None
+    assert str(runnable.get("id")) != de["id"], (
+        "differential analysis became runnable while the group gate was open"
+    )
+    assert de["id"] in {
+        str(step.get("id")) for step in graph.blocked_pending(
+            pending="pending", completed={"done", "skipped"},
+        )
+    }
+
+
+def test_de_workflow_plan_has_no_backward_dependency_edges():
+    planned = _compile_de_workflow_plan()
+
+    assert _backward_edges(planned) == []
+
+
+def test_quantification_publishes_counts_and_de_consumes_the_group_confirmation():
+    planned = _compile_de_workflow_plan()
+    quant = _find_step(planned, skill="mirdeep2-mirna")
+    gate = _find_step(planned, skill="differential-analysis", title="确认差异分析样本分组")
+    de = _find_step(planned, skill="differential-analysis", title="完成非配对miRNA差异分析")
+
+    assert quant["outputs"] == ["raw_counts"]
+    assert de["inputs"] == ["group_design_confirmed", "raw_counts"]
+    assert de["outputs"] == ["differential_results", "de_annotated_adata"]
+    assert quant["id"] in de["depends_on"]
+    assert gate["id"] in de["depends_on"]
+
+
+def test_report_deliverable_is_not_confused_with_a_qc_step_mentioning_multiqc():
+    from sRNAgent.agent.plan_orchestrator import _is_report_step
+
+    assert _is_report_step({"title": "完成批量接头修剪与FASTQ质控", "skill": "fastq-qc"}) is False
+    assert _is_report_step({"title": "生成HTML科学分析报告", "skill": "reporting"}) is True
+
+    planned = _compile_de_workflow_plan()
+    trim = _find_step(planned, skill="fastq-qc", title="完成批量接头修剪与FASTQ质控")
+    plots = _find_step(planned, skill="plotting")
+    report = _find_step(planned, skill="reporting")
+
+    # The QC step consumes the adapter gate and produces the MultiQC report
+    # that the plots consume, so it must stay ahead of them.
+    assert trim["id"] in plots.get("depends_on", [])
+    assert trim["id"] in report.get("depends_on", [])
+    assert plots["id"] in report.get("depends_on", [])
+
+
+def test_trr_request_scopes_both_mirna_and_trna_assays():
+    scope = _derive_requested_scope("用tRAX定量tRR并做miRNA差异分析")
+
+    assert scope["requested_assays"] == ["mirna", "trna"]
+
+
+def test_expand_plan_prerequisites_keeps_the_planner_declared_graph():
+    planned = _expand_plan_prerequisites(
+        [
+            {
+                "id": "de", "title": "完成非配对miRNA差异分析",
+                "goal": "run DE", "skill": "differential-analysis",
+                "inputs": ["raw_counts"],
+                "outputs": ["differential_results"],
+                "depends_on": ["quant"],
+            },
+            {
+                "id": "quant", "title": "定量已知miRNA",
+                "goal": "quantify", "skill": "mirdeep2-mirna",
+            },
+        ],
+        extra_context="",
+        user_query="做miRNA差异分析",
+    )
+
+    by_id = {str(step.get("id")): step for step in planned}
+    de = next(step for step in planned if step.get("skill") == "differential-analysis")
+    quant = next(step for step in planned if step.get("skill") == "mirdeep2-mirna")
+    assert de["inputs"] == ["raw_counts"]
+    assert de["outputs"] == ["differential_results"]
+    # The edge must follow the renumbered producer, not the stale planner ID.
+    assert de["depends_on"] == [quant["id"]]
+    assert quant["id"] in by_id
+
+
+def test_expand_plan_prerequisites_never_reuses_a_planner_step_id():
+    """A freed planner ID must not be handed to a different step."""
+    planned = _expand_plan_prerequisites(
+        [
+            {"id": "10", "title": "完成非配对miRNA差异分析", "goal": "run DE",
+             "skill": "differential-analysis"},
+            {"id": "11", "title": "核查现有 raw counts 矩阵", "goal": "check counts",
+             "skill": ""},
+        ],
+        extra_context="",
+        user_query="做miRNA差异分析",
+    )
+
+    ids = [str(step.get("id")) for step in planned]
+    assert len(ids) == len(set(ids)), f"duplicate step IDs: {ids}"
+    assert "10" not in ids or planned[ids.index("10")].get("skill") == "differential-analysis"
+
+
+def test_expand_plan_prerequisites_does_not_duplicate_the_planner_count_check():
+    """The planner's own count check must not be inserted a second time."""
+    planned = _expand_plan_prerequisites(
+        [
+            {"id": "counts", "title": "核查现有 raw counts 矩阵", "goal": "check counts",
+             "skill": ""},
+            {"id": "de", "title": "完成非配对miRNA差异分析", "goal": "run DE",
+             "skill": "differential-analysis"},
+        ],
+        extra_context="",
+        user_query="做miRNA差异分析",
+    )
+
+    titles = [str(step.get("title")) for step in planned]
+    assert titles.count("核查现有 raw counts 矩阵") == 1

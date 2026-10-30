@@ -51,6 +51,16 @@ def _artifact_names(value: Any) -> List[str]:
     return names
 
 
+def _merge_artifact_names(existing: Any, declared: Any) -> List[str]:
+    """Union of a step's own artifacts and the ones a contract declares.
+
+    A contract states the artifacts a step *must* consume and produce; it
+    does not know every artifact the planner already attached.  Replacing the
+    planner's list would silently delete edges it declared, so keep both.
+    """
+    return _artifact_names([*_artifact_names(existing), *_artifact_names(declared)])
+
+
 def wire_artifact_dependencies(steps: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Compile artifact edges and return a stable topological plan order."""
     wired = [step for step in steps if isinstance(step, dict)]
@@ -319,8 +329,8 @@ def apply_workflow_nodes(
                             contracts.append({"id": contract_id, **dict(node.get("execution") or {})})
                 if kind == "bind_io" or isinstance(node.get("io"), dict):
                     io = node.get("io") if isinstance(node.get("io"), dict) else {}
-                    target["inputs"] = _artifact_names(io.get("inputs"))
-                    target["outputs"] = _artifact_names(io.get("outputs"))
+                    target["inputs"] = _merge_artifact_names(target.get("inputs"), io.get("inputs"))
+                    target["outputs"] = _merge_artifact_names(target.get("outputs"), io.get("outputs"))
             continue
         if kind == "order":
             placement = node.get("placement") if isinstance(node.get("placement"), dict) else {}
