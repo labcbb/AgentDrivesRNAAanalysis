@@ -2612,7 +2612,7 @@ def test_quantification_publishes_counts_and_de_consumes_the_group_confirmation(
     gate = _find_step(planned, skill="differential-analysis", title="确认差异分析样本分组")
     de = _find_step(planned, skill="differential-analysis", title="完成非配对miRNA差异分析")
 
-    assert quant["outputs"] == ["raw_counts"]
+    assert "raw_counts" in quant["outputs"]
     assert de["inputs"] == ["group_design_confirmed", "raw_counts"]
     assert de["outputs"] == ["differential_results", "de_annotated_adata"]
     assert quant["id"] in de["depends_on"]
@@ -2987,3 +2987,154 @@ def test_isomir_differential_analysis_reads_the_isomir_counts():
     assert de["inputs"] == ["group_design_confirmed", "isomir_counts"]
     assert mirtop["id"] in de["depends_on"]
     assert _backward_edges(planned) == []
+
+
+# --------------------------------------------------------------------------
+# Regression tests for the artifact vocabulary.
+#
+# The planner and the contracts name the same capability differently -- the
+# planner writes `trimmed_fastq_paths`, a contract writes `trimmed_fastq`.
+# Matching the literal strings instead of the capability made the edge
+# disappear, and the quantification ran before the trimming that feeds it.
+# --------------------------------------------------------------------------
+
+def test_quantification_follows_trimming_despite_the_artifact_naming():
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "完成批量接头修剪与FASTQ质控", "skill": "fastq-qc",
+             "outputs": ["trimmed_fastq_paths", "fastqc_reports", "multiqc_report"]},
+            {"id": "2", "title": "定量已知miRNA", "skill": "mirdeep2-mirna"},
+        ],
+        "完成 miRNA 定量",
+    )
+    trim = _find_step(planned, skill="fastq-qc", title="完成批量接头修剪与FASTQ质控")
+    quant = _find_step(planned, skill="mirdeep2-mirna")
+
+    assert trim["id"] in quant["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+def test_quantification_follows_the_reference_download():
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "下载参考数据并构建Bowtie索引", "skill": "reference-download"},
+            {"id": "2", "title": "定量已知miRNA", "skill": "mirdeep2-mirna"},
+        ],
+        "完成 miRNA 定量",
+    )
+    reference = _find_step(planned, skill="reference-download")
+    quant = _find_step(planned, skill="mirdeep2-mirna")
+
+    assert "mirbase_mature_fasta" in reference["outputs"]
+    assert reference["id"] in quant["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+def test_report_follows_the_plots_and_the_analyses():
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "完成非配对miRNA差异分析", "skill": "differential-analysis"},
+            {"id": "2", "title": "完成批量接头修剪与FASTQ质控", "skill": "fastq-qc",
+             "outputs": ["fastqc_reports", "multiqc_report"]},
+            {"id": "3", "title": "生成并登记分析图件", "skill": "plotting"},
+            {"id": "4", "title": "生成HTML科学分析报告", "skill": "reporting"},
+        ],
+        "完成 miRNA 差异分析并生成 HTML 报告",
+    )
+    de = _find_step(planned, skill="differential-analysis", title="完成非配对miRNA差异分析")
+    trim = _find_step(planned, skill="fastq-qc", title="完成批量接头修剪与FASTQ质控")
+    plots = _find_step(planned, skill="plotting")
+    report = _find_step(planned, skill="reporting")
+
+    assert de["id"] in plots["depends_on"]
+    assert trim["id"] in plots["depends_on"]
+    assert plots["id"] in report["depends_on"]
+    assert de["id"] in report["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+def test_target_prediction_follows_the_quantification_that_carried_the_sequences():
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "定量已知miRNA", "skill": "mirdeep2-mirna"},
+            {"id": "2", "title": "从差异结果确定靶标分析候选miRNA", "skill": "mirna-target-prediction"},
+        ],
+        "预测候选miRNA靶基因",
+    )
+    quant = _find_step(planned, skill="mirdeep2-mirna")
+    selection = _find_step(planned, skill="mirna-target-prediction", title="从差异结果确定靶标分析候选miRNA")
+
+    assert quant["id"] in selection["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+# --------------------------------------------------------------------------
+# Coverage guards.
+#
+# A skill that publishes no artifact leaves everything downstream of it
+# unordered, and a tool that no skill mentions is a tool the agent cannot
+# call.  Both regressions are silent, so they are guarded here.
+# --------------------------------------------------------------------------
+
+def test_every_registered_skill_declares_its_artifact_contract():
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+
+    missing = [
+        slug for slug, skill in registry.skills.items()
+        if not (skill.path / "plan_contract.json").exists()
+    ]
+    assert missing == [], f"skills without a plan contract: {missing}"
+
+
+def test_every_registered_tool_is_documented_in_a_skill():
+    import inspect
+    import re
+
+    import pytest
+
+    import sRNAgent as sa
+    from sRNAgent.skill_registry import SkillRegistry
+
+    skills_dir = Path(__file__).resolve().parents[2] / "skills"
+    registry = SkillRegistry(skills_dir)
+    registry.load()
+    documented = "\n".join(
+        path.read_text(encoding="utf-8") for path in skills_dir.rglob("*.md")
+    )
+
+    functions = sa.get_registry()
+    functions._ensure_hydrated()
+    registered: dict = {}
+    for key, meta in functions._registry.items():
+        function = meta["function"]
+        registered.setdefault(
+            (getattr(function, "__module__", ""), getattr(function, "__name__", "")), set(),
+        ).add(f"sa.{meta['category']}.{key}")
+
+    # A tool is reachable under its registry names and under whatever else
+    # the namespace exposes, and the agent copies the name a skill shows.
+    for category in ("alignment", "diff", "download", "fastq", "fragment", "model",
+                     "plot", "quant", "reference", "report", "target"):
+        module = getattr(sa, category)
+        for name in dir(module):
+            if name.startswith("_"):
+                continue
+            attribute = getattr(module, name)
+            if not callable(attribute) or inspect.isclass(attribute):
+                continue
+            key = (getattr(attribute, "__module__", ""), getattr(attribute, "__name__", ""))
+            if key not in registered:
+                continue
+            registered[key].add(f"sa.{category}.{name}")
+
+    for key, aliases in registered.items():
+        if not any(
+            re.search(rf"\b{re.escape(alias)}\b", documented)
+            for alias in aliases
+        ):
+            pytest.fail(
+                f"registered tool {key[0]}.{key[1]} is not documented in any skill"
+            )

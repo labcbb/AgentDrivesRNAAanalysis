@@ -10,11 +10,12 @@
         "skills": ["mirdeep2-mirna"],
         "title_patterns": ["(?:定量|quantif).*(?:miRNA|miR)|(?:miRNA|miR).*(?:定量|quantif)"],
         "exclude_workflow_contracts": true,
+        "require_title_match": true,
         "select": "first"
       },
       "io": {
         "inputs": ["trimmed_fastq", "mirbase_mature_fasta", "mirbase_hairpin_fasta", "bowtie_genome_index", "reference_genome_fasta"],
-        "outputs": ["raw_counts"]
+        "outputs": ["raw_counts", "mirna_sequence_metadata"]
       }
     }
   ]

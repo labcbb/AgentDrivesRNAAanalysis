@@ -1,0 +1,26 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "plotting-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["plotting"]},
+      "selector": {
+        "skills": ["plotting"],
+        "exclude_workflow_contracts": true,
+        "select": "all"
+      },
+      "io": {
+        "inputs": [
+          "de_annotated_adata",
+          "target_annotated_adata",
+          "raw_counts",
+          "fastqc_reports",
+          "multiqc_report"
+        ],
+        "outputs": ["registered_analysis_figures"]
+      }
+    }
+  ]
+}

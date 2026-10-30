@@ -1,0 +1,29 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "reporting-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["reporting"]},
+      "selector": {
+        "skills": ["reporting"],
+        "exclude_workflow_contracts": true,
+        "select": "all"
+      },
+      "io": {
+        "inputs": [
+          "registered_analysis_figures",
+          "de_annotated_adata",
+          "target_annotated_adata",
+          "differential_results",
+          "target_prediction_results",
+          "raw_counts",
+          "fastqc_reports",
+          "multiqc_report"
+        ],
+        "outputs": ["analysis_report_html", "reported_adata"]
+      }
+    }
+  ]
+}

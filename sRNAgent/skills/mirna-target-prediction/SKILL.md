@@ -113,7 +113,22 @@ mirna_adata = sa.target.starbase_mirna_targets(
 starbase_records = mirna_adata.uns["starbase_mirna_targets"]["last_run"]["records"]
 ```
 
-### 3. Predict exact-sequence targets with miRanda
+### 3. Cross-check with miRTarBase experimentally validated interactions
+
+miRTarBase curates miRNA-target interactions from the literature. Use it to
+confirm that a candidate target gene has experimental support, not to
+predict new targets — a candidate absent from miRTarBase is not thereby
+discarded:
+
+```python
+mirtarbase = sa.reference.download_mirtarbase("hsa", output_dir="references")
+print(mirtarbase["csv_path"])
+
+# The species codes are fixed; check the available ones before downloading.
+print(sa.reference.list_mirtarbase_species())
+```
+
+### 4. Predict exact-sequence targets with miRanda
 
 Use miRanda for an isomiR, and optionally as local sequence evidence for a
 canonical mature miRNA. The output retains each predicted duplex score, free
@@ -143,7 +158,7 @@ The tool runs `miranda miRNA.fa UTRs.fa -sc 140 -en -20 -out predictions.txt`.
 Keep the recorded `adata.uns["miranda_targets"]["prediction_file"]`; do not
 replace it with a hand-filtered file.
 
-### 4. Validate seed-complement sites in 3' UTRs
+### 5. Validate seed-complement sites in 3' UTRs
 
 Use the observed sequence in `adata.var["sequence"]` to scan the same UTR FASTA
 for the reverse complement of positions 2-8. This is deterministic supporting
@@ -170,7 +185,7 @@ selected_genes = sorted(miRanda_gene_set & seed_gene_set)
 For a canonical miRNA, an explicit `restrict_to_cached_targets=True` scan may
 validate a starBase result. Never enable that restriction for an isomiR.
 
-### 5. Compare an isomiR with its parent miRNA
+### 6. Compare an isomiR with its parent miRNA
 
 To attribute target changes to an observed isomiR, run the same local miRanda
 and seed workflow for both sequences. The tool reads the parent ID from
@@ -201,7 +216,7 @@ transcript IDs, and exact seed-site counts. A changed 5' seed is labelled
 `seed_status="changed"`; a 3' change can retain the same seed but still change
 miRanda alignment or energy.
 
-### 6. Hand off selected target genes to enrichment
+### 7. Hand off selected target genes to enrichment
 
 Pass only the documented, unique gene-symbol list to
 `enrichr-gene-enrichment`. Record the source method, thresholds, and whether

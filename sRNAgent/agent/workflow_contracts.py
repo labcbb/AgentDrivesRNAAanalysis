@@ -80,12 +80,14 @@ def wire_artifact_dependencies(steps: Iterable[Dict[str, Any]]) -> List[Dict[str
     """Compile artifact edges and return a stable topological plan order."""
     wired = [step for step in steps if isinstance(step, dict)]
     producers: Dict[str, List[tuple[int, str]]] = {}
+    capabilities: Dict[str, frozenset[str]] = {}
     for index, step in enumerate(wired):
         step_id = str(step.get("id") or "").strip()
         if not step_id:
             continue
         for artifact in _artifact_names(step.get("outputs")):
             producers.setdefault(artifact, []).append((index, step_id))
+            capabilities.setdefault(artifact, frozenset(_typed_artifact_names([artifact])))
 
     # A consumer must wait for *every* producer of the artifacts it reads.
     # The small-RNA counts matrix is assembled by one step per assay -- miRNA,
@@ -98,14 +100,18 @@ def wire_artifact_dependencies(steps: Iterable[Dict[str, Any]]) -> List[Dict[str
             continue
         dependencies = _artifact_names(step.get("depends_on"))
         for artifact in _artifact_names(step.get("inputs")):
-            for _, producer in producers.get(artifact, []):
-                if producer == step_id or producer in dependencies:
+            wanted = frozenset(_typed_artifact_names([artifact]))
+            for producer_artifact, entries in producers.items():
+                if not (wanted & capabilities[producer_artifact]):
                     continue
-                if _reaches(producer, step_id, edges):
-                    # Wiring this edge would close a cycle and leave a step
-                    # that can never become runnable.  Keep the graph acyclic.
-                    continue
-                dependencies.append(producer)
+                for _, producer in entries:
+                    if producer == step_id or producer in dependencies:
+                        continue
+                    if _reaches(producer, step_id, edges):
+                        # Wiring this edge would close a cycle and leave a step
+                        # that can never become runnable.  Keep the graph acyclic.
+                        continue
+                    dependencies.append(producer)
         edges[step_id] = dependencies
         if dependencies:
             step["depends_on"] = dependencies
@@ -154,6 +160,17 @@ _ARTIFACT_PATTERNS = {
     "genome_fasta": re.compile(r"\b(?:genome_fasta|reference_fasta)\b|\bgenome.*\.fa(?:sta)?\b", re.I),
 }
 
+# The planner and the contracts name the same capability differently: the
+# planner writes `trimmed_fastq_paths`, a contract writes `trimmed_fastq`.
+# Both name the same data, so the graph has to match them on the capability
+# rather than on the literal string -- otherwise the edge silently vanishes.
+_ARTIFACT_ALIASES = {
+    "fastq_paths": "raw_fastq",
+    "clean_fastq_paths": "trimmed_fastq",
+    "trimmed_fastq_paths": "trimmed_fastq",
+    "collapsed_fastq_paths": "collapsed_fastq",
+}
+
 
 def _typed_artifact_names(values: Any) -> List[str]:
     """Normalize persisted artifact IDs and workspace paths into capabilities."""
@@ -161,6 +178,9 @@ def _typed_artifact_names(values: Any) -> List[str]:
     inferred: List[str] = []
     for value in normalized:
         lower = value.casefold()
+        alias = _ARTIFACT_ALIASES.get(lower)
+        if alias:
+            inferred.append(alias)
         if re.search(r"\.(?:fastq|fq)(?:\.gz)?$", lower):
             inferred.append("trimmed_fastq" if re.search(r"trimmed|clean", lower) else "raw_fastq")
         if re.search(r"(?:^|[_/.-])(?:de|differential)[_/.-]?.*(?:results?|table)|de_results", lower):
@@ -345,16 +365,20 @@ def apply_workflow_nodes(
                 ]
             targets = _select_steps(planned, selector)
             if targets:
-                target = targets[-1] if selector.get("select") == "last" else targets[0]
-                if kind == "execution":
-                    contracts = target.setdefault("executionContracts", [])
-                    if isinstance(contracts, list):
-                        if not any(
-                            isinstance(existing, dict)
-                            and str(existing.get("id") or "").strip() == contract_id
-                            for existing in contracts
-                        ):
-                            contracts.append({"id": contract_id, **dict(node.get("execution") or {})})
+                if selector.get("select") == "all":
+                    chosen = list(targets)
+                else:
+                    chosen = [targets[-1] if selector.get("select") == "last" else targets[0]]
+                for target in chosen:
+                    if kind == "execution":
+                        contracts = target.setdefault("executionContracts", [])
+                        if isinstance(contracts, list):
+                            if not any(
+                                isinstance(existing, dict)
+                                and str(existing.get("id") or "").strip() == contract_id
+                                for existing in contracts
+                            ):
+                                contracts.append({"id": contract_id, **dict(node.get("execution") or {})})
                 if kind == "bind_io" or isinstance(node.get("io"), dict):
                     io = node.get("io") if isinstance(node.get("io"), dict) else {}
                     target["inputs"] = merge_artifact_names(target.get("inputs"), io.get("inputs"))

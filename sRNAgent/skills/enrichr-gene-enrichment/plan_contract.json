@@ -1,0 +1,20 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "enrichment-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["enrichr-gene-enrichment"]},
+      "selector": {
+        "skills": ["enrichr-gene-enrichment"],
+        "exclude_workflow_contracts": true,
+        "select": "all"
+      },
+      "io": {
+        "inputs": ["differential_results", "de_annotated_adata"],
+        "outputs": ["enrichment_results"]
+      }
+    }
+  ]
+}

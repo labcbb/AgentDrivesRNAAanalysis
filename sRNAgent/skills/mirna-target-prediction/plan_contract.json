@@ -45,6 +45,22 @@
       }
     },
     {
+      "id": "starbase-target-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["mirna-target-prediction"]},
+      "selector": {
+        "skills": ["mirna-target-prediction"],
+        "title_patterns": ["starBase|starbase|ENCORI"],
+        "exclude_workflow_contracts": true,
+        "require_title_match": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["target_candidates_confirmed", "mirna_sequence_metadata"],
+        "outputs": ["starbase_target_predictions", "target_prediction_results"]
+      }
+    },
+    {
       "id": "target-prediction-input-contract",
       "kind": "bind_io",
       "activation": {"requires_skills": ["mirna-target-prediction"]},

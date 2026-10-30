@@ -1,0 +1,20 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "modeling-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["modeling"]},
+      "selector": {
+        "skills": ["modeling"],
+        "exclude_workflow_contracts": true,
+        "select": "all"
+      },
+      "io": {
+        "inputs": ["de_annotated_adata", "raw_counts", "differential_results"],
+        "outputs": ["model_results"]
+      }
+    }
+  ]
+}

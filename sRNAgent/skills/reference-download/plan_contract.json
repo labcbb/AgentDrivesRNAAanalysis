@@ -1,0 +1,28 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "reference-download-output-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["reference-download"]},
+      "selector": {
+        "skills": ["reference-download"],
+        "exclude_workflow_contracts": true,
+        "select": "all"
+      },
+      "io": {
+        "outputs": [
+          "reference_genome_fasta",
+          "reference_annotation",
+          "mirbase_mature_fasta",
+          "mirbase_hairpin_fasta",
+          "bowtie_genome_index",
+          "three_prime_utr_fasta",
+          "pirna_reference_fasta",
+          "trna_reference_gtf"
+        ]
+      }
+    }
+  ]
+}

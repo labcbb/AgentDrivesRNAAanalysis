@@ -105,6 +105,19 @@ sa.diff.filter_low_expression(adata, min_mean=1.0)
 - `adata.X`、`adata.layers["counts"]`、`adata.layers["logcpm"]` 等所有 layer 同步过滤
 - 打印保留/去除的 miRNA 数量
 
+在差异分析之前用 PCA 检查样本分层是否与分组一致：
+
+```python
+# 需要 adata.layers["logcpm"]；缺失时先运行 sa.quant.normalize_cpm(adata)
+adata = sa.diff.pca_logcpm(adata, n_comps=2)
+print(adata.uns["pca"]["variance_ratio"])
+```
+
+`pca_logcpm` 把结果写入 `adata.obsm["X_pca"]`、`adata.uns["pca"]`
+（含 `variance` / `variance_ratio` / `total_variance`）和 `adata.varm["PCs"]`。
+它只读取 `adata.layers["logcpm"]`（缺失时直接报错，不自行归一化），
+用于判断分组是否可分、是否存在离群样本；它不修改 `adata.X` 或分组标签。
+
 ### 3. 差异分析
 
 ```python
