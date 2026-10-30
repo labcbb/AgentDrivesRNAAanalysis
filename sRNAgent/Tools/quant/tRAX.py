@@ -26,6 +26,21 @@ def _dense_counts(matrix) -> np.ndarray:
     return np.asarray(matrix, dtype=np.float64)
 
 
+def _compute_log_cpm(count_matrix) -> np.ndarray:
+    """Compute log2(CPM + 1) from a raw count matrix (samples x features).
+
+    Shared by every quant tool (mirdeep2, mirtop) and by
+    ``store_count_matrix``, which must recompute the layer after a merge
+    because CPM denominators change when features are appended.
+    """
+    arr = _dense_counts(count_matrix)
+    lib_sizes = arr.sum(axis=1, keepdims=True)
+    # Avoid division by zero for samples with zero total counts
+    lib_sizes = np.where(lib_sizes == 0, 1.0, lib_sizes)
+    cpm = arr / lib_sizes * 1e6
+    return np.log2(cpm + 1.0)
+
+
 def _infer_rna_type(var: pd.DataFrame) -> str:
     if "rna_type" in var.columns and len(set(var["rna_type"].astype(str))) == 1:
         return str(var["rna_type"].astype(str).iloc[0])
@@ -66,6 +81,11 @@ def store_count_matrix(
     new_var = var.copy()
     new_var["rna_type"] = rna_type
 
+    # A logcpm layer must track the counts layer: appending features changes
+    # the CPM denominator, so the old values are no longer valid. Recompute it
+    # from the merged counts when the caller had one.
+    had_logcpm = "logcpm" in adata.layers
+
     if adata.n_vars == 0:
         combined_counts = counts
         combined_var = new_var
@@ -88,6 +108,12 @@ def store_count_matrix(
     result = AnnData(X=combined_counts, obs=adata.obs.copy(), var=combined_var)
     result.layers[counts_layer] = combined_counts.copy()
     result.uns.update(adata.uns)
+
+    # Recompute logcpm from the merged counts — keeping the old layer would
+    # silently carry stale values (the CPM denominator changed) or drop the
+    # layer entirely, breaking downstream PCA/DE steps.
+    if had_logcpm:
+        result.layers["logcpm"] = _compute_log_cpm(combined_counts)
 
     for key in adata.obsm.keys():
         result.obsm[key] = adata.obsm[key].copy()

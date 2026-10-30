@@ -143,6 +143,7 @@ adata = sa.quant.feature_count(
 
 > 不同 `rna_type` 的特征会共存于 `adata.X` / `adata.layers["counts"]` 中。
 > 同一 `rna_type` 重复运行会替换旧特征，不影响其他 RNA 类型。
+> 合并会改变 CPM 分母：若合并前已有 `adata.layers["logcpm"]`，工具会用合并后的 counts 重算该 layer（不会保留过期值，也不会静默丢弃）；若合并前没有 logcpm，合并后也不会自动生成 —— 需要时再调用 `sa.quant.normalize_cpm(adata)`。
 
 ### 2. 查看定量结果
 

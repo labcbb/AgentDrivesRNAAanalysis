@@ -260,6 +260,52 @@ def test_store_count_matrix_accepts_sparse_existing_counts():
     assert result.layers["counts"].shape == (2, 3)
 
 
+def test_store_count_matrix_recomputes_logcpm_after_merge():
+    """Merging a second rna_type must not silently drop or stale the logcpm layer."""
+    adata = ad.AnnData(
+        X=np.array([[10.0, 0.0], [0.0, 0.0]], dtype=float),
+        obs=pd.DataFrame(index=["S1", "S2"]),
+        var=pd.DataFrame({"rna_type": ["miRNA", "miRNA"]}, index=["m1", "m2"]),
+    )
+    adata.layers["counts"] = adata.X.copy()
+    adata.layers["logcpm"] = np.log2(
+        adata.X / adata.X.sum(axis=1, keepdims=True) * 1e6 + 1.0
+    )
+
+    result = store_count_matrix(
+        adata,
+        np.array([[0.0, 7.0], [0.0, 0.0]], dtype=float),
+        pd.DataFrame(index=["p1", "p2"]),
+        rna_type="piRNA",
+    )
+
+    # logcpm must survive the merge and match the merged counts.
+    assert "logcpm" in result.layers
+    assert result.layers["logcpm"].shape == result.layers["counts"].shape
+    merged = np.asarray(result.layers["counts"], dtype=float)
+    lib_sizes = merged.sum(axis=1, keepdims=True)
+    lib_sizes = np.where(lib_sizes == 0, 1.0, lib_sizes)
+    expected = np.log2(merged / lib_sizes * 1e6 + 1.0)
+    assert np.allclose(np.asarray(result.layers["logcpm"], dtype=float), expected)
+
+
+def test_store_count_matrix_without_logcpm_stays_without_logcpm():
+    adata = ad.AnnData(
+        X=np.array([[10.0, 0.0], [0.0, 0.0]], dtype=float),
+        obs=pd.DataFrame(index=["S1", "S2"]),
+        var=pd.DataFrame({"rna_type": ["miRNA", "miRNA"]}, index=["m1", "m2"]),
+    )
+    adata.layers["counts"] = adata.X.copy()
+
+    result = store_count_matrix(
+        adata,
+        np.array([[0.0, 7.0], [0.0, 0.0]], dtype=float),
+        pd.DataFrame(index=["p1", "p2"]),
+        rna_type="piRNA",
+    )
+    assert "logcpm" not in result.layers
+
+
 def test_registered_adata_tool_accepts_mudata_explicit_mod():
     srna = ad.AnnData(
         X=np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),

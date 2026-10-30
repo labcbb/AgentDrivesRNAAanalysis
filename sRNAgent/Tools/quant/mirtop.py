@@ -37,6 +37,7 @@ from ..._registry import register_function
 from ..._utils import run_cli_cmd
 from ..alignment.bowtie import normalize_rna_fasta_to_dna
 from ..reference.mirbase import prepare_mirtop_reference
+from .tRAX import _compute_log_cpm as _shared_compute_log_cpm
 from .tRAX import store_count_matrix
 
 
@@ -117,11 +118,7 @@ def _resolve_reference_files(gff: str, hairpin: str) -> Tuple[Path, Path]:
 
 def _compute_log_cpm(count_matrix) -> np.ndarray:
     """``log2(CPM + 1)`` from a raw count matrix (samples x features)."""
-    arr = np.asarray(count_matrix, dtype=np.float64)
-    lib_sizes = arr.sum(axis=1, keepdims=True)
-    lib_sizes = np.where(lib_sizes == 0, 1.0, lib_sizes)
-    cpm = arr / lib_sizes * 1e6
-    return np.log2(cpm + 1.0)
+    return _shared_compute_log_cpm(count_matrix)
 
 
 _MIRTOP_META_COLS = [
