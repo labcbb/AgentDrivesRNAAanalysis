@@ -303,13 +303,17 @@ class ChatClient:
                 raise last_error from exc
             except urllib.error.URLError as exc:
                 reason = getattr(exc, "reason", exc)
-                last_error = RuntimeError(f"LLM connection error: {reason}")
+                last_error = RuntimeError(
+                    f"LLM connection error: {reason} [url={_safe_url(url)}]"
+                )
                 if attempt < _LLM_MAX_RETRIES:
                     self._retry_sleep(attempt)
                     continue
                 raise last_error from exc
             except TimeoutError as exc:
-                last_error = RuntimeError(f"LLM connection error: timed out ({exc})")
+                last_error = RuntimeError(
+                    f"LLM connection error: timed out ({exc}) [url={_safe_url(url)}]"
+                )
                 if attempt < _LLM_MAX_RETRIES:
                     self._retry_sleep(attempt)
                     continue
