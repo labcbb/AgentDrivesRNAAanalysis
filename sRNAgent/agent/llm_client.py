@@ -137,9 +137,42 @@ def _safe_url(url: str) -> str:
     return urlunsplit((parts.scheme, host, parts.path, "", ""))
 
 
+def _is_minimax_host(url: str) -> bool:
+    return (urlsplit(url).hostname or "").lower() in _MINIMAX_HOSTS
+
+
+# MiniMax answers a request whose key it read but rejected with "invalid api
+# key", and a request whose key it did not recognise at all with "Please carry
+# the API secret key in the 'X-Api-Key' field".  The two need different
+# answers, and the CN and Global platforms run separate accounts whose keys do
+# not work on each other's host -- the usual cause of the first.
+_MINIMAX_KEY_REJECTED_HINT = (
+    "Key 已被 MiniMax 读到但被拒绝。国内版 (platform.minimaxi.com) 与国际版 "
+    "(platform.minimax.io) 是两套独立账号，Key 不能互换：国内版 Key 请配 "
+    "https://api.minimaxi.com/anthropic，国际版 Key 请配 "
+    "https://api.minimax.io/anthropic；并确认 Key 未过期/未撤销。"
+)
+_MINIMAX_KEY_UNRECOGNISED_HINT = (
+    "MiniMax 没认出这个 Key：可能格式不对、粘贴时被截断或带入了多余字符，"
+    "也可能请求头没带上。请在 Config 页面重新完整粘贴 Key 后再测。"
+)
+
+
+def _minimax_auth_hint(detail: str) -> str:
+    """Pick the hint that matches what MiniMax said about the key."""
+    if "invalid api key" in detail.lower():
+        return _MINIMAX_KEY_REJECTED_HINT
+    return _MINIMAX_KEY_UNRECOGNISED_HINT
+
+
 # MiniMax serves OpenAI-compatible calls at /v1 and Anthropic-compatible calls
-# at /anthropic — the same host, two different path prefixes.
-_MINIMAX_HOSTS = frozenset({"api.minimaxi.com", "api.minimax.io"})
+# at /anthropic — the same host, two different path prefixes.  The list covers
+# every host MiniMax serves the API on, because a host that is missing from it
+# silently skips the path rewrite and lands on the plain-text "404 page not
+# found" body instead.
+_MINIMAX_HOSTS = frozenset({
+    "api.minimaxi.com", "api.minimax.io", "api.minimax.cn", "api.minimax.chat",
+})
 _MINIMAX_PATH_SUFFIXES = (
     "/v1/messages",
     "/v1/chat/completions",
@@ -294,8 +327,11 @@ class ChatClient:
                         raise last_error from exc
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
+                message = f"LLM HTTP {exc.code}: {detail}"
+                if exc.code in (401, 403) and _is_minimax_host(url):
+                    message = f"{message} — {_minimax_auth_hint(detail)}"
                 last_error = RuntimeError(
-                    f"LLM HTTP {exc.code}: {detail} [url={_safe_url(url)}]"
+                    f"{message} [url={_safe_url(url)}]"
                 )
                 if self._transient_http(exc.code) and attempt < _LLM_MAX_RETRIES:
                     self._retry_sleep(attempt)

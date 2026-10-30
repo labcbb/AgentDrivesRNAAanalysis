@@ -46,8 +46,12 @@ def _safe_url(url: str) -> str:
 
 # MiniMax serves OpenAI-compatible calls at /v1 and Anthropic-compatible calls
 # at /anthropic — the same host, two different path prefixes. Keep in sync with
-# sRNAgent/agent/llm_client.py::_minimax_base.
-_MINIMAX_HOSTS = frozenset({"api.minimaxi.com", "api.minimax.io"})
+# sRNAgent/agent/llm_client.py::_minimax_base.  A host that is missing from
+# this set silently skips the path rewrite and lands on the plain-text
+# "404 page not found" body instead.
+_MINIMAX_HOSTS = frozenset({
+    "api.minimaxi.com", "api.minimax.io", "api.minimax.cn", "api.minimax.chat",
+})
 _MINIMAX_PATH_SUFFIXES = (
     "/v1/messages",
     "/v1/chat/completions",
@@ -56,6 +60,30 @@ _MINIMAX_PATH_SUFFIXES = (
     "/messages",
     "/v1",
 )
+
+
+def _is_minimax_host(url: str) -> bool:
+    return (urlsplit(url).hostname or "").lower() in _MINIMAX_HOSTS
+
+
+# Keep in sync with sRNAgent/agent/llm_client.py::_minimax_auth_hint.
+_MINIMAX_KEY_REJECTED_HINT = (
+    "Key 已被 MiniMax 读到但被拒绝。国内版 (platform.minimaxi.com) 与国际版 "
+    "(platform.minimax.io) 是两套独立账号，Key 不能互换：国内版 Key 请配 "
+    "https://api.minimaxi.com/anthropic，国际版 Key 请配 "
+    "https://api.minimax.io/anthropic；并确认 Key 未过期/未撤销。"
+)
+_MINIMAX_KEY_UNRECOGNISED_HINT = (
+    "MiniMax 没认出这个 Key：可能格式不对、粘贴时被截断或带入了多余字符，"
+    "也可能请求头没带上。请在 Config 页面重新完整粘贴 Key 后再测。"
+)
+
+
+def _minimax_auth_hint(detail: str) -> str:
+    """Pick the hint that matches what MiniMax said about the key."""
+    if "invalid api key" in detail.lower():
+        return _MINIMAX_KEY_REJECTED_HINT
+    return _MINIMAX_KEY_UNRECOGNISED_HINT
 
 
 def _minimax_base(base_url: str, protocol: str) -> str:
@@ -220,6 +248,8 @@ def forward_chat(body: dict[str, Any]) -> dict[str, Any]:
             msg = parsed.get("error", {}).get("message") or parsed.get("message") or detail
         except json.JSONDecodeError:
             msg = detail or str(exc)
+        if exc.code in (401, 403) and _is_minimax_host(url):
+            msg = f"{msg} — {_minimax_auth_hint(detail)}"
         return {"ok": False, "error": f"HTTP {exc.code}: {msg} (url={_safe_url(url)})"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{exc} (url={_safe_url(url)})"}
