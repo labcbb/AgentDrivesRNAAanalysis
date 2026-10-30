@@ -304,16 +304,12 @@ print(f"tRNA BED:   {result['trna_bed']}")
 ```python
 import sRNAgent as sa
 
-# Download GTF first, then build
-sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
+# The tool downloads the Ensembl GTF itself and writes the filtered GTF.
 result = sa.reference.build_trax_human_gtf(output_dir="ref")
 print(f"tRAX GTF: {result['trax_gtf']}")
 
-# Or build from existing GTF
-result = sa.reference.build_trax_human_gtf(
-    output_dir="ref",
-    gtf_path="ref/gencode.v50.primary_assembly.annotation.gtf.gz",
-)
+# Optionally download the raw GTF separately (the tool does not consume a local GTF path).
+sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
 ```
 
 sa.reference.list_species()

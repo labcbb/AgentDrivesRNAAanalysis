@@ -325,9 +325,10 @@ zcat ref/mature.fa.gz | head -2
 import sRNAgent as sa
 
 # 比对 trimmed sRNA-seq 到 miRNA 参考序列
-result = sa.alignment.bowtie(
-    "S1",
-    fq1="trimmed/S1_trimmed.fastq.gz",
+# 注意：bowtie 读取 adata.obs["trimmed_path"]（回退到 adata.obs["fastq_path"]），
+# 索引需先用 sa.alignment.bowtie_build 建立在 adata.uns["genome_index"] 上。
+adata = sa.alignment.bowtie(
+    adata,
     index_basename="ref/mature_hsa",  # 需要先 bowtie_build
     total_mismatches=0,
     m=1,
@@ -426,25 +427,22 @@ print(f"Detailed out:  {result['trna_detailed']}")
 
 ### 12. 构建 tRAX 小 RNA GTF 注释
 
-从 GENCODE/Ensembl GTF 中提取 tRAX 定量所需的小 RNA 特征（miRNA、rRNA、snRNA、snoRNA 等）。需先下载 GTF：
+从 GENCODE/Ensembl GTF 中提取 tRAX 定量所需的小 RNA 特征（miRNA、rRNA、snRNA、snoRNA 等）。
+
+工具会**自行下载** Ensembl GTF 并写出过滤后的 GTF，不需要（也无法）传入已有的 GTF 路径：
 
 ```python
-# 先下载 GTF
-sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
-
-# 构建 tRAX 专用 GTF
 result = sa.reference.build_trax_human_gtf(output_dir="ref")
 print(f"tRAX GTF: {result['trax_gtf']}")
-# tRAX GTF: ref/trax_human.gtf
+# tRAX GTF: ref/hg38-genes.gtf
 ```
 
-**CORRECT — 从已有的 GTF 文件直接构建（不依赖 download_gtf）：**
+参数：`output_dir`（输出目录，默认 `"references"`）、`output_name`（过滤后文件名，默认 `"hg38-genes.gtf"`）、`assembly`（默认 `"GRCh38"`）、`jobs`（下载线程，默认 4）、`force`（覆盖重建）。
+
+如需先单独下载原始 GTF，再查看来源文件：
 
 ```python
-result = sa.reference.build_trax_human_gtf(
-    output_dir="ref",
-    gtf_path="ref/gencode.v50.primary_assembly.annotation.gtf.gz",
-)
+sa.reference.download_gtf("homo_sapiens", output_dir="ref", jobs=4)
 ```
 
 构建的 GTF 包含以下特征类型：``Mt_rRNA``、``miRNA``、``misc_RNA``、``rRNA``、``snRNA``、``snoRNA``、``ribozyme``、``sRNA``、``scaRNA``。
@@ -468,7 +466,10 @@ result = sa.reference.build_trax_human_gtf(
  "trna_name_map":      "ref/hg38-tRNAs_name_map.txt"}
 
 # build_trax_human_gtf
-{"trax_gtf": "ref/trax_human.gtf"}
+# source_gtf_gz 是从 Ensembl 列表里自动挑选的 GTF 文件名（随 Ensembl 发布版本变化）；
+# trax_gtf 是过滤后的输出文件名，由 output_name 决定（默认 hg38-genes.gtf）。
+{"source_gtf_gz": "ref/<ensembl>.gtf.gz",
+ "trax_gtf":      "ref/hg38-genes.gtf"}
 ```
 
 ## Critical API Reference
