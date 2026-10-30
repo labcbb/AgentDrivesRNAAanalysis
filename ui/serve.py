@@ -32,6 +32,18 @@ def normalize_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
+def _safe_url(url: str) -> str:
+    """Endpoint without credentials or query string, safe to show in errors.
+
+    Keep in sync with sRNAgent/agent/llm_client.py::_safe_url.
+    """
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
 # MiniMax serves OpenAI-compatible calls at /v1 and Anthropic-compatible calls
 # at /anthropic — the same host, two different path prefixes. Keep in sync with
 # sRNAgent/agent/llm_client.py::_minimax_base.
@@ -208,9 +220,9 @@ def forward_chat(body: dict[str, Any]) -> dict[str, Any]:
             msg = parsed.get("error", {}).get("message") or parsed.get("message") or detail
         except json.JSONDecodeError:
             msg = detail or str(exc)
-        return {"ok": False, "error": f"HTTP {exc.code}: {msg}"}
+        return {"ok": False, "error": f"HTTP {exc.code}: {msg} (url={_safe_url(url)})"}
     except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "error": f"{exc} (url={_safe_url(url)})"}
 
 
 def forward_agent_chat(body: dict[str, Any]) -> dict[str, Any]:
