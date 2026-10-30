@@ -1,0 +1,20 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "fastq-download-output-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["fastq-dl-srna"]},
+      "selector": {
+        "skills": ["fastq-dl-srna"],
+        "title_patterns": ["下载|download|fetch"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "outputs": ["raw_fastq"]
+      }
+    }
+  ]
+}

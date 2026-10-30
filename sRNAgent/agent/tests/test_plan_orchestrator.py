@@ -2773,3 +2773,217 @@ def test_restored_plan_repair_keeps_the_de_step_behind_the_group_gate():
         )
     }
     assert "de" in blocked
+
+
+# --------------------------------------------------------------------------
+# Regression tests for the non-miRNA assays.
+#
+# piRNA, tDR/tRF and fragmentomics run through the same plan machinery, so
+# they inherit the same ordering defects: a quantification that publishes no
+# artifact leaves the differential analysis unordered, and two modalities
+# sharing the differential-analysis skill cross-link their counts.
+# --------------------------------------------------------------------------
+
+def _compile_plan(steps: list, query: str) -> list:
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    return _enforce_workflow_contracts(
+        steps, skill_registry=registry, user_query=query, extra_context="",
+    )
+
+
+def _pirna_plan() -> list:
+    return _compile_plan(
+        [
+            {"id": "1", "title": "下载SRP261717 FASTQ", "skill": "fastq-dl-srna"},
+            {"id": "2", "title": "下载参考并构建索引", "skill": "reference-download"},
+            {"id": "3", "title": "完成 small-RNA 参考序列比对", "skill": "alignment-srna"},
+            {"id": "4", "title": "piRNA 定量", "skill": "samtools_idxstats"},
+            {"id": "5", "title": "完成 piRNA 差异分析", "skill": "differential-analysis"},
+        ],
+        "完成 piRNA 定量和差异分析",
+    )
+
+
+def _tdr_plan() -> list:
+    return _compile_plan(
+        [
+            {"id": "1", "title": "下载SRP261717 FASTQ", "skill": "fastq-dl-srna"},
+            {"id": "2", "title": "完成批量接头修剪与FASTQ质控", "skill": "fastq-qc"},
+            {"id": "3", "title": "tRAX 定量 tDR", "skill": "trna-fragment-quantification-with-trax"},
+            {"id": "4", "title": "完成 tDR 差异分析", "skill": "differential-analysis"},
+        ],
+        "用 tRAX 定量 tDR 并做差异分析",
+    )
+
+
+def _fragmentomics_plan() -> list:
+    return _compile_plan(
+        [
+            {"id": "1", "title": "下载参考并构建索引", "skill": "reference-download"},
+            {"id": "2", "title": "完成参考基因组比对", "skill": "alignment-srna"},
+            {"id": "3", "title": "运行片段组学分析", "skill": "fragment-analysis"},
+            {"id": "4", "title": "片段组学 差异分析", "skill": "differential-analysis"},
+        ],
+        "完成片段组学定量和差异分析",
+    )
+
+
+def test_pirna_quantification_publishes_counts_for_the_differential_analysis():
+    planned = _pirna_plan()
+    idxstats = _find_step(planned, skill="samtools_idxstats")
+    de = _find_step(planned, skill="differential-analysis", title="完成 piRNA 差异分析")
+
+    assert idxstats["outputs"] == ["raw_counts"]
+    assert "raw_counts" in de["inputs"]
+    assert idxstats["id"] in de["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+def test_pirna_differential_analysis_waits_for_the_group_confirmation():
+    from sRNAgent.agent.plan_state import PlanGraph
+
+    planned = _pirna_plan()
+    gate = _find_step(planned, skill="differential-analysis", title="确认差异分析样本分组")
+    de = _find_step(planned, skill="differential-analysis", title="完成 piRNA 差异分析")
+
+    gate["status"] = "awaiting_approval"
+    graph = PlanGraph({"steps": planned})
+    blocked = {
+        str(step.get("id")) for step in graph.blocked_pending(
+            pending="pending", completed={"done", "skipped"},
+        )
+    }
+    assert de["id"] in blocked
+
+
+def test_tdr_quantification_publishes_counts_and_runs_after_trimming():
+    planned = _tdr_plan()
+    trax = _find_step(planned, skill="trna-fragment-quantification-with-trax")
+    trim = _find_step(planned, skill="fastq-qc", title="完成 tRAX 前的 FASTQ 质控与修剪")
+    de = _find_step(planned, skill="differential-analysis", title="完成 tDR 差异分析")
+
+    assert trax["outputs"] == ["raw_counts"]
+    assert "raw_counts" in de["inputs"]
+    assert trax["id"] in de["depends_on"]
+    # tRAX consumes trimmed FASTQ, so its trimming stage must come first.
+    assert trim["id"] in trax["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+def test_tdr_count_validation_follows_the_quantification():
+    planned = _tdr_plan()
+    trax = _find_step(planned, skill="trna-fragment-quantification-with-trax")
+    check = _find_step(planned, skill="", title="核查现有 raw counts 矩阵")
+
+    assert check["inputs"] == ["raw_counts"]
+    assert trax["id"] in check["depends_on"]
+
+
+def test_planner_count_check_inherits_the_counts_dependency():
+    """The planner's own count check is ordered like an inserted one."""
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "定量已知miRNA", "skill": "mirdeep2-mirna"},
+            {"id": "2", "title": "核查现有 raw counts 矩阵", "skill": ""},
+            {"id": "3", "title": "完成非配对miRNA差异分析", "skill": "differential-analysis"},
+        ],
+        "完成 miRNA 定量和差异分析",
+    )
+    mirna = _find_step(planned, skill="mirdeep2-mirna")
+    check = _find_step(planned, skill="", title="核查现有 raw counts 矩阵")
+
+    assert check["inputs"] == ["raw_counts"]
+    assert mirna["id"] in check["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+def test_fragmentomics_quantification_publishes_its_own_counts():
+    planned = _fragmentomics_plan()
+    quant = _find_step(planned, skill="fragment-analysis", title="运行片段组学分析")
+    de = _find_step(planned, skill="differential-analysis", title="片段组学 差异分析")
+
+    assert quant["outputs"] == ["fragmentomics_counts"]
+    assert de["inputs"] == ["group_design_confirmed", "fragmentomics_counts"]
+    assert quant["id"] in de["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+def test_fragmentomics_bam_validation_follows_the_alignment():
+    planned = _fragmentomics_plan()
+    alignment = _find_step(planned, skill="alignment-srna")
+    validate = _find_step(
+        planned, skill="fragment-analysis", title="核验 fragmentomics 全基因组 BAM",
+    )
+
+    assert alignment["outputs"] == ["bam"]
+    assert alignment["id"] in validate["depends_on"]
+
+
+def test_two_differential_analyses_do_not_cross_link_their_counts():
+    """The srna and the fragmentomics analyses read different count matrices."""
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "定量已知miRNA", "skill": "mirdeep2-mirna"},
+            {"id": "2", "title": "完成非配对miRNA差异分析", "skill": "differential-analysis"},
+            {"id": "3", "title": "运行片段组学分析", "skill": "fragment-analysis"},
+            {"id": "4", "title": "片段组学 差异分析（limma-voom）", "skill": "differential-analysis"},
+        ],
+        "完成 miRNA 与片段组学定量和差异分析",
+    )
+
+    mirna = _find_step(planned, skill="mirdeep2-mirna")
+    fragment = _find_step(planned, skill="fragment-analysis", title="运行片段组学分析")
+    srna_de = _find_step(planned, skill="differential-analysis", title="完成非配对miRNA差异分析")
+    fragment_de = _find_step(planned, skill="differential-analysis", title="片段组学 差异分析")
+
+    assert srna_de["inputs"] == ["group_design_confirmed", "raw_counts"]
+    assert fragment_de["inputs"] == ["group_design_confirmed", "fragmentomics_counts"]
+    assert mirna["id"] in srna_de["depends_on"]
+    assert fragment["id"] in fragment_de["depends_on"]
+    assert fragment["id"] not in srna_de["depends_on"]
+    assert mirna["id"] not in fragment_de["depends_on"]
+    assert _backward_edges(planned) == []
+
+
+def test_small_rna_differential_analysis_waits_for_every_assay_quantification():
+    """miRNA, piRNA and tRNA each write into the shared srna counts matrix."""
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "定量已知miRNA", "skill": "mirdeep2-mirna"},
+            {"id": "2", "title": "piRNA 定量", "skill": "samtools_idxstats"},
+            {"id": "3", "title": "tRAX 定量 tDR", "skill": "trna-fragment-quantification-with-trax"},
+            {"id": "4", "title": "完成小RNA差异分析", "skill": "differential-analysis"},
+        ],
+        "完成 miRNA、piRNA、tRNA 定量和差异分析",
+    )
+
+    de = _find_step(planned, skill="differential-analysis", title="完成小RNA差异分析")
+    producers = {
+        _find_step(planned, skill=skill)["id"]
+        for skill in (
+            "mirdeep2-mirna", "samtools_idxstats", "trna-fragment-quantification-with-trax",
+        )
+    }
+
+    assert producers <= set(de["depends_on"])
+    assert _backward_edges(planned) == []
+
+
+def test_isomir_differential_analysis_reads_the_isomir_counts():
+    """The isomiR counts live in their own AnnData, not the srna one."""
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "运行 mirtop", "skill": "isomir-quantification"},
+            {"id": "2", "title": "完成 isomiR 差异分析", "skill": "differential-analysis"},
+        ],
+        "做 isomiR 定量和差异分析",
+    )
+    mirtop = _find_step(planned, skill="isomir-quantification", title="运行 mirtop")
+    de = _find_step(planned, skill="differential-analysis", title="完成 isomiR 差异分析")
+
+    assert de["inputs"] == ["group_design_confirmed", "isomir_counts"]
+    assert mirtop["id"] in de["depends_on"]
+    assert _backward_edges(planned) == []

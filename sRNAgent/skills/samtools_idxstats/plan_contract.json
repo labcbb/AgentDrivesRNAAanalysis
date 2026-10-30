@@ -1,0 +1,21 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "pirna-quantification-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["samtools_idxstats"]},
+      "selector": {
+        "skills": ["samtools_idxstats"],
+        "title_patterns": ["(?:定量|quantif)|piRNA|idxstats"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["bam"],
+        "outputs": ["raw_counts"]
+      }
+    }
+  ]
+}

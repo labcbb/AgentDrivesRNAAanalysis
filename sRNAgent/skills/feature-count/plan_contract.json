@@ -47,6 +47,21 @@
           "edit_hint": "若已有证据支持建议，可回复“可以”采用；若未记录，请补充建库信息或直接回复 `strandedness=unstranded/forward/reverse`。"
         }
       }
+    },
+    {
+      "id": "feature-count-quantification-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["feature-count"]},
+      "selector": {
+        "skills": ["feature-count"],
+        "title_patterns": ["(?:定量|quantif)|featureCount|counts?"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["bam", "strandedness_confirmed"],
+        "outputs": ["raw_counts"]
+      }
     }
   ]
 }

@@ -51,7 +51,7 @@ def _artifact_names(value: Any) -> List[str]:
     return names
 
 
-def _merge_artifact_names(existing: Any, declared: Any) -> List[str]:
+def merge_artifact_names(existing: Any, declared: Any) -> List[str]:
     """Union of a step's own artifacts and the ones a contract declares.
 
     A contract states the artifacts a step *must* consume and produce; it
@@ -59,6 +59,21 @@ def _merge_artifact_names(existing: Any, declared: Any) -> List[str]:
     planner's list would silently delete edges it declared, so keep both.
     """
     return _artifact_names([*_artifact_names(existing), *_artifact_names(declared)])
+
+
+def _reaches(start: str, target: str, edges: Mapping[str, Iterable[str]]) -> bool:
+    """True when ``target`` is reachable from ``start`` along dependency edges."""
+    stack = [start]
+    seen: set[str] = set()
+    while stack:
+        node = stack.pop()
+        if node == target:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(edges.get(node, ()))
+    return False
 
 
 def wire_artifact_dependencies(steps: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -72,22 +87,26 @@ def wire_artifact_dependencies(steps: Iterable[Dict[str, Any]]) -> List[Dict[str
         for artifact in _artifact_names(step.get("outputs")):
             producers.setdefault(artifact, []).append((index, step_id))
 
+    # A consumer must wait for *every* producer of the artifacts it reads.
+    # The small-RNA counts matrix is assembled by one step per assay -- miRNA,
+    # piRNA and tRNA each write their own block into the shared AnnData --
+    # so a differential analysis over it is only valid once all of them ran.
+    edges: Dict[str, List[str]] = {}
     for index, step in enumerate(wired):
         step_id = str(step.get("id") or "").strip()
         if not step_id:
             continue
         dependencies = _artifact_names(step.get("depends_on"))
         for artifact in _artifact_names(step.get("inputs")):
-            candidates = [item for item in producers.get(artifact, []) if item[1] != step_id]
-            if not candidates:
-                continue
-            earlier = [item for item in candidates if item[0] < index]
-            # Prefer the closest declared producer before this consumer. If a
-            # malformed/restored plan placed the producer later, wire it
-            # anyway and let the topological sort repair the visible order.
-            producer = (earlier[-1] if earlier else candidates[0])[1]
-            if producer not in dependencies:
+            for _, producer in producers.get(artifact, []):
+                if producer == step_id or producer in dependencies:
+                    continue
+                if _reaches(producer, step_id, edges):
+                    # Wiring this edge would close a cycle and leave a step
+                    # that can never become runnable.  Keep the graph acyclic.
+                    continue
                 dependencies.append(producer)
+        edges[step_id] = dependencies
         if dependencies:
             step["depends_on"] = dependencies
 
@@ -271,6 +290,15 @@ def _select_steps(steps: List[Dict[str, Any]], selector: Dict[str, Any]) -> List
     ]
     if selector.get("exclude_workflow_contracts"):
         targets = [step for step in targets if not str(step.get("workflowContract") or "").strip()]
+    excluded = _replacement_patterns({"replaces": {"title_patterns": selector.get("exclude_title_patterns")}})
+    if excluded:
+        # Two workflows can share one skill -- the differential-analysis skill
+        # runs once per modality.  The exclusion keeps a contract bound to the
+        # modality it owns instead of the first step that happens to match.
+        targets = [
+            step for step in targets
+            if not any(pattern.search(str(step.get("title") or "")) for pattern in excluded)
+        ]
     patterns = _replacement_patterns({"replaces": {"title_patterns": selector.get("title_patterns")}})
     if patterns:
         pattern_matches = [
@@ -329,8 +357,8 @@ def apply_workflow_nodes(
                             contracts.append({"id": contract_id, **dict(node.get("execution") or {})})
                 if kind == "bind_io" or isinstance(node.get("io"), dict):
                     io = node.get("io") if isinstance(node.get("io"), dict) else {}
-                    target["inputs"] = _merge_artifact_names(target.get("inputs"), io.get("inputs"))
-                    target["outputs"] = _merge_artifact_names(target.get("outputs"), io.get("outputs"))
+                    target["inputs"] = merge_artifact_names(target.get("inputs"), io.get("inputs"))
+                    target["outputs"] = merge_artifact_names(target.get("outputs"), io.get("outputs"))
             continue
         if kind == "order":
             placement = node.get("placement") if isinstance(node.get("placement"), dict) else {}
@@ -432,5 +460,5 @@ class WorkflowCompiler:
 
 __all__ = [
     "WORKFLOW_SCHEMA", "ArtifactState", "WorkflowCompiler", "apply_workflow_nodes", "artifact_inventory", "artifact_state",
-    "load_workflow_nodes", "wire_artifact_dependencies",
+    "load_workflow_nodes", "merge_artifact_names", "wire_artifact_dependencies",
 ]

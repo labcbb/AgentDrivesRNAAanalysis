@@ -6,13 +6,28 @@
       "id": "trim-raw-fastq-before-trax",
       "kind": "stage",
       "activation": {"requires": ["raw_fastq"], "missing": ["trimmed_fastq"]},
-      "placement": {"before_skills": ["trax_quantification"]},
+      "placement": {"before_skills": ["trna-fragment-quantification-with-trax", "trax_quantification"]},
       "step": {
         "title": "完成 tRAX 前的 FASTQ 质控与修剪",
         "goal": "先运行 sa.fastq.cutadapt，生成 clean_fastq_path / trimmed_path；确认 adapter 与长度过滤后，再将 clean FASTQ 交给 tRAX。",
         "skill": "fastq-qc",
         "inputs": ["trim_config_confirmed"],
         "outputs": ["trimmed_fastq"]
+      }
+    },
+    {
+      "id": "trax-quantification-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["trna-fragment-quantification-with-trax"]},
+      "selector": {
+        "skills": ["trna-fragment-quantification-with-trax"],
+        "title_patterns": ["(?:定量|quantif)|tRAX|tRF|tDR"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["trimmed_fastq", "reference_genome_fasta"],
+        "outputs": ["raw_counts"]
       }
     }
   ]

@@ -70,11 +70,42 @@
       "selector": {
         "skills": ["differential-analysis"],
         "title_patterns": ["(?:差异分析|de\\b|differential)"],
+        "exclude_title_patterns": ["fragmentomics|片段组学|isomiR|isomir"],
         "exclude_workflow_contracts": true,
         "select": "first"
       },
       "io": {
         "inputs": ["group_design_confirmed", "raw_counts"],
+        "outputs": ["differential_results", "de_annotated_adata"]
+      }
+    },
+    {
+      "id": "fragmentomics-de-analysis-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["fragment-analysis"]},
+      "selector": {
+        "skills": ["differential-analysis"],
+        "title_patterns": ["fragmentomics|片段组学"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["group_design_confirmed", "fragmentomics_counts"],
+        "outputs": ["differential_results", "de_annotated_adata"]
+      }
+    },
+    {
+      "id": "isomir-de-analysis-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["isomir-quantification"]},
+      "selector": {
+        "skills": ["differential-analysis"],
+        "title_patterns": ["isomiR|isomir"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["group_design_confirmed", "isomir_counts"],
         "outputs": ["differential_results", "de_annotated_adata"]
       }
     }

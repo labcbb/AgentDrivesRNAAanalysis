@@ -26,7 +26,10 @@ from .plan_lifecycle import PlanLifecycle, clone_plan
 from .context import normalize_text_payload
 from .intent_router import IntentRouter, RouteIntent, is_gate_actionable_reply, is_plan_approval_confirm
 from .tools import list_available_skills, rank_skill_matches, resolve_skill_query
-from .workflow_contracts import WorkflowCompiler, apply_workflow_nodes, load_workflow_nodes, wire_artifact_dependencies
+from .workflow_contracts import (
+    WorkflowCompiler, apply_workflow_nodes, load_workflow_nodes, merge_artifact_names,
+    wire_artifact_dependencies,
+)
 
 if TYPE_CHECKING:
     from .srn_agent import SRNAgent, ProgressCallback, CodeApprovalCallback
@@ -157,6 +160,14 @@ _REBUILT_STEP_SKILLS = frozenset({
     "mirdeep2-mirna",
     "isomir-quantification",
 })
+
+# The count validation steps read the matrix the quantification produced, so
+# each of them must consume the artifact of its own modality.
+_COUNT_CHECK_ARTIFACTS = {
+    "核查现有 raw counts 矩阵": "raw_counts",
+    "核查 fragmentomics 定量矩阵": "fragmentomics_counts",
+    "核查 isomiR 定量矩阵": "isomir_counts",
+}
 _EXPLICIT_DE_REQUEST_RE = re.compile(
     r"(?:运行|执行|进行|完成|重跑|重新跑|run|perform|execute|rerun).{0,24}"
     r"(?:差异分析|differential(?:-analysis)?|limma|DE)"
@@ -1864,6 +1875,17 @@ def _expand_plan_prerequisites(
                 for dependency in dependencies
                 if str(dependency).strip()
             ]
+
+    # A count validation reads the matrix the quantification produced, so it
+    # must follow it.  The planner's own check step keeps its identity but
+    # carries the same dependency an inserted one would have.
+    for item in expanded:
+        artifact = _COUNT_CHECK_ARTIFACTS.get(str(item.get("title") or "").strip())
+        if not artifact:
+            continue
+        merged = merge_artifact_names(item.get("inputs"), [artifact])
+        if merged:
+            item["inputs"] = merged
 
     return expanded or steps
 

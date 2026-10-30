@@ -1,0 +1,21 @@
+{
+  "schema": "srnagent.workflow/v2",
+  "version": 2,
+  "nodes": [
+    {
+      "id": "alignment-output-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["alignment-srna"]},
+      "selector": {
+        "skills": ["alignment-srna"],
+        "title_patterns": ["比对|align|bowtie"],
+        "exclude_workflow_contracts": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["trimmed_fastq", "reference_genome_fasta", "bowtie_genome_index"],
+        "outputs": ["bam"]
+      }
+    }
+  ]
+}
