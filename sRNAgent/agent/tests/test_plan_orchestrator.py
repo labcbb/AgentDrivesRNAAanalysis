@@ -2705,3 +2705,71 @@ def test_expand_plan_prerequisites_does_not_duplicate_the_planner_count_check():
 
     titles = [str(step.get("title")) for step in planned]
     assert titles.count("核查现有 raw counts 矩阵") == 1
+
+
+def test_restored_plan_gets_its_artifact_edges_back():
+    """A persisted plan without artifact edges must be repaired on restore."""
+    from sRNAgent.agent.plan_orchestrator import _repair_plan_artifact_graph
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    persisted = [
+        {"id": "download", "title": "下载SRP261717 FASTQ并保留样本元数据",
+         "skill": "fastq-dl-srna", "status": "done"},
+        {"id": "gate", "title": "确认差异分析样本分组", "skill": "differential-analysis",
+         "status": "awaiting_approval", "workflowContract": "confirm-groups-before-de",
+         "outputs": ["group_design_confirmed"]},
+        {"id": "quant", "title": "定量已知miRNA", "skill": "mirdeep2-mirna",
+         "status": "done"},
+        {"id": "de", "title": "完成非配对miRNA差异分析", "skill": "differential-analysis",
+         "status": "pending"},
+        {"id": "predict", "title": "预测候选miRNA靶基因",
+         "skill": "mirna-target-prediction", "status": "pending"},
+    ]
+
+    repaired = _repair_plan_artifact_graph(
+        persisted, skill_registry=registry, user_query="定量miRNA并做差异分析",
+    )
+
+    by_id = {str(step.get("id")): step for step in repaired}
+    assert set(by_id) == {str(step.get("id")) for step in persisted}
+    assert [str(step.get("id")) for step in repaired].count("de") == 1
+
+    de = by_id["de"]
+    assert de["inputs"] == ["group_design_confirmed", "raw_counts"]
+    assert "gate" in de["depends_on"]
+    assert "quant" in de["depends_on"]
+    # The restored statuses must survive the repair.
+    assert by_id["download"]["status"] == "done"
+    assert by_id["gate"]["status"] == "awaiting_approval"
+    assert by_id["de"]["status"] == "pending"
+
+
+def test_restored_plan_repair_keeps_the_de_step_behind_the_group_gate():
+    from sRNAgent.agent.plan_orchestrator import _repair_plan_artifact_graph
+    from sRNAgent.agent.plan_state import PlanGraph
+    from sRNAgent.skill_registry import SkillRegistry
+
+    registry = SkillRegistry(Path(__file__).resolve().parents[2] / "skills")
+    registry.load()
+    repaired = _repair_plan_artifact_graph(
+        [
+            {"id": "gate", "title": "确认差异分析样本分组", "skill": "differential-analysis",
+             "status": "awaiting_approval", "workflowContract": "confirm-groups-before-de",
+             "outputs": ["group_design_confirmed"]},
+            {"id": "quant", "title": "定量已知miRNA", "skill": "mirdeep2-mirna",
+             "status": "done"},
+            {"id": "de", "title": "完成非配对miRNA差异分析", "skill": "differential-analysis",
+             "status": "pending"},
+        ],
+        skill_registry=registry, user_query="定量miRNA并做差异分析",
+    )
+
+    graph = PlanGraph({"steps": repaired})
+    blocked = {
+        str(step.get("id")) for step in graph.blocked_pending(
+            pending="pending", completed={"done", "skipped"},
+        )
+    }
+    assert "de" in blocked

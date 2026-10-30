@@ -547,6 +547,49 @@ def _enforce_workflow_contracts(
     return _order_de_workflow_steps(constrained)
 
 
+def _repair_plan_artifact_graph(
+    steps: List[Dict[str, Any]],
+    *,
+    skill_registry: Any,
+    user_query: str,
+    available_artifacts: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Re-derive the artifact edges of a persisted plan.
+
+    A plan persisted by an older build can lack the artifact inputs and
+    outputs that express its data dependencies.  The graph then has no edge
+    to order it by, and a consumer -- differential analysis, for instance --
+    becomes runnable ahead of the producer it needs.
+
+    The contracts' artifact bindings are re-applied because they *merge* the
+    declared artifacts into the existing steps: no step is added, removed,
+    or renumbered, so the restored statuses and IDs stay valid.  Bindings
+    that also replace a step are skipped here; replacing a step that already
+    ran would discard its result.
+    """
+    if skill_registry is None:
+        return steps
+    entry_skills = [str(step.get("skill") or "") for step in steps if isinstance(step, dict)]
+    contracts = _load_skill_plan_contracts(
+        skill_registry, user_query, step_skills=entry_skills,
+    )
+    bindings = [
+        node for node in contracts
+        if isinstance(node, dict)
+        and str(node.get("kind") or "").strip().lower() == "bind_io"
+        and not node.get("replaces")
+        and not node.get("replaces_titles")
+    ]
+    if not bindings:
+        return steps
+    planned = apply_workflow_nodes(
+        steps,
+        bindings,
+        context={"available_artifacts": list(available_artifacts or [])},
+    )
+    return _order_de_workflow_steps(planned)
+
+
 def _context_has_group_info(extra_context: str) -> bool:
     return bool(_GROUP_RE.search(extra_context or ""))
 
@@ -4219,6 +4262,19 @@ class PlanOrchestrator:
             # intentionally creates a fresh pending plan, which is correct
             # for LLM output but wrong for an interrupted persisted plan.
             plan["steps"] = scoped_steps
+            # A persisted plan can predate the artifact graph, or have been
+            # written with missing edges.  Re-apply the contracts' artifact
+            # bindings so the restored plan carries the same dependencies a
+            # fresh plan would; this merges artifacts into the existing steps
+            # and leaves their IDs and statuses untouched.
+            plan["steps"] = _repair_plan_artifact_graph(
+                plan["steps"],
+                skill_registry=getattr(self.agent, "skill_registry", None),
+                user_query=str(plan.get("goal") or user_query),
+                available_artifacts=list(dict.fromkeys([
+                    *_refresh_plan_artifact_state(plan), *(available_artifacts or []),
+                ])),
+            )
             # Repair persisted target-only plans with the same deterministic
             # compiler used for new plans. Older plans could have been
             # reordered by the DE presentation helper after target contracts
