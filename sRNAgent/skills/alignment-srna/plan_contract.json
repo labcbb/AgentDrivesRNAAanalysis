@@ -13,8 +13,23 @@
         "select": "first"
       },
       "io": {
-        "inputs": ["trimmed_fastq", "reference_genome_fasta", "bowtie_genome_index"],
+        "inputs": ["trimmed_fastq"],
         "outputs": ["bam"]
+      }
+    },
+    {
+      "id": "genome-alignment-input-contract",
+      "kind": "bind_io",
+      "activation": {"requires_skills": ["alignment-srna"]},
+      "selector": {
+        "skills": ["alignment-srna"],
+        "title_patterns": ["全基因组|参考基因组比对|完整基因组|whole[- ]?genome|genome"],
+        "exclude_workflow_contracts": true,
+        "require_title_match": true,
+        "select": "first"
+      },
+      "io": {
+        "inputs": ["reference_genome_fasta", "bowtie_genome_index"]
       }
     }
   ]

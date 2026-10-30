@@ -3089,6 +3089,90 @@ def test_every_registered_skill_declares_its_artifact_contract():
     assert missing == [], f"skills without a plan contract: {missing}"
 
 
+# --------------------------------------------------------------------------
+# Contract-content guards.
+#
+# The contract text is what the agent executes.  A wrong constant or a
+# mis-scoped artifact makes it do the wrong science, and neither shows up in
+# the plan graph.
+# --------------------------------------------------------------------------
+
+def test_adapter_preflight_names_the_sequences_the_code_recommends():
+    """The preflight must name whole adapter sequences, not truncated ones."""
+    import json
+
+    from sRNAgent.agent.plan_orchestrator import _KIT_ADAPTER_RECOMMENDATIONS
+
+    contract = json.loads(
+        (Path(__file__).resolve().parents[2] / "skills" / "fastq-qc" / "plan_contract.json")
+        .read_text(encoding="utf-8")
+    )
+    preflight = next(
+        node["preflight"]["goal"]
+        for node in contract["nodes"]
+        if node.get("preflight")
+    )
+
+    for _, sequence, _ in _KIT_ADAPTER_RECOMMENDATIONS:
+        assert sequence in preflight, f"{sequence} is recommended by the code but not named"
+        # A truncated prefix would make cutadapt leave the adapter behind.
+        assert sequence not in preflight.replace(sequence, ""), (
+            f"the preflight names a truncated form of {sequence}"
+        )
+
+
+def test_adapter_preflight_does_not_name_a_truncated_nebnext_adapter():
+    import json
+
+    contract = json.loads(
+        (Path(__file__).resolve().parents[2] / "skills" / "fastq-qc" / "plan_contract.json")
+        .read_text(encoding="utf-8")
+    )
+    preflight = next(
+        node["preflight"]["goal"]
+        for node in contract["nodes"]
+        if node.get("preflight")
+    )
+
+    full = "AGATCGGAAGAGCACACGTCTGAACTCCAGTCAC"
+    truncated = "AGATCGGAAGAGCACACGTCTGAACTC"
+    assert full in preflight
+    assert f"`{truncated}`" not in preflight
+
+
+def test_hairpin_alignment_does_not_claim_the_whole_genome_reference():
+    """The hairpin BAM comes from collapsed FASTQ against the hairpin index."""
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "折叠 trimmed FASTQ 供 isomiR hairpin 比对",
+             "skill": "isomir-quantification", "outputs": ["collapsed_fastq"]},
+            {"id": "2", "title": "hairpin Bowtie 比对重建", "skill": "alignment-srna"},
+        ],
+        "做 isomiR 定量",
+    )
+    alignment = _find_step(planned, skill="alignment-srna")
+
+    assert "collapsed_fastq" in alignment["inputs"]
+    assert "reference_genome_fasta" not in alignment["inputs"]
+    assert "bowtie_genome_index" not in alignment["inputs"]
+
+
+def test_genome_alignment_claims_the_reference_it_aligns_against():
+    planned = _compile_plan(
+        [
+            {"id": "1", "title": "下载参考数据并构建Bowtie索引", "skill": "reference-download"},
+            {"id": "2", "title": "完成参考基因组比对", "skill": "alignment-srna"},
+        ],
+        "做全基因组比对",
+    )
+    alignment = _find_step(planned, skill="alignment-srna")
+    reference = _find_step(planned, skill="reference-download")
+
+    assert "reference_genome_fasta" in alignment["inputs"]
+    assert "bowtie_genome_index" in alignment["inputs"]
+    assert reference["id"] in alignment["depends_on"]
+
+
 def test_every_registered_tool_is_documented_in_a_skill():
     import inspect
     import re
