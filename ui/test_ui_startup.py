@@ -171,3 +171,34 @@ def test_registry_hydration_is_not_half_visible_to_concurrent_callers():
     assert flag_set > hydrate_call, (
         "self._hydrated must be set after hydration completes, not before"
     )
+
+
+# --------------------------------------------------------------------------
+# 5. a send must schedule a backend state resync (no manual refresh needed)
+# --------------------------------------------------------------------------
+def test_post_send_resync_is_scheduled_after_sending():
+    source = _read("app.js")
+    assert "schedulePostSendResync" in source, (
+        "app.js must resync backend state after a send instead of relying on "
+        "the user reloading the page"
+    )
+    send_block = source.split("const streamChatId = activeChatId;", 1)[1].split("\n", 6)[0:6]
+    assert any("schedulePostSendResync(" in line for line in send_block), (
+        "the send path must schedule the resync"
+    )
+
+
+def test_post_send_resync_uses_a_short_delay_and_covers_the_stale_surfaces():
+    source = _read("app.js")
+    assert "const POST_SEND_RESYNC_MS = 3000;" in source, (
+        "the resync should fire a few seconds after the send"
+    )
+    block = source.split("async function refreshBackendStateAfterSend(chatId)", 1)[1].split("\n}", 1)[0]
+    for needed in ("loadAgentBackendStatus", "syncChatStoreFromServer", "fetchRunStatus", "KernelPanel"):
+        assert needed in block, f"the resync must refresh {needed}"
+
+
+def test_post_send_resync_timer_is_exported_for_testing():
+    source = _read("app.js")
+    assert "window.schedulePostSendResync = schedulePostSendResync;" in source
+

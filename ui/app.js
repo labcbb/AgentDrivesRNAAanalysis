@@ -105,6 +105,57 @@ const backgroundWatches = new Map();
 /** Retries for auto-chained steps that start after a brief idle gap. */
 const progressTrackingRetryTimers = new Map();
 let executionElapsedTimer = null;
+/** 发送后兜底同步：延迟一小段时间后重新拉取后端状态 / 会话列表 / 内核面板。 */
+const POST_SEND_RESYNC_MS = 3000;
+const postSendResyncTimers = new Map();
+
+/**
+ * 发送消息后延迟 POST_SEND_RESYNC_MS 触发一次兜底同步。
+ *
+ * 流式响应过程中状态可能因 SSE 帧丢失、run_report 落盘时序等原因而不同步；
+ * 与其要求用户手动刷新页面，不如在发送后自动重新拉一次服务端状态。
+ * 同一个会话重复发送会取消上一次未触发的定时器，避免堆积。
+ */
+function schedulePostSendResync(chatId) {
+  if (!chatId) return;
+  const existing = postSendResyncTimers.get(chatId);
+  if (existing != null) window.clearTimeout(existing);
+  const timer = window.setTimeout(() => {
+    postSendResyncTimers.delete(chatId);
+    void refreshBackendStateAfterSend(chatId);
+  }, POST_SEND_RESYNC_MS);
+  postSendResyncTimers.set(chatId, timer);
+}
+
+async function refreshBackendStateAfterSend(chatId) {
+  // 后端连接状态 + skill 列表（强制重探，避免命中过期缓存）。
+  try {
+    await loadAgentBackendStatus();
+  } catch {
+    // 忽略：状态刷新失败不应影响主流程。
+  }
+  // 会话列表：服务端可能刚写入了这条会话。
+  try {
+    await syncChatStoreFromServer();
+    if (chatId === activeChatId) renderRecentChats();
+  } catch {
+    // 忽略。
+  }
+  // 运行状态 + 右侧内核面板。
+  try {
+    const status = await fetchRunStatus(chatId);
+    if (status?.ok) {
+      syncRunStatusToUI(chatId, status, { messages: chatHistory });
+    }
+  } catch {
+    // 忽略。
+  }
+  try {
+    window.KernelPanel?.refresh?.({ force: true });
+  } catch {
+    // 忽略。
+  }
+}
 
 function isChatStreaming(chatId) {
   if (!chatId) return false;
@@ -2717,6 +2768,9 @@ async function initChatSessions() {
 
   applyActiveChatFromStore();
   void resumeBackgroundRunIfNeeded(activeChatId);
+  // 兜底：初始化后延迟再同步一次，确保状态栏 / 会话列表 / 内核面板都落到最新，
+  // 即使首次探测或首轮渲染因时序问题没能完成。
+  schedulePostSendResync(activeChatId);
 }
 
 function appendMarkdownInline(target, text) {
@@ -5115,6 +5169,8 @@ async function handleSend() {
 
   const streamChatId = activeChatId;
   const streamMessages = chatHistory;
+  // 兜底：发送后延迟几秒自动重新同步服务端状态，用户无需手动刷新页面。
+  schedulePostSendResync(streamChatId);
   let pending = null;
   let streamGeneration = 0;
   let runId = null;
@@ -6038,6 +6094,7 @@ updateComposerStatus();
 loadAgentBackendStatus();
 window.getActiveChatId = () => activeChatId;
 window.isAgentSending = () => isActiveChatSending();
+window.schedulePostSendResync = schedulePostSendResync;
 window.KernelPanel?.refresh?.();
 
 autoApproveToggle?.addEventListener("click", () => {
