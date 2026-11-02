@@ -8,6 +8,7 @@ import faulthandler
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -469,10 +470,43 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, directory=ROOT, **kwargs)
 
-    def end_headers(self) -> None:
+    def send_head(self) -> Any:
+        """Serve static files with revalidation headers.
+
+        Without an ETag / Cache-Control the browser applies heuristic caching
+        to Last-Modified and may keep serving a stale app.js after an edit.
+        Sending an ETag lets the client revalidate cheaply, and
+        ``Cache-Control: no-cache`` forces that revalidation on every load.
+        """
+        path = self.translate_path(self.path)
+        etag = self._compute_etag(path)
+        if etag:
+            if_none_match = self.headers.get("If-None-Match", "")
+            if etag in {tag.strip() for tag in if_none_match.split(",")}:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                return None
+        self._etag = etag
+        return super().send_head()
+
+    def _compute_etag(self, path: str) -> str:
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return ""
+        # mtime + size is enough here: these are local files edited by hand.
+        return f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+
+    def end_headers(self) -> None:  # noqa: F811
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        etag = getattr(self, "_etag", "")
+        if etag:
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
     def do_OPTIONS(self) -> None:  # noqa: N802
@@ -757,6 +791,26 @@ class Handler(SimpleHTTPRequestHandler):
             super().log_message(fmt, *args)
 
 
+def warm_up_backend() -> None:
+    """Import the sRNAgent backend once, off the request path.
+
+    The first ``/api/agent/status`` call pays a cold ``import sRNAgent`` plus
+    registry hydration (~3-23s). Doing it here moves that cost into server
+    startup so the first real browser request is served immediately.
+    """
+    started = time.time()
+    try:
+        status = forward_agent_status()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warmup] backend warm-up failed: {exc}")
+        return
+    elapsed = time.time() - started
+    if status.get("ok"):
+        print(f"[warmup] sRNAgent backend ready in {elapsed:.1f}s ({len(status.get('skills') or [])} skills)")
+    else:
+        print(f"[warmup] backend warm-up reported: {status.get('error')}")
+
+
 def main() -> None:
     # Native extensions can terminate the interpreter without a Python
     # traceback. Keep all thread stacks in stderr/captured service logs.
@@ -806,6 +860,8 @@ def main() -> None:
     print("sRNAgent    → POST /api/agent/chat  /api/agent/chat/stream  …")
     print("JupyterLab  → GET /api/jupyterlab/status  POST /api/jupyterlab/start|stop  (Overview 独立内核, 默认端口 8766)")
     print("Press Ctrl+C to stop")
+    # Warm the backend in the background so the first browser request is fast.
+    threading.Thread(target=warm_up_backend, name="srnagent-warmup", daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

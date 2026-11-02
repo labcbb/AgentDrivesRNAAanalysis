@@ -14,33 +14,86 @@
 
   const PROXY_BASE = resolveProxyBase();
 
+  // 探针缓存不能是"粘性"的：serve.py 可能远晚于页面加载才启动（或重启）。
+  // 因此缓存条目会过期，失败后还会自动重试，页面无需刷新即可自愈。
+  const PROBE_CACHE_TTL_MS = 5000;
+  const PROBE_RETRY_MIN_MS = 2000;
+  const PROBE_RETRY_MAX_MS = 15000;
+
   let proxyProbeCache = null;
+  let proxyProbeCacheAt = 0;
   let proxyProbePromise = null;
+  let proxyProbeSettled = null;
+  let proxyProbeRetryTimer = null;
+  let proxyProbeRetryDelay = PROBE_RETRY_MIN_MS;
+
+  function clearProbeRetry() {
+    if (proxyProbeRetryTimer != null) {
+      window.clearTimeout(proxyProbeRetryTimer);
+      proxyProbeRetryTimer = null;
+    }
+  }
+
+  function scheduleProbeRetry() {
+    if (proxyProbeRetryTimer != null) return;
+    proxyProbeRetryTimer = window.setTimeout(() => {
+      proxyProbeRetryTimer = null;
+      void probeProxyServer(true).then((ok) => {
+        if (!ok) return;
+        proxyProbeRetryDelay = PROBE_RETRY_MIN_MS;
+        // 后端恢复后广播一次，让会话列表 / 内核面板等重新同步。
+        window.dispatchEvent(new CustomEvent("proxy-server-probed", { detail: { ok: true } }));
+        window.updateComposerStatus?.();
+      });
+    }, proxyProbeRetryDelay);
+    proxyProbeRetryDelay = Math.min(proxyProbeRetryDelay * 2, PROBE_RETRY_MAX_MS);
+  }
 
   /** 检测当前页面能否访问 serve.py 后端（不依赖固定端口） */
   async function probeProxyServer(force = false) {
     if (window.location.protocol === "file:") {
       proxyProbeCache = false;
+      window.__proxyServerReady = false;
       return false;
     }
-    if (!force && proxyProbeCache !== null) return proxyProbeCache;
+    const fresh = proxyProbeCache !== null
+      && Date.now() - proxyProbeCacheAt < PROBE_CACHE_TTL_MS;
+    if (!force && fresh) return proxyProbeCache;
     if (!force && proxyProbePromise) return proxyProbePromise;
 
-    proxyProbePromise = fetch(`${PROXY_BASE}/api/agent/status`, { method: "GET" })
+    const attempt = fetch(`${PROXY_BASE}/api/agent/status`, { method: "GET" })
       .then((response) => {
         proxyProbeCache = response.ok;
+        proxyProbeCacheAt = Date.now();
         window.__proxyServerReady = proxyProbeCache;
+        if (proxyProbeCache) {
+          clearProbeRetry();
+          proxyProbeRetryDelay = PROBE_RETRY_MIN_MS;
+        } else {
+          scheduleProbeRetry();
+        }
         return proxyProbeCache;
       })
       .catch(() => {
         proxyProbeCache = false;
+        proxyProbeCacheAt = Date.now();
         window.__proxyServerReady = false;
+        scheduleProbeRetry();
         return false;
-      })
-      .finally(() => {
-        proxyProbePromise = null;
       });
-    return proxyProbePromise;
+    proxyProbePromise = attempt;
+    // 保留已 settle 的 promise：晚于 llm-client.js 加载的模块可以 await 它，
+    // 不必依赖同步读取缓存，也就不会错过探测结果。
+    proxyProbeSettled = attempt;
+    attempt.finally(() => {
+      if (proxyProbePromise === attempt) proxyProbePromise = null;
+    });
+    return attempt;
+  }
+
+  /** 等待首次探测完成（无论成功与否），避免调用方读到竞态中的中间态 */
+  function whenProxyServerReady() {
+    return proxyProbeSettled || probeProxyServer();
   }
 
   function isPageOnProxyServer() {
@@ -588,6 +641,7 @@
   window.saveChatSession = saveChatSession;
   window.llmIsLocalServer = isPageOnProxyServer;
   window.probeProxyServer = probeProxyServer;
+  window.whenProxyServerReady = whenProxyServerReady;
   window.llmProxyBase = PROXY_BASE;
 
   function notifyProxyProbeDone() {

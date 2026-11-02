@@ -14,6 +14,7 @@ import textwrap
 from difflib import get_close_matches
 import warnings
 import json
+import threading
 from pathlib import Path
 
 from ._utils import wrap_adata_tool_for_mudata
@@ -72,6 +73,9 @@ class FunctionRegistry:
         self._function_map: Dict[Callable, str] = {}  # Maps functions to their primary keys
         self._categories: Dict[str, List[str]] = {}  # Category to function mapping
         self._hydrated: bool = False  # Whether full module hydration has run
+        # Guards hydration: concurrent callers must not observe a half-hydrated
+        # registry (e.g. the UI warm-up thread racing a real request).
+        self._hydrate_lock = threading.Lock()
 
     def _ensure_hydrated(self) -> None:
         """Import sRNAgent submodules once so queries see all registered functions.
@@ -81,13 +85,18 @@ class FunctionRegistry:
         """
         if self._hydrated:
             return
-        self._hydrated = True
-        try:
-            _hydrate_registry_for_export()
-        except Exception:
-            # Never let a hydration hiccup break a lookup — partial registry is
-            # still better than crashing the query path.
-            pass
+        with self._hydrate_lock:
+            if self._hydrated:
+                return
+            try:
+                _hydrate_registry_for_export()
+            except Exception:
+                # Never let a hydration hiccup break a lookup — partial registry is
+                # still better than crashing the query path.
+                pass
+            # Mark hydrated only after the scan finished, so a concurrent
+            # caller never returns a partially populated registry.
+            self._hydrated = True
 
     def _store_entry(
         self,

@@ -485,8 +485,22 @@
     stopPolling,
   };
 
-  if (window.llmIsLocalServer?.()) {
+  // 探测是异步的：脚本加载这一刻后端可能还没探测完。这里必须 await 探测结果，
+  // 否则 llmIsLocalServer() 读到 false 会永久跳过 startPolling，
+  // 导致右侧 Environment/Visualization 面板必须刷新页面才出现。
+  void (async () => {
+    try {
+      await window.whenProxyServerReady?.();
+    } catch {
+      // 探测失败时仍按"本地服务"处理，refresh() 内部有守卫，不会误请求。
+    }
     refresh();
     startPolling(12000);
-  }
+  })();
+
+  // 后端恢复后（serve.py 稍后才启动或重启）重新拉一次并恢复轮询。
+  window.addEventListener("proxy-server-probed", () => {
+    refresh({ force: true });
+    startPolling(12000);
+  });
 })();

@@ -2699,7 +2699,9 @@ function applyActiveChatFromStore() {
 }
 
 async function initChatSessions() {
-  const serverOk = await window.probeProxyServer?.();
+  // 等待首次探测 settle，避免读到"探测还没回来"的中间态：
+  // 之前这里会误判成"后端没连上"而切到 local 模式，导致会话列表空白。
+  const serverOk = (await window.whenProxyServerReady?.()) === true;
   if (serverOk) {
     chatPersistenceMode = "server";
     try {
@@ -5720,7 +5722,9 @@ function updateAgentBackendStatus(meta) {
 
 async function loadAgentBackendStatus() {
   updateComposerStatus();
-  const ok = await window.probeProxyServer?.();
+  // 强制重新探测：后端可能在本页加载之后才启动（或重启），
+  // 非强制探测会命中尚未过期的旧缓存而误报"未连接"。
+  const ok = (await window.probeProxyServer?.(true)) === true;
   updateComposerStatus();
   if (!ok || !window.fetchAgentStatus) return;
   try {
