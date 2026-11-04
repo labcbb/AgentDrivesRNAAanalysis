@@ -519,7 +519,20 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
-        self.wfile.write(payload)
+        self._write_payload(payload)
+
+    def _write_payload(self, payload: bytes) -> None:
+        """Write to the client, tolerating a browser that already left.
+
+        Reloading the page aborts the in-flight requests: the browser closes
+        the socket while the server is still writing the response. That is
+        normal client behaviour, not a server fault, so it must not raise a
+        BrokenPipeError traceback.
+        """
+        try:
+            self.wfile.write(payload)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def _write_sse_stream(self, event_iter, *, cancel_on_disconnect: bool = False) -> None:
         """Stream SSE events.
@@ -663,7 +676,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "private, max-age=60")
             self.end_headers()
-            self.wfile.write(payload)
+            self._write_payload(payload)
             return
         if path == "/api/sessions":
             self._write_json(forward_sessions_list())
@@ -811,6 +824,23 @@ def warm_up_backend() -> None:
         print(f"[warmup] backend warm-up reported: {status.get('error')}")
 
 
+class Server(ThreadingHTTPServer):
+    """Threading server that treats a disconnected browser as normal.
+
+    Reloading the page closes the socket while the server is still writing
+    the response. ``socketserver`` would otherwise print a full
+    BrokenPipeError traceback for what is ordinary client behaviour.
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def main() -> None:
     # Native extensions can terminate the interpreter without a Python
     # traceback. Keep all thread stacks in stderr/captured service logs.
@@ -850,7 +880,7 @@ def main() -> None:
     os.chdir(workspace)
 
     port = int(args.port)
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = Server((host, port), Handler)
     if host == "0.0.0.0":
         print(f"OpenClaw UI → http://0.0.0.0:{port}/index.html  (use http://<server-ip>:{port}/index.html)")
     else:
