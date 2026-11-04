@@ -602,6 +602,75 @@ def _repair_plan_artifact_graph(
     return _order_de_workflow_steps(planned)
 
 
+def _recompile_persisted_plan_contracts(
+    steps: List[Dict[str, Any]],
+    *,
+    skill_registry: Any,
+    user_query: str,
+    available_artifacts: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Re-apply the workflow contracts to a plan that was persisted earlier.
+
+    A plan saved by an older build can contain steps that the contracts have
+    since taken over -- the planner's own adapter gate next to the contract's
+    injected one -- and dependency edges pointing at the removed copy. The
+    plan then reports "计划被未完成或缺失的依赖阻塞" forever.
+
+    The contracts are re-applied so the restored plan matches what a fresh
+    plan would look like. Statuses are carried over by step id, so a step
+    that already ran keeps its result and a step that failed keeps its
+    error. A planner step that the contract replaces is dropped only when
+    the contract's own step has not run yet.
+    """
+    if skill_registry is None:
+        return steps
+    planned = [step for step in steps if isinstance(step, dict)]
+    if not planned:
+        return planned
+    entry_skills = [str(step.get("skill") or "") for step in planned]
+    contracts = _load_skill_plan_contracts(
+        skill_registry, user_query, step_skills=entry_skills,
+    )
+    if not contracts:
+        return planned
+    previous = {
+        str(step.get("id") or ""): step
+        for step in planned
+        if str(step.get("id") or "")
+    }
+    compiled = apply_workflow_nodes(
+        planned,
+        contracts,
+        context={"available_artifacts": list(available_artifacts or [])},
+    )
+    for step in compiled:
+        if not isinstance(step, dict):
+            continue
+        original = previous.get(str(step.get("id") or ""))
+        if original is None:
+            continue
+        # Carry the persisted state onto the recompiled step.
+        for key in ("status", "result", "approval", "transientRetries"):
+            if key in original:
+                step[key] = original[key]
+    # A dependency that no longer exists would block the step forever.
+    known = {
+        str(step.get("id") or "")
+        for step in compiled
+        if str(step.get("id") or "")
+    }
+    for step in compiled:
+        if not isinstance(step, dict):
+            continue
+        depends = step.get("depends_on")
+        if isinstance(depends, list):
+            step["depends_on"] = [
+                dep for dep in depends
+                if str(dep).strip() in known
+            ]
+    return compiled
+
+
 def _context_has_group_info(extra_context: str) -> bool:
     return bool(_GROUP_RE.search(extra_context or ""))
 
@@ -4347,6 +4416,19 @@ class PlanOrchestrator:
             # fresh plan would; this merges artifacts into the existing steps
             # and leaves their IDs and statuses untouched.
             plan["steps"] = _repair_plan_artifact_graph(
+                plan["steps"],
+                skill_registry=getattr(self.agent, "skill_registry", None),
+                user_query=str(plan.get("goal") or user_query),
+                available_artifacts=list(dict.fromkeys([
+                    *_refresh_plan_artifact_state(plan), *(available_artifacts or []),
+                ])),
+            )
+            # Re-apply the workflow contracts to a plan that was persisted by
+            # an older build. Without this, steps the contracts have since
+            # taken over keep their stale duplicate and their dependency edges
+            # point at the removed copy, so the plan reports "计划被未完成或缺失
+            # 的依赖阻塞" on every resume.
+            plan["steps"] = _recompile_persisted_plan_contracts(
                 plan["steps"],
                 skill_registry=getattr(self.agent, "skill_registry", None),
                 user_query=str(plan.get("goal") or user_query),

@@ -104,6 +104,101 @@ def test_fastq_qc_contract_replaces_the_planner_duplicate_steps():
     assert "读取现有 FASTQ 修剪配置" in titles
 
 
+def test_contract_preflight_is_restored_when_only_the_stage_exists():
+    """A plan holding the approval stage must still get its preflight."""
+    from sRNAgent.agent.workflow_contracts import apply_workflow_nodes, load_workflow_nodes
+
+    contract = (
+        Path(__file__).resolve().parents[2] / "skills" / "fastq-qc" / "plan_contract.json"
+    )
+    nodes = load_workflow_nodes(contract, skill="fastq-qc")
+    planned = [
+        {
+            "id": "workflow:confirm-adapter-before-trimming",
+            "title": "确认 sRNA-seq 3' adapter",
+            "skill": "fastq-qc",
+            "status": "pending",
+            "workflowContract": "confirm-adapter-before-trimming",
+            "inputs": ["trim_config_evidence"],
+            "outputs": ["trim_config_confirmed"],
+        },
+    ]
+    compiled = apply_workflow_nodes(planned, nodes, context={"available_artifacts": []})
+    ids = {str(s.get("id") or "") for s in compiled}
+    assert "workflow:confirm-adapter-before-trimming:preflight" in ids, (
+        "the missing preflight must be restored, otherwise the approval stage "
+        "has no evidence step to wait for"
+    )
+
+
+def test_restored_plan_drops_the_duplicates_and_keeps_the_statuses():
+    """Re-applying the contracts to a persisted plan must not reset it."""
+    from sRNAgent.agent.plan_orchestrator import _recompile_persisted_plan_contracts
+    from sRNAgent.agent.plan_state import PlanGraph
+    from sRNAgent.skill_registry import SkillRegistry, discover_skill_roots
+
+    roots = discover_skill_roots()
+    registry = SkillRegistry(roots[0][1])
+    registry.load()
+
+    persisted = [
+        {"id": "download-fastq", "title": "全量下载新增项目FASTQ",
+         "skill": "fastq-dl-srna", "status": "done", "result": "ok", "depends_on": []},
+        {"id": "workflow:confirm-adapter-before-trimming:preflight",
+         "title": "读取现有 FASTQ 修剪配置", "skill": "fastq-qc", "status": "failed",
+         "result": "STEP_EXECUTION_ERROR: RuntimeError: LLM connection error",
+         "workflowContract": "confirm-adapter-before-trimming:preflight"},
+        {"id": "preflight-trimming-config", "title": "读取现有FASTQ修剪配置",
+         "skill": "fastq-qc", "status": "failed", "depends_on": ["download-fastq"]},
+        {"id": "workflow:confirm-adapter-before-trimming", "title": "确认 sRNA-seq 3' adapter",
+         "skill": "fastq-qc", "status": "pending",
+         "depends_on": ["workflow:confirm-adapter-before-trimming:preflight",
+                        "preflight-trimming-config"],
+         "workflowContract": "confirm-adapter-before-trimming"},
+        {"id": "confirm-adapter", "title": "确认sRNA-seq 3' adapter",
+         "skill": "fastq-qc", "status": "pending",
+         "depends_on": ["preflight-trimming-config",
+                        "workflow:confirm-adapter-before-trimming:preflight"]},
+        {"id": "confirm-trimming-config", "title": "确认新增样本修剪配置",
+         "skill": "fastq-qc", "status": "pending",
+         "depends_on": ["confirm-adapter",
+                        "workflow:confirm-adapter-before-trimming:preflight",
+                        "preflight-trimming-config"]},
+    ]
+
+    compiled = _recompile_persisted_plan_contracts(
+        persisted,
+        skill_registry=registry,
+        user_query="下载并修剪新增项目的FASTQ",
+        available_artifacts=[],
+    )
+    ids = [str(s.get("id") or "") for s in compiled]
+    assert "preflight-trimming-config" not in ids, (
+        "the planner's duplicate preflight must be dropped"
+    )
+    assert "confirm-adapter" not in ids, "the planner's duplicate gate must be dropped"
+    assert "confirm-trimming-config" not in ids, "the duplicate config gate must be dropped"
+
+    by_id = {str(s.get("id") or ""): s for s in compiled}
+    assert by_id["download-fastq"]["status"] == "done", "a completed step must stay done"
+    assert by_id["workflow:confirm-adapter-before-trimming:preflight"]["status"] == "failed", (
+        "a failed step must keep its failure so it can be retried"
+    )
+
+    # No dependency may point at a step that no longer exists.
+    known = set(ids)
+    for step in compiled:
+        for dep in step.get("depends_on") or []:
+            assert str(dep) in known, f"dangling dependency: {dep}"
+
+    # The failed preflight must be selectable for a replay.
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    retryable = PlanOrchestrator._next_retryable_failed_step({"steps": compiled})
+    assert retryable is not None
+    assert retryable["id"] == "workflow:confirm-adapter-before-trimming:preflight"
+
+
 def test_step_failure_message_distinguishes_reasons():
     from sRNAgent.agent.plan_orchestrator import _step_failure_message
 

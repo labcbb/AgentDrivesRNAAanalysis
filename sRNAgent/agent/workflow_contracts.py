@@ -404,20 +404,43 @@ def apply_workflow_nodes(
                 if str(step.get("workflowContract") or "") == contract_id
                 or not _is_replaced_step(step, titles=aliases, patterns=patterns)
             ]
-        if any(str(step.get("workflowContract") or "") == contract_id for step in planned):
-            continue
-        stage = _new_step(spec, contract_id=contract_id)
-        if kind == "approval":
-            approval = node.get("approval") if isinstance(node.get("approval"), dict) else {}
-            stage["approval"] = {"id": contract_id, **approval}
-        placement = node.get("placement") if isinstance(node.get("placement"), dict) else {}
-        index = _insert_index(planned, placement)
         preflight = node.get("preflight") if isinstance(node.get("preflight"), dict) else {}
-        if preflight:
-            preflight_stage = _new_step(preflight, contract_id=f"{contract_id}:preflight")
-            planned.insert(index, preflight_stage)
-            index += 1
-        planned.insert(index, stage)
+        preflight_contract_id = f"{contract_id}:preflight"
+        stage_exists = any(
+            str(step.get("workflowContract") or "") == contract_id for step in planned
+        )
+        preflight_exists = any(
+            str(step.get("workflowContract") or "") == preflight_contract_id
+            for step in planned
+        )
+        if stage_exists and (not preflight or preflight_exists):
+            continue
+        if not stage_exists:
+            stage = _new_step(spec, contract_id=contract_id)
+            if kind == "approval":
+                approval = node.get("approval") if isinstance(node.get("approval"), dict) else {}
+                stage["approval"] = {"id": contract_id, **approval}
+            placement = node.get("placement") if isinstance(node.get("placement"), dict) else {}
+            index = _insert_index(planned, placement)
+            if preflight and not preflight_exists:
+                preflight_stage = _new_step(preflight, contract_id=preflight_contract_id)
+                planned.insert(index, preflight_stage)
+                index += 1
+            planned.insert(index, stage)
+            continue
+        # The contract's stage is already in the plan but its preflight is not.
+        # Restore the missing preflight so the stage's evidence step exists.
+        if preflight and not preflight_exists:
+            preflight_stage = _new_step(preflight, contract_id=preflight_contract_id)
+            stage_index = next(
+                (
+                    index
+                    for index, step in enumerate(planned)
+                    if str(step.get("workflowContract") or "") == contract_id
+                ),
+                len(planned),
+            )
+            planned.insert(stage_index, preflight_stage)
     return wire_artifact_dependencies(planned)
 
 
