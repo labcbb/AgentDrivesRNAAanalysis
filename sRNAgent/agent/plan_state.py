@@ -5,7 +5,7 @@ state-machine rules testable independently from :mod:`plan_orchestrator`.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 STEP_PENDING = "pending"
 STEP_RUNNING = "running"
@@ -62,6 +62,31 @@ class PlanGraph:
             if step.get("status") != pending:
                 continue
             if self.dependencies_satisfied(step, completed):
+                return step
+        return None
+
+    def next_runnable_retryable(
+        self,
+        *,
+        pending: str,
+        failed: str,
+        completed: Iterable[str],
+        is_retryable: Callable[[Dict[str, Any]], bool],
+    ) -> Optional[Dict[str, Any]]:
+        """Return a failed step that may be retried, if one is runnable.
+
+        A step that failed on a transient error (a dropped TLS handshake, a
+        503) must not strand the plan: its dependants are blocked forever
+        because nothing else selects ``failed`` steps. Retrying is only safe
+        when the step itself left no output behind, which the caller decides
+        via ``is_retryable``.
+        """
+        for step in self.steps:
+            if step.get("status") != failed:
+                continue
+            if not self.dependencies_satisfied(step, completed):
+                continue
+            if is_retryable(step):
                 return step
         return None
 

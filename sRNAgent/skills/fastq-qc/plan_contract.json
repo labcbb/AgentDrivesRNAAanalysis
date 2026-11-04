@@ -7,6 +7,17 @@
       "kind": "approval",
       "activation": {},
       "placement": {"before_skills": ["fastq-qc"]},
+      "replaces_titles": [
+        "确认 sRNA-seq 3' adapter",
+        "确认sRNA-seq 3' adapter",
+        "确认新增样本修剪配置",
+        "确认新增样本修剪参数",
+        "确认修剪配置",
+        "读取现有 FASTQ 修剪配置",
+        "读取现有FASTQ修剪配置",
+        "读取修剪配置",
+        "检查现有修剪配置"
+      ],
       "step": {
         "title": "确认 sRNA-seq 3' adapter",
         "goal": "展示有证据支持的 3' adapter 与完整 cutadapt 配置；当建库元数据明确匹配已知试剂盒时，应说明依据并给出对应 adapter 建议，供用户确认；未确认具体 adapter 序列前不得运行 cutadapt，也不得按未知试剂盒默认值推定。",

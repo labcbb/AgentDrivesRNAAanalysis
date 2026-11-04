@@ -18,6 +18,92 @@ def test_step_failed_ignores_cancelled_substring_in_success_prose():
     assert _step_failed("STEP_EXECUTION_ERROR: RuntimeError: LLM HTTP 502: bad gateway")
 
 
+def test_ssl_eof_is_classified_as_transient():
+    """A dropped TLS handshake must be retried, not treated as a hard failure."""
+    from sRNAgent.agent.plan_orchestrator import (
+        _is_transient_error_text,
+        _is_transient_exception,
+        _is_transient_step_error,
+    )
+
+    eof = (
+        "STEP_EXECUTION_ERROR: RuntimeError: LLM connection error: "
+        "[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol "
+        "(_ssl.c:1032) [url=https://api.minimax.io/anthropic/v1/messages]"
+    )
+    assert _is_transient_error_text(eof)
+    assert _is_transient_step_error(eof)
+    assert _is_transient_exception(
+        RuntimeError(
+            "LLM connection error: [SSL: UNEXPECTED_EOF_WHILE_READING] "
+            "EOF occurred in violation of protocol (_ssl.c:1032)"
+        )
+    )
+    # A genuine bug must not be retried forever.
+    assert not _is_transient_step_error("STEP_EXECUTION_ERROR: RuntimeError: writer crashed")
+
+
+def test_failed_transient_step_is_selectable_for_replay():
+    """A step that failed on a transient error must not strand its dependants."""
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {"id": "preflight", "status": "failed",
+             "result": "STEP_EXECUTION_ERROR: RuntimeError: LLM connection error: "
+                       "[SSL: UNEXPECTED_EOF_WHILE_READING]"},
+            {"id": "approve", "status": "pending", "depends_on": ["preflight"]},
+        ]
+    }
+    step = PlanOrchestrator._next_retryable_failed_step(plan)
+    assert step is not None and step["id"] == "preflight"
+
+    # A non-transient failure stays failed: the plan reports it instead of
+    # silently looping.
+    plan["steps"][0]["result"] = "STEP_EXECUTION_ERROR: RuntimeError: writer crashed"
+    assert PlanOrchestrator._next_retryable_failed_step(plan) is None
+
+
+def test_transient_replay_is_bounded():
+    """A persistent outage must not replay the same step forever."""
+    from sRNAgent.agent.plan_orchestrator import (
+        _MAX_STEP_TRANSIENT_REPLAYS,
+        PlanOrchestrator,
+    )
+
+    step = {"id": "s", "status": "failed"}
+    allowed = 0
+    while PlanOrchestrator._can_retry_step(step):
+        allowed += 1
+        assert allowed <= _MAX_STEP_TRANSIENT_REPLAYS + 1
+    assert allowed == _MAX_STEP_TRANSIENT_REPLAYS
+    assert step["transientRetries"] == _MAX_STEP_TRANSIENT_REPLAYS
+
+
+def test_step_retry_budget_is_wider_than_the_old_two_attempts():
+    """Three back-to-back attempts still fail ~1 time in 2 on the flaky route."""
+    from sRNAgent.agent.plan_orchestrator import _MAX_STEP_TRANSIENT_RETRIES
+
+    assert _MAX_STEP_TRANSIENT_RETRIES >= 5
+
+
+def test_fastq_qc_contract_replaces_the_planner_duplicate_steps():
+    """The contract owns the adapter gate, so the planner's copy must go."""
+    from sRNAgent.agent.workflow_contracts import load_workflow_nodes
+
+    contract = (
+        Path(__file__).resolve().parents[2] / "skills" / "fastq-qc" / "plan_contract.json"
+    )
+    nodes = load_workflow_nodes(contract, skill="fastq-qc")
+    assert nodes, "fastq-qc must declare its adapter gate"
+    node = nodes[0]
+    titles = {str(t) for t in (node.get("replaces_titles") or [])}
+    assert "确认 sRNA-seq 3' adapter" in titles
+    assert "确认sRNA-seq 3' adapter" in titles
+    assert "确认新增样本修剪配置" in titles
+    assert "读取现有 FASTQ 修剪配置" in titles
+
+
 def test_step_failure_message_distinguishes_reasons():
     from sRNAgent.agent.plan_orchestrator import _step_failure_message
 
@@ -202,6 +288,8 @@ def test_execute_step_resilient_retries_transient_then_succeeds():
         return "step ok"
 
     orch._execute_step = flaky_execute  # type: ignore
+    waited = []
+    orch._wait_before_retry = lambda seconds, cancel_event: waited.append(seconds)  # type: ignore
     result = orch._execute_step_resilient(
         {"id": "1", "title": "t"},
         step_index=1,
@@ -213,6 +301,9 @@ def test_execute_step_resilient_retries_transient_then_succeeds():
     )
     assert result == "step ok"
     assert attempts["n"] == 2
+    # A retry must wait before trying again: back-to-back attempts keep hitting
+    # the same flaky route and exhaust the budget.
+    assert waited == [1.0]
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2242,7 +2243,11 @@ _TRANSIENT_ERROR_MARKERS = (
     "broken pipe",
     "temporary failure",
 )
-_MAX_STEP_TRANSIENT_RETRIES = 2
+_MAX_STEP_TRANSIENT_RETRIES = 5
+_STEP_RETRY_BACKOFF_SEC = (1.0, 2.0, 4.0, 8.0, 16.0)
+# Outer safety net: how many times a step may be replayed after its in-step
+# retry loop was exhausted. Bounded so a persistent outage cannot loop.
+_MAX_STEP_TRANSIENT_REPLAYS = 2
 _REL_OUTPUT_PATH_RE = re.compile(
     r"(?:^|[\s`'\"(=])((?:results|references|reports|figures)/[A-Za-z0-9_./\-]+)"
 )
@@ -4103,14 +4108,22 @@ class PlanOrchestrator:
                     and checkpoint["messages"]
                 ):
                     attempt_resume = checkpoint["messages"]
+                # Back off between attempts. A flaky TLS route (the MiniMax
+                # Global endpoint drops ~1 in 5 handshakes from this host)
+                # fails every attempt if the retries fire back to back.
+                backoff = _STEP_RETRY_BACKOFF_SEC[
+                    min(attempt - 1, len(_STEP_RETRY_BACKOFF_SEC) - 1)
+                ]
                 self._emit(
                     on_progress,
                     "status",
                     message=(
                         f"步骤 {step_index} 遇到临时 API/网络错误，"
-                        f"正在重试（{attempt}/{_MAX_STEP_TRANSIENT_RETRIES}）…"
+                        f"{backoff:g}s 后重试（{attempt}/{_MAX_STEP_TRANSIENT_RETRIES}）…"
                     ),
                 )
+                if backoff > 0:
+                    self._wait_before_retry(backoff, cancel_event)
             try:
                 return self._execute_step(
                     step,
@@ -4141,6 +4154,50 @@ class PlanOrchestrator:
             pending=STEP_PENDING,
             completed={STEP_DONE, STEP_SKIPPED},
         )
+
+    @staticmethod
+    def _wait_before_retry(seconds: float, cancel_event: Any) -> None:
+        """Sleep before the next attempt, staying responsive to cancellation."""
+        if cancel_event is None:
+            time.sleep(seconds)
+            return
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if cancel_event.is_set():
+                raise AgentCancelledError("cancelled during retry backoff")
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+    @staticmethod
+    def _next_retryable_failed_step(plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return a failed step that failed transiently and can be retried.
+
+        A dropped TLS handshake used to strand the whole plan: the step was
+        marked failed, nothing selected failed steps again, and every
+        dependant reported "计划被未完成或缺失的依赖阻塞". Retrying the step
+        is safe because a transient failure left no output behind.
+        """
+        return PlanGraph(plan).next_runnable_retryable(
+            pending=STEP_PENDING,
+            failed=STEP_FAILED,
+            completed={STEP_DONE, STEP_SKIPPED},
+            is_retryable=lambda step: _is_transient_step_error(
+                str(step.get("result") or "")
+            ),
+        )
+
+    @staticmethod
+    def _can_retry_step(step: Dict[str, Any]) -> bool:
+        """Allow a bounded number of whole-step retries for transient failures.
+
+        The in-step retry loop already covers a brief outage. This is the
+        outer safety net for a step that exhausted it; it must not loop
+        forever, so the attempt counter on the step bounds it.
+        """
+        attempts = int(step.get("transientRetries") or 0)
+        if attempts >= _MAX_STEP_TRANSIENT_REPLAYS:
+            return False
+        step["transientRetries"] = attempts + 1
+        return True
 
     def run(
         self,
@@ -4387,6 +4444,21 @@ class PlanOrchestrator:
                 self._persist_plan(plan)
             pending = self._next_pending_step(plan)
             if pending is None:
+                # A step that failed on a transient error left its dependants
+                # blocked forever. Put it back to pending and run it again.
+                retryable = self._next_retryable_failed_step(plan)
+                if retryable is not None and self._can_retry_step(retryable):
+                    retryable["status"] = STEP_PENDING
+                    self._emit(
+                        on_progress,
+                        "status",
+                        message=(
+                            f"步骤 {retryable.get('title') or retryable.get('id') or ''} "
+                            "此前因临时网络错误失败，正在重新执行…"
+                        ),
+                    )
+                    self._persist_plan(plan)
+                    continue
                 graph = PlanGraph(plan)
                 waiting = graph.first_with_status(STEP_AWAITING_APPROVAL)
                 if waiting:
@@ -4531,6 +4603,7 @@ class PlanOrchestrator:
 
             pending["status"] = STEP_DONE
             pending["result"] = result
+            pending.pop("transientRetries", None)
             self._persist_plan(plan)
             self._save_step_checkpoint(plan, None)
             self._emit(
