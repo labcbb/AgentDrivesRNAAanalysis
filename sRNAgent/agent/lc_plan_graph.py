@@ -73,9 +73,11 @@ def run_lc_plan_steps(
     # Local imports avoid circular import at module load and keep domain helpers
     # owned by plan_orchestrator.py.
     from .plan_orchestrator import (
+        PlanOrchestrator,
         _auto_complete_target_candidate_gates,
         _build_approval_request,
         _build_final_summary,
+        _is_transient_step_error,
         _resolve_step_result,
         _step_failure_message,
     )
@@ -98,6 +100,30 @@ def run_lc_plan_steps(
         pending = orchestrator._next_pending_step(current_plan)
 
         if pending is None:
+            # A step that failed on a transient error (a dropped TLS handshake,
+            # a 503) must not strand the plan: nothing else selects failed
+            # steps, so every dependant would report "计划被未完成或缺失的依赖
+            # 阻塞". Put the step back to pending and run it again.
+            retryable = PlanOrchestrator._next_retryable_failed_step(current_plan)
+            if retryable is not None and PlanOrchestrator._can_retry_step(retryable):
+                retryable["status"] = STEP_PENDING
+                orchestrator._emit(
+                    on_progress,
+                    "status",
+                    message=(
+                        f"步骤 {retryable.get('title') or retryable.get('id') or ''} "
+                        "此前因临时网络错误失败，正在重新执行…"
+                    ),
+                )
+                orchestrator._persist_plan(current_plan)
+                return {
+                    "plan": current_plan,
+                    "done": False,
+                    "outcome": "continue",
+                    "step_total": step_total,
+                    "current_step_id": "",
+                    "step_result": "",
+                }
             graph = PlanGraph(current_plan)
             waiting = graph.first_with_status(STEP_AWAITING_APPROVAL)
             if waiting:
@@ -312,6 +338,30 @@ def run_lc_plan_steps(
                 stepIndex=step_index,
                 message=_step_failure_message(step_index, result),
             )
+
+            # A transient failure (dropped TLS handshake, 503) must be retried
+            # in place. Replanning instead would call the same flaky endpoint
+            # and produce a worse plan -- or no plan at all.
+            if _is_transient_step_error(result) and PlanOrchestrator._can_retry_step(pending):
+                pending["status"] = STEP_PENDING
+                orchestrator._persist_plan(current_plan)
+                orchestrator._emit(
+                    on_progress,
+                    "status",
+                    message=(
+                        f"步骤 {step_index} 遇到临时 API/网络错误，"
+                        "正在重新执行该步骤…"
+                    ),
+                )
+                return {
+                    "plan": current_plan,
+                    "done": False,
+                    "outcome": "continue",
+                    "replan_attempts": replan_attempts,
+                    "step_total": len(current_plan.get("steps") or []),
+                    "current_step_id": "",
+                    "step_result": "",
+                }
 
             if replan_attempts >= max_replan:
                 summary = orchestrator._ensure_user_facing_reply(

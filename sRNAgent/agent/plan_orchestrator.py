@@ -4457,6 +4457,11 @@ class PlanOrchestrator:
             analysis["requested_modalities"] = scope["requested_modalities"]
             analysis["target_prediction_only"] = bool(scope.get("target_prediction_only"))
             plan["analysis"] = analysis
+            # Persist the recompiled plan. The restore path above may have
+            # dropped steps the contracts have taken over and rebuilt their
+            # dependency edges; writing it back means the next resume starts
+            # from the repaired graph instead of repairing it again.
+            self._persist_plan(plan)
             self._emit(
                 on_progress,
                 "plan_restored",
