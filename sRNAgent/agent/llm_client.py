@@ -8,13 +8,22 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 # Transient gateway / rate-limit / overload responses worth retrying.
 _TRANSIENT_HTTP_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 _LLM_MAX_RETRIES = 3
 _LLM_RETRY_BACKOFF_SEC = (1.0, 2.0, 4.0)
+# Socket timeout for the request body phase.
+_LLM_TIMEOUT_SEC = 120
+# The first attempt is capped short: a healthy TLS handshake takes about a
+# second, so a longer cap only delays the failover to an alternate host.
+_LLM_FIRST_ATTEMPT_TIMEOUT = 12
+# Ceiling for the whole attempt sequence. A dead route can hold a socket for
+# a minute at a time, and retrying it several times would otherwise turn one
+# failed request into a multi-minute stall.
+_LLM_TOTAL_BUDGET_SEC = 45
 
 
 @dataclass
@@ -174,6 +183,16 @@ def _minimax_auth_hint(detail: str) -> str:
 _MINIMAX_HOSTS = frozenset({
     "api.minimaxi.com", "api.minimax.io", "api.minimax.cn", "api.minimax.chat",
 })
+# Alternate hosts tried when the configured one cannot be reached at all
+# (TLS handshake timeout on the international route). The path is preserved,
+# so the request still hits the same API surface. A host that answers with
+# 401/403 is skipped rather than reported: it belongs to another platform.
+_MINIMAX_FALLBACK_HOSTS: Dict[str, Tuple[str, ...]] = {
+    "api.minimax.io": ("api.minimax.chat", "api.minimax.cn"),
+    "api.minimaxi.com": ("api.minimax.cn", "api.minimax.chat"),
+    "api.minimax.cn": ("api.minimax.chat", "api.minimaxi.com"),
+    "api.minimax.chat": ("api.minimax.cn", "api.minimaxi.com"),
+}
 _MINIMAX_PATH_SUFFIXES = (
     "/v1/messages",
     "/v1/chat/completions",
@@ -216,6 +235,27 @@ def _is_dns_failure(reason: Any) -> bool:
         return True
     text = str(reason).lower()
     return "name or service not known" in text or "nodename nor servname" in text
+
+
+def _request_url_candidates(url: str) -> List[str]:
+    """Return the URLs to try for a request, primary first.
+
+    Only MiniMax URLs get alternates: the international route to
+    ``api.minimax.io`` degrades often enough that the TLS handshake can time
+    out, and a sibling host serving the same API surface is worth a try. The
+    path prefix is preserved so the request keeps hitting the same endpoint.
+    """
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    alternates = _MINIMAX_FALLBACK_HOSTS.get(host)
+    if not alternates:
+        return [url]
+    candidates = [url]
+    for alternate in alternates:
+        if alternate == host:
+            continue
+        candidates.append(urlunsplit((parts.scheme, alternate, parts.path, parts.query, "")))
+    return candidates
 
 
 def _anthropic_url(base_url: str) -> str:
@@ -330,28 +370,54 @@ class ChatClient:
     def _request(self, url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> Dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
         last_error: Optional[BaseException] = None
-        for attempt in range(_LLM_MAX_RETRIES + 1):
-            request = urllib.request.Request(url, data=body, method="POST", headers=headers)
+        # The route to a given MiniMax host can degrade (the international
+        # path to api.minimax.io times out at the TLS handshake). When that
+        # happens the request never reaches the API, so an alternate host for
+        # the same API surface is tried before giving up.
+        candidates = _request_url_candidates(url)
+        primary = candidates[0]
+        attempts = [primary, *candidates[1:], *([primary] * _LLM_MAX_RETRIES)]
+        deadline = time.monotonic() + _LLM_TOTAL_BUDGET_SEC
+        for attempt, target in enumerate(attempts):
+            if attempt > 0 and time.monotonic() >= deadline:
+                # The budget is spent; report the original failure rather than
+                # keeping the caller waiting on a route that is clearly down.
+                break
+            request = urllib.request.Request(target, data=body, method="POST", headers=headers)
+            # A healthy route completes its TLS handshake in about a second.
+            # Capping the first attempt keeps a dead route from stalling the
+            # whole request for the full timeout before the alternates are tried.
+            timeout = _LLM_FIRST_ATTEMPT_TIMEOUT if attempt == 0 else _LLM_TIMEOUT_SEC
+            # Never let an attempt run past the overall budget.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            timeout = max(1.0, min(float(timeout), remaining))
             try:
-                with urllib.request.urlopen(request, timeout=120) as response:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
                     raw = response.read().decode("utf-8")
                     try:
                         return json.loads(raw)
                     except json.JSONDecodeError as exc:
                         last_error = RuntimeError(f"LLM connection error: invalid JSON ({exc})")
-                        if attempt < _LLM_MAX_RETRIES:
+                        if attempt < len(attempts) - 1:
                             self._retry_sleep(attempt)
                             continue
                         raise last_error from exc
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
                 message = f"LLM HTTP {exc.code}: {detail}"
-                if exc.code in (401, 403) and _is_minimax_host(url):
+                if exc.code in (401, 403) and _is_minimax_host(target):
                     message = f"{message} — {_minimax_auth_hint(detail)}"
                 last_error = RuntimeError(
-                    f"{message} [url={_safe_url(url)}]"
+                    f"{message} [url={_safe_url(target)}]"
                 )
-                if self._transient_http(exc.code) and attempt < _LLM_MAX_RETRIES:
+                if target != primary and exc.code in (401, 403):
+                    # The alternate host rejected the key: it belongs to a
+                    # different platform. Keep the original failure and try the
+                    # next candidate instead of reporting a misleading 401.
+                    continue
+                if self._transient_http(exc.code) and attempt < len(attempts) - 1:
                     self._retry_sleep(attempt)
                     continue
                 raise last_error from exc
@@ -362,21 +428,21 @@ class ChatClient:
                 # points at the base URL instead of burning the retry budget.
                 if _is_dns_failure(reason):
                     raise RuntimeError(
-                        f"LLM connection error: {reason} [url={_safe_url(url)}] — "
+                        f"LLM connection error: {reason} [url={_safe_url(target)}] — "
                         "域名无法解析，请检查 Config 中的 Base URL"
                     ) from exc
                 last_error = RuntimeError(
-                    f"LLM connection error: {reason} [url={_safe_url(url)}]"
+                    f"LLM connection error: {reason} [url={_safe_url(target)}]"
                 )
-                if attempt < _LLM_MAX_RETRIES:
+                if attempt < len(attempts) - 1:
                     self._retry_sleep(attempt)
                     continue
                 raise last_error from exc
             except TimeoutError as exc:
                 last_error = RuntimeError(
-                    f"LLM connection error: timed out ({exc}) [url={_safe_url(url)}]"
+                    f"LLM connection error: timed out ({exc}) [url={_safe_url(target)}]"
                 )
-                if attempt < _LLM_MAX_RETRIES:
+                if attempt < len(attempts) - 1:
                     self._retry_sleep(attempt)
                     continue
                 raise last_error from exc

@@ -130,6 +130,116 @@ def test_dns_failure_is_not_retried_because_retrying_cannot_help():
     assert not _is_dns_failure(ConnectionResetError("reset by peer"))
 
 
+def test_request_candidates_include_alternate_minimax_hosts():
+    """An unreachable international route must have somewhere else to go."""
+    from sRNAgent.agent.llm_client import _request_url_candidates
+
+    candidates = _request_url_candidates(
+        "https://api.minimax.io/anthropic/v1/messages"
+    )
+    assert candidates[0] == "https://api.minimax.io/anthropic/v1/messages"
+    assert "https://api.minimax.chat/anthropic/v1/messages" in candidates
+    assert "https://api.minimax.cn/anthropic/v1/messages" in candidates
+    # The path must survive the host swap, or the request hits a different API.
+    for candidate in candidates[1:]:
+        assert candidate.endswith("/anthropic/v1/messages")
+
+    # A non-MiniMax host gets no alternates.
+    assert _request_url_candidates("https://example.com/v1/messages") == [
+        "https://example.com/v1/messages"
+    ]
+
+
+def test_an_alternate_host_that_rejects_the_key_is_skipped(monkeypatch):
+    """A 401 from a sibling host means another platform, not a bad key."""
+    import json as _json
+    import socket as _socket
+    import ssl
+    import urllib.error
+
+    from sRNAgent.agent import llm_client
+
+    calls = []
+
+    class _Response:
+        def __init__(self, payload):
+            self._payload = _json.dumps(payload).encode("utf-8")
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def fake_urlopen(request, timeout=None):
+        calls.append(request.full_url)
+        host = request.full_url.split("/")[2]
+        if host == "api.minimax.io":
+            # The real symptom on the international route: the TLS handshake
+            # is cut off, not a name-resolution failure.
+            raise urllib.error.URLError(
+                ssl.SSLError(
+                    "EOF occurred in violation of protocol (_ssl.c:1032)"
+                )
+            )
+        if host == "api.minimax.chat":
+            import io
+
+            raise urllib.error.HTTPError(
+                request.full_url, 401, "Unauthorized", {},
+                io.BytesIO(
+                    _json.dumps({"error": {"message": "invalid api key"}}).encode("utf-8")
+                ),
+            )
+        return _Response({"ok": True})
+
+    monkeypatch.setattr(llm_client.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(llm_client.ChatClient, "_retry_sleep", staticmethod(lambda attempt: None))
+
+    client = llm_client.ChatClient.__new__(llm_client.ChatClient)
+    result = client._request(
+        "https://api.minimax.io/anthropic/v1/messages",
+        {"x-api-key": "x"},
+        {"model": "m"},
+    )
+    assert result == {"ok": True}
+    assert "api.minimax.io" in calls[0]
+    assert any("api.minimax.chat" in call for call in calls)
+    assert any("api.minimax.cn" in call for call in calls)
+
+
+def test_the_attempt_sequence_is_capped_by_a_total_budget(monkeypatch):
+    """A dead route must not turn one failed request into minutes of waiting."""
+    import pytest
+
+    from sRNAgent.agent import llm_client
+
+    timeouts = []
+
+    def fake_urlopen(request, timeout=None):
+        timeouts.append(timeout)
+        raise TimeoutError("handshake timed out")
+
+    monkeypatch.setattr(llm_client.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(llm_client.ChatClient, "_retry_sleep", staticmethod(lambda attempt: None))
+
+    client = llm_client.ChatClient.__new__(llm_client.ChatClient)
+    with pytest.raises(Exception):
+        client._request(
+            "https://api.minimax.io/anthropic/v1/messages",
+            {"x-api-key": "x"},
+            {"model": "m"},
+        )
+    assert timeouts, "the request must have been attempted"
+    # No attempt may be allowed to outlive the overall budget.
+    assert max(timeouts) <= llm_client._LLM_TOTAL_BUDGET_SEC
+    # The first attempt is capped short so a dead route fails over quickly.
+    assert timeouts[0] == llm_client._LLM_FIRST_ATTEMPT_TIMEOUT
+
+
 def test_fastq_qc_contract_replaces_the_planner_duplicate_steps():
     """The contract owns the adapter gate, so the planner's copy must go."""
     from sRNAgent.agent.workflow_contracts import load_workflow_nodes
