@@ -87,6 +87,49 @@ def test_step_retry_budget_is_wider_than_the_old_two_attempts():
     assert _MAX_STEP_TRANSIENT_RETRIES >= 5
 
 
+def test_a_new_user_turn_refreshes_the_replay_budget():
+    """A step that exhausted its budget while offline must be retryable again.
+
+    The budget bounds the retries inside one run. Without a refresh a new
+    user message could never revive a step that ran out of budget while the
+    network was down -- the plan would report a blocked dependency forever.
+    """
+    from sRNAgent.agent.plan_orchestrator import PlanOrchestrator
+
+    plan = {
+        "steps": [
+            {
+                "id": "preflight",
+                "status": "failed",
+                "transientRetries": 99,
+                "result": (
+                    "STEP_EXECUTION_ERROR: RuntimeError: LLM connection error: "
+                    "[SSL: UNEXPECTED_EOF_WHILE_READING]"
+                ),
+            }
+        ]
+    }
+    restored = PlanOrchestrator._prepare_restored_plan(plan)
+    assert "transientRetries" not in restored["steps"][0], (
+        "a new turn must clear the exhausted replay budget"
+    )
+    assert PlanOrchestrator._can_retry_step(restored["steps"][0]) is True
+
+
+def test_dns_failure_is_not_retried_because_retrying_cannot_help():
+    """A name that does not resolve fails identically on every attempt."""
+    import socket
+
+    from sRNAgent.agent.llm_client import _is_dns_failure
+
+    assert _is_dns_failure(socket.gaierror(-2, "Name or service not known"))
+    assert _is_dns_failure("Name or service not known")
+    # A resolver timeout may be transient.
+    assert not _is_dns_failure(socket.gaierror(-3, "Temporary failure in name resolution"))
+    assert not _is_dns_failure(socket.timeout("timed out"))
+    assert not _is_dns_failure(ConnectionResetError("reset by peer"))
+
+
 def test_fastq_qc_contract_replaces_the_planner_duplicate_steps():
     """The contract owns the adapter gate, so the planner's copy must go."""
     from sRNAgent.agent.workflow_contracts import load_workflow_nodes

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -200,6 +201,23 @@ def _minimax_base(base_url: str, protocol: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, f"{path}{prefix}", "", ""))
 
 
+def _is_dns_failure(reason: Any) -> bool:
+    """True when the failure was a name-resolution failure, not a network fault.
+
+    ``socket.gaierror`` means the host could not be resolved. The important
+    distinction is *which* failure: ``EAI_NONAME`` means the name does not
+    exist, so retrying cannot help and the caller should report the bad URL.
+    ``EAI_AGAIN`` means the resolver itself was unavailable, which is
+    transient and must keep the retry.
+    """
+    if isinstance(reason, socket.gaierror):
+        return reason.errno == socket.EAI_NONAME
+    if isinstance(reason, OSError) and reason.errno == socket.EAI_NONAME:
+        return True
+    text = str(reason).lower()
+    return "name or service not known" in text or "nodename nor servname" in text
+
+
 def _anthropic_url(base_url: str) -> str:
     base = _minimax_base(base_url.rstrip("/"), "anthropic-messages").rstrip("/")
     if base.endswith("/v1/messages"):
@@ -339,6 +357,14 @@ class ChatClient:
                 raise last_error from exc
             except urllib.error.URLError as exc:
                 reason = getattr(exc, "reason", exc)
+                # A name that does not resolve cannot be fixed by retrying: the
+                # request never leaves the host. Fail fast with a message that
+                # points at the base URL instead of burning the retry budget.
+                if _is_dns_failure(reason):
+                    raise RuntimeError(
+                        f"LLM connection error: {reason} [url={_safe_url(url)}] — "
+                        "域名无法解析，请检查 Config 中的 Base URL"
+                    ) from exc
                 last_error = RuntimeError(
                     f"LLM connection error: {reason} [url={_safe_url(url)}]"
                 )

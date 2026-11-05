@@ -3539,6 +3539,14 @@ class PlanOrchestrator:
         restored = clone_plan(plan)
         lifecycle = PlanLifecycle(restored)
         lifecycle.prepare_for_resume()
+        # The replay budget bounds the retries inside a single run. A new user
+        # turn is an explicit request to continue, and the network may well be
+        # healthy again, so the budget is refreshed here. Without this a step
+        # that exhausted its budget while the link was down could never be
+        # retried again, no matter how many times the user asked.
+        for step in restored.get("steps") or []:
+            if isinstance(step, dict):
+                step.pop("transientRetries", None)
         for index, step in enumerate(restored.get("steps") or []):
             if isinstance(step, dict) and isinstance(step.get("approval"), dict):
                 _sanitize_restored_approval(step["approval"])
